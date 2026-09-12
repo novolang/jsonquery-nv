@@ -1,0 +1,420 @@
+// jqlang.nv — a jq program as a typed value, and the parse that
+// produces one.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE WHOLE GRAMMAR IS IN ONE MODULE because jq's grammar is mutually
+// recursive at every level: a filter holds filters, an object's key is
+// a filter, a string's interpolation is a filter, and a `reduce`'s
+// three parts are filters.  Splitting it would need modules that named
+// each other, and novo-lang module imports do not describe a cycle.
+// Evaluation is where the split belongs, and `jqeval` is that module.
+//
+// A PATH IS A JSONPATH QUERY, NOT A LIST OF STEPS.  `JqFPath` holds a
+// `jpquery.JpQuery`, so `.users[0].name` is parsed by jsonpath-nv and
+// evaluated by `jpeval.select`.  The reason is not economy: it is that
+// `orbit/nq`'s 818-line hand-written scanner supports three step kinds
+// and RFC 9535 supports eight, so delegating is how a jq program gets
+// slices, descendant segments and filter selectors —
+// `.users[?@.age > 30]` — that nq could not express at all.  Where jq's
+// answers differ from RFC 9535's, they differ in the EVALUATOR and in
+// exactly one function, `jqeval.select_path`; the README's table is
+// those four rows.
+//
+// `f?` IS `try f`, AND THIS TREE SAYS SO.  jq defines the postfix `?`
+// as `try` with no handler, so the parser builds `JqFTry(f, empty)` for
+// both spellings and `render` prints the same text for them.  Two
+// variants would be two things a reader has to learn are one thing.
+//
+// WHAT IS NOT IN THE TREE, on purpose: the assignment operators (`=`,
+// `|=`, `+=`, `del`-by-assignment).  They are not hard, they are a
+// DIFFERENT half of jq — they need a path to write to rather than a
+// value to read, and the piece that would carry it is
+// `jpeval.path_steps`, which turns a normalized path back into a walk.
+// Adding them before there is an implementation behind these
+// signatures would be designing against nothing.  `path(f)` and
+// `getpath(p)` are here, so the reading half of paths is complete and
+// the writing half is a named later step rather than a silence.
+
+use jperror
+use jpquery
+use jqbuiltin
+use jqerror
+
+// A parsed program: the text it came from, and the filter it is.
+//
+// The source is kept because every position in the tree is a byte
+// offset into it, and a caller pointing a caret needs both.
+//
+// ```novo
+// use jqlang
+//
+// fn main() [io]
+//     match jqlang.parse(".users[] | .name")
+//         Err(f) => println("${f.at}")
+//         Ok(p)  => println(p.source)
+// ```
+pub struct JqProgram
+    source: Str
+    root: JqFilter
+
+// One filter.  Directly recursive, because jq is.
+//
+// Every variant carries `at`, the byte offset where it starts, so a
+// runtime error forty thousand records into a stream can point at the
+// filter that raised rather than at the whole program.
+pub enum JqFilter
+    // `.` — the input, unchanged.
+    JqFIdentity(at: Int)
+    // `.a.b[0]`, `.[]`, `.users[?@.age > 30]`, `..` — a path, held as
+    // the JSONPath query it is.  jq's spellings that RFC 9535 has no
+    // syntax for are rewritten at parse time: `.[]` is `[*]`, and a
+    // bare `.name` is `['name']`.
+    JqFPath(at: Int, query: jpquery.JpQuery)
+    // `f | g` — every output of `f` fed to `g` in turn.
+    JqFPipe(at: Int, left: JqFilter, right: JqFilter)
+    // `f, g` — the outputs of `f` then the outputs of `g`.
+    JqFComma(at: Int, left: JqFilter, right: JqFilter)
+    // `1`, `"s"`, `true`, `null`.
+    JqFLiteral(at: Int, value: JqLiteral)
+    // `[f]` — every output of `f` collected into one array.  The
+    // filter that turns a stream back into a value, and the reason
+    // `[.[] | select(.ok)]` is a parse error in nq and a program here.
+    JqFArray(at: Int, body: JqFilter)
+    // `{a: f, "b": g, (h): i, $x, c}` — an object built per output of
+    // its parts.  The shorthands are desugared by the parser, so `{a}`
+    // arrives as a field whose key is the literal `"a"` and whose
+    // value is the path `.a`.
+    JqFObject(at: Int, fields: [JqField])
+    // `f + g`, `f == g`, `f and g`, `f // g`.
+    JqFBinary(at: Int, op: JqBinOp, left: JqFilter, right: JqFilter)
+    // `-f`.  Unary minus is its own node because jq applies it to the
+    // OUTPUTS of a filter, so `-(.a, .b)` negates two of them.
+    JqFNegate(at: Int, body: JqFilter)
+    // `if c then a else b end`.  `then` is a reserved word in
+    // novo-lang, which is why the field below is not called it.
+    JqFIf(at: Int, condition: JqFilter, consequent: JqFilter, alternative: JqFilter)
+    // `try f catch g`, and `f?`, which is this with `empty` as the
+    // handler.  The handler's INPUT is the error value, not the
+    // original input — that is what makes `try f catch .code` read a
+    // member out of what `error({code: 4})` raised.
+    JqFTry(at: Int, body: JqFilter, handler: JqFilter)
+    // `reduce s as $x (init; update)` — one output, the last state.
+    JqFReduce(at: Int, source: JqFilter, pattern: JqPattern, init: JqFilter, update: JqFilter)
+    // `foreach s as $x (init; update; extract)` — one output per
+    // input, which is what makes a running total expressible.
+    JqFForeach(at: Int, source: JqFilter, pattern: JqPattern, init: JqFilter, update: JqFilter,
+               extract: JqFilter)
+    // `f as $x | g` — `g` run once per output of `f`, with `$x` bound.
+    JqFBind(at: Int, source: JqFilter, pattern: JqPattern, body: JqFilter)
+    // `$name`.
+    JqFVariable(at: Int, name: Str)
+    // `map(f)`, `select(f)`, `keys` — a call to something with a name.
+    JqFCall(at: Int, callee: JqCallee, arguments: [JqFilter])
+    // `def f(a): body; rest` — a definition and the program it scopes
+    // over.  In the tree rather than in a table because that is what
+    // its scope IS: `rest` sees `f` and nothing outside does.
+    JqFDefine(at: Int, name: Str, parameters: [Str], body: JqFilter, rest: JqFilter)
+    // `"a\(.b)c"` — a string with filters in it.  One node rather than
+    // a `+` chain because each interpolated filter may produce several
+    // outputs, and the string is built once per combination.
+    JqFInterpolate(at: Int, parts: [JqStrPart])
+
+// What a call names.
+//
+// Resolved at PARSE time, not at run time, which is what makes
+// `floor` a fault with a caret under it rather than a failure on the
+// four hundred thousandth record.
+pub enum JqCallee
+    // A builtin, already resolved to its name-and-arity pair.
+    JqCBuiltin(builtin: jqbuiltin.JqBuiltin)
+    // A `def` in scope, by name.  The arity was checked against the
+    // definition when the call was parsed.
+    JqCDefined(name: Str)
+
+// A literal.
+//
+// Numbers are `Float` however they were written, because JSON has one
+// number type and a program that says `> 30` has to match a value
+// stored as `30.5`.  `orbit/nq` made the same choice for the same
+// reason.
+pub enum JqLiteral
+    JqLNull
+    JqLBool(value: Bool)
+    JqLNumber(value: Float)
+    JqLString(text: Str)
+
+// A binary operator.
+pub enum JqBinOp
+    // `+` — numbers add, strings and arrays concatenate, objects
+    // merge with the right winning, and `null` is the identity of all
+    // four.  That last rule is why `{} + null` is `{}` and not an
+    // error.
+    JqOpAdd
+    JqOpSubtract
+    JqOpMultiply
+    // `/` — numbers divide, and a STRING divided by a string splits
+    // it, which is jq's and surprises everyone once.
+    JqOpDivide
+    JqOpModulo
+    JqOpEqual
+    JqOpNotEqual
+    // `<`, `<=`, `>`, `>=` — over jq's total order across types, so
+    // `1 < "a"` is true rather than an error.  `jqeval.order` is that
+    // order.
+    JqOpLess
+    JqOpLessEqual
+    JqOpGreater
+    JqOpGreaterEqual
+    // `and`, `or` — short-circuiting, over truthiness rather than over
+    // booleans: only `null` and `false` are falsy, so `0 and 1` is
+    // true.
+    JqOpAnd
+    JqOpOr
+    // `//` — the left side's outputs that are neither `null` nor
+    // `false`, and the right side's if there are none.  It also
+    // swallows an ERROR on the left, which is what makes
+    // `.a.b // "none"` work on a document where `.a` is a number.
+    JqOpAlternative
+
+// One field of an object construction.
+//
+// Both halves are filters because both can be: `{(.k): .v}` computes
+// its key, and `{a: 1, a: 2}` is two fields with the later winning.
+pub struct JqField
+    key: JqFilter
+    value: JqFilter
+
+// A destructuring pattern, for `as`, `reduce` and `foreach`.
+//
+// jq's `. as [$a, $b]` and `. as {$name}` are real and a port that
+// only bound a single variable would refuse programs people write.
+// An element a pattern reaches that the value does not have binds
+// `null`, which is the same missing-is-null rule paths follow.
+pub enum JqPattern
+    JqPVariable(name: Str)
+    JqPArray(elements: [JqPattern])
+    JqPObject(entries: [JqPatternEntry])
+
+// One entry of an object pattern: what to look up, and what to bind
+// it to.
+//
+// The key is a filter so `. as {(.k): $v}` works, and `{$x}` is the
+// shorthand the parser desugars into a literal key `"x"` and the
+// pattern `$x`.
+pub struct JqPatternEntry
+    key: JqFilter
+    pattern: JqPattern
+
+// One piece of an interpolated string.
+pub enum JqStrPart
+    JqSText(text: Str)
+    JqSInterpolate(body: JqFilter)
+
+// Parse a program.
+//
+// The only call that answers a `JqFault`.  Everything that can be
+// wrong with a program is wrong here — an unknown builtin, a wrong
+// arity, an unbound `$x`, a path RFC 9535 refuses — so a service that
+// accepts programs from outside parses once, at the edge, and from
+// then on can only be slow.
+//
+// ```novo
+// use jqlang
+//
+// fn main() [io]
+//     match jqlang.parse(".users[] | select(.age >= 30) | .name")
+//         Err(f) => println("${f.at}")
+//         Ok(p)  => println(jqlang.render(p))
+// ```
+pub fn parse(source: Str) -> Result<JqProgram, jqerror.JqFault> []
+    todo("jsonquery-nv.jqlang.parse")
+
+// Parse with a set of variable names treated as supplied.
+//
+// What a `--arg name value` flag needs: the names are bound by the
+// caller at run time, so they must not be `JqUnboundVariable` at parse
+// time.  Passing an empty list is `parse`.
+//
+// ```novo
+// use jqlang
+//
+// fn main() [io]
+//     match jqlang.parse_with(".x + \$limit", ["limit"])
+//         Err(f) => println("${f.at}")
+//         Ok(p)  => println(jqlang.render(p))
+// ```
+pub fn parse_with(source: Str, supplied: [Str]) -> Result<JqProgram, jqerror.JqFault> []
+    todo("jsonquery-nv.jqlang.parse_with")
+
+// Build a program from a filter and the text it came from.
+//
+// For a caller constructing a filter in code rather than parsing one.
+//
+// ```novo
+// use jqlang
+//
+// fn main() [io]
+//     println(jqlang.program(".", JqFIdentity(0)).source)
+// ```
+pub fn program(source: Str, root: JqFilter) -> JqProgram []
+    todo("jsonquery-nv.jqlang.program")
+
+// Build one field of an object construction.
+//
+// ```novo
+// use jqlang
+//
+// fn main() [io]
+//     let f = jqlang.field(JqFLiteral(0, JqLString("a")), JqFIdentity(0))
+//     println(jqlang.render_filter(f.value))
+// ```
+pub fn field(key: JqFilter, value: JqFilter) -> JqField []
+    todo("jsonquery-nv.jqlang.field")
+
+// The program rendered back as jq text, in one canonical spelling.
+//
+// Not the text that was parsed: a round trip through this normalises,
+// which is what makes two programs that mean the same thing comparable
+// as strings.  `f?` renders as `try f`, because that is what it is.
+//
+// ```novo
+// use jqlang
+//
+// fn main() [io]
+//     match jqlang.parse(".a?")
+//         Err(_) => println("did not parse")
+//         Ok(p)  => println(jqlang.render(p))
+// ```
+pub fn render(p: JqProgram) -> Str []
+    todo("jsonquery-nv.jqlang.render")
+
+// One filter rendered as jq text.
+//
+// ```novo
+// use jqlang
+//
+// fn main() [io]
+//     println(jqlang.render_filter(JqFIdentity(0)))
+// ```
+pub fn render_filter(f: JqFilter) -> Str []
+    todo("jsonquery-nv.jqlang.render_filter")
+
+// Where a filter starts, as a byte offset into the program's source.
+//
+// Every variant carries one; this reads it without a `match` at each
+// call site.
+//
+// ```novo
+// use jqlang
+//
+// fn main() [io]
+//     println("${jqlang.position(JqFIdentity(7))}")
+// ```
+pub fn position(f: JqFilter) -> Int []
+    todo("jsonquery-nv.jqlang.position")
+
+// The `$names` a program reads and nothing in it binds.
+//
+// Exactly the set a caller has to supply before the program will run,
+// so a CLI knows which `--arg` are required without running anything.
+// A program with no `$` in it answers the empty list.
+//
+// ```novo
+// use jqlang
+//
+// fn main() [io]
+//     match jqlang.parse_with(".x + \$limit", ["limit"])
+//         Err(_) => println("did not parse")
+//         Ok(p)  => println("${jqlang.free_variables(p)}")
+// ```
+pub fn free_variables(p: JqProgram) -> [Str] []
+    todo("jsonquery-nv.jqlang.free_variables")
+
+// The names a program's `def`s declare, in the order they are written.
+//
+// ```novo
+// use jqlang
+//
+// fn main() [io]
+//     match jqlang.parse("def twice(f): f | f; twice(.a)")
+//         Err(_) => println("did not parse")
+//         Ok(p)  => println("${jqlang.defined_names(p)}")
+// ```
+pub fn defined_names(p: JqProgram) -> [Str] []
+    todo("jsonquery-nv.jqlang.defined_names")
+
+// The builtins a program calls, without repeats.
+//
+// What a caller auditing a program before it runs it wants: a service
+// that will not accept `error` or a program that only reads.
+//
+// ```novo
+// use std.list
+// use jqlang
+//
+// fn main() [io]
+//     match jqlang.parse("map(.a) | length")
+//         Err(_) => println("did not parse")
+//         Ok(p)  => println("${list.len(jqlang.called_builtins(p))}")
+// ```
+pub fn called_builtins(p: JqProgram) -> [jqbuiltin.JqBuiltin] []
+    todo("jsonquery-nv.jqlang.called_builtins")
+
+// Whether a filter is a PATH EXPRESSION — one that names places in the
+// input rather than computing new values.
+//
+// jq's own rule, and the one most ports skip: `path(f)` and
+// `getpath`'s companions only mean something for a filter every one of
+// whose outputs came from somewhere in the input.  `.a` is a path
+// expression, `.a + 1` is not, and `if .x then .a else .b end` is one
+// because both branches are.  Refusing at parse time is what stops
+// `path(1)` from being a run-time surprise.
+//
+// ```novo
+// use jqlang
+//
+// fn main() [io]
+//     match jqlang.parse(".a.b")
+//         Err(_) => println("did not parse")
+//         Ok(p)  => println("${jqlang.is_path_expression(p.root)}")
+// ```
+pub fn is_path_expression(f: JqFilter) -> Bool []
+    todo("jsonquery-nv.jqlang.is_path_expression")
+
+// How deeply a filter nests.
+//
+// A bound a caller can check before evaluating, since evaluation
+// recurses over this tree and a program from outside chose its depth.
+//
+// ```novo
+// use jqlang
+//
+// fn main() [io]
+//     match jqlang.parse(".a | .b | .c")
+//         Err(_) => println("did not parse")
+//         Ok(p)  => println("${jqlang.depth(p.root)}")
+// ```
+pub fn depth(f: JqFilter) -> Int []
+    todo("jsonquery-nv.jqlang.depth")
+
+// The JSONPath fault behind a `JqBadPath`, when there is one.
+//
+// The delegate's own message says what RFC 9535 § 2.4.3 objected to,
+// and folding it away would leave a user told only that their path is
+// bad.
+//
+// ```novo
+// use jqlang
+// use jqerror
+//
+// fn main() [io]
+//     match jqlang.parse(".a")
+//         Err(f) =>
+//             match jqlang.path_fault(f)
+//                 None    => println("not a path fault")
+//                 Some(p) => println("${p.at}")
+//         Ok(_)  => println("parsed")
+// ```
+pub fn path_fault(f: jqerror.JqFault) -> ?jperror.JpFault []
+    todo("jsonquery-nv.jqlang.path_fault")

@@ -1,0 +1,255 @@
+// jqerror.nv — the two things that can go wrong, and why they are two
+// types rather than one.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A PARSE FAULT AND A RUNTIME ERROR ARE NOT THE SAME KIND OF THING, and
+// a port that spells both as a string loses the difference that makes
+// `try`/`catch` work.
+//
+// `JqFault` is a program that does not parse.  It has a byte span into
+// the program text, nothing can catch it, and there is no program to
+// run — a caller points a caret at `at` and stops.  It is answered once,
+// by `jqlang.parse`, and never again.
+//
+// `JqError` is a filter that failed while running, and in jq a runtime
+// error IS A VALUE: `error({code: 4, path: .p})` raises an object, and
+// `try f catch .code` binds that object and reads a member out of it.
+// So `JqError` carries a `JsonValueH`, not a message, and
+// `error_message` is a rendering of that value rather than the thing
+// itself.  A port that made the payload a `Str` can express
+// `error("no")` and cannot express the line above, which is the shape
+// every non-trivial jq program that handles failures is written in.
+//
+// THE POSITION SURVIVES INTO THE RUNTIME.  `JqError.at` is the byte
+// offset of the filter that raised, so a caller can point the same
+// caret at `.a` in `.users[] | .a.b` when the run fails on a record
+// forty thousand lines in.  jq itself cannot do this; the offset is
+// already in the parsed program, so keeping it costs one field.
+
+use std.json
+
+// Why a program did not parse.
+//
+// One variant per mistake a person actually makes, because the whole
+// value of a positioned fault is that the message names the mistake
+// rather than the token the scanner happened to be looking at.
+pub enum JqFaultKind
+    // A byte that cannot start anything at this point in the grammar.
+    JqUnexpectedByte
+    // A string literal that runs to the end of the program.
+    JqUnterminatedString
+    // An escape the string grammar does not have.
+    JqBadEscape
+    // A `\(` interpolation with no closing `)`, or one holding a
+    // filter that does not parse.
+    JqBadInterpolation
+    // A number literal that is not one — `1.2.3`, `1e`, a bare `.5`
+    // where a path would start.
+    JqBadNumber
+    // `(`, `[`, `{` with no partner.
+    JqUnclosedBracket
+    // A `|` or a `,` with nothing after it.
+    JqDanglingOperator
+    // A name that is neither a builtin nor a `def` in scope.  The
+    // message lists the near ones, which is what
+    // `jqbuiltin.is_known_name` and `jqbuiltin.arities_of` are for.
+    JqUnknownFunction
+    // A known name called with a count of arguments it has no form
+    // for: `range/4`, `length/1`.  The message names the arities the
+    // builtin does have.
+    JqWrongArity
+    // A builtin this package refuses by name, with a reason — the six
+    // regex builtins I-Regexp cannot carry.  Distinct from
+    // `JqUnknownFunction` because "jq has this and we do not" is a
+    // different thing to be told than "nothing has this".
+    JqRefusedFunction
+    // A `$name` that no `as` binding, no `def` parameter and no caller
+    // binding supplies.  `jqlang.free_variables` is the same answer
+    // computed for a whole program.
+    JqUnboundVariable
+    // A path expression the delegate refused.  The inner fault's own
+    // message is folded into this one's, because a user who wrote
+    // `.a[?@.* > 1]` should be told what RFC 9535 § 2.4.3 says about
+    // it and not merely that the path is bad.
+    JqBadPath
+    // `reduce`, `foreach` or `as` with a pattern that is not one.
+    JqBadPattern
+    // An object construction whose key is neither a name, a string, a
+    // `$variable` nor a parenthesised filter.
+    JqBadObjectKey
+    // The program parsed and then there was more of it.
+    JqTrailingInput
+
+// A program that did not parse, and where.
+//
+// `at` and `to` are byte offsets into the program text, half open, so
+// a caller underlines `[at, to)` and needs no second scan to find the
+// extent of what it is complaining about.
+pub struct JqFault
+    kind: JqFaultKind
+    at: Int
+    to: Int
+    // The name a `JqUnknownFunction`, `JqWrongArity`,
+    // `JqRefusedFunction` or `JqUnboundVariable` was about, and the
+    // empty string for every other kind.  Carried rather than re-cut
+    // from the source, because `at`/`to` for a wrong arity span the
+    // whole call and the name is the part a message wants.
+    subject: Str
+
+// Build a fault.
+//
+// ```novo
+// use jqerror
+//
+// fn main() [io]
+//     let f = jqerror.fault(JqUnexpectedByte, 3, 4, "")
+//     println("${f.at}")
+// ```
+pub fn fault(kind: JqFaultKind, at: Int, to: Int, subject: Str) -> JqFault []
+    todo("jsonquery-nv.jqerror.fault")
+
+// The kind's own name, for a caller that wants to branch on text or
+// print a machine-readable code.
+//
+// ```novo
+// use jqerror
+//
+// fn main() [io]
+//     println(jqerror.fault_kind_name(JqWrongArity))
+// ```
+pub fn fault_kind_name(kind: JqFaultKind) -> Str []
+    todo("jsonquery-nv.jqerror.fault_kind_name")
+
+// One line of English naming the mistake and, where there is one, the
+// subject.
+//
+// ```novo
+// use jqerror
+//
+// fn main() [io]
+//     println(jqerror.fault_message(jqerror.fault(JqUnknownFunction, 5, 10, "floor")))
+// ```
+pub fn fault_message(f: JqFault) -> Str []
+    todo("jsonquery-nv.jqerror.fault_message")
+
+// Why a filter failed while running.
+//
+// jq's runtime errors are few and each is a rule a user has to know;
+// naming them is what lets a caller decide which ones its own program
+// treats as data.  A filter that keeps only the records it can read
+// catches `JqCannotIndex` and lets `JqUserRaised` through.
+pub enum JqErrorKind
+    // `.foo` or `.[0]` against a value that is not the container that
+    // selector addresses — a number, a string, a boolean.  jq's rule,
+    // kept: reaching INTO a container that has no such place is
+    // `null`, and reaching into something that is not a container at
+    // all is an error.
+    JqCannotIndex
+    // `.[]` against anything that is not an array or an object, `null`
+    // included.  `null | .foo` is `null` and `null | .[]` is this,
+    // which looks inconsistent and is jq's, deliberately kept.
+    JqCannotIterate
+    // An operator applied to operands it has no meaning for: `{} - 1`,
+    // `"a" * "b"`, `[] / 2`.
+    JqTypeMismatch
+    // `1 / 0` and `1 % 0`.
+    JqDivideByZero
+    // A builtin handed an argument of the wrong type: `join` over an
+    // array of objects, `implode` over an array holding a string.
+    JqBadArgument
+    // `error(v)`, raised by the program itself.  The value is whatever
+    // the program passed, and `error` with no argument re-raises the
+    // input.
+    JqUserRaised
+    // A limit in `JqLimits` was crossed.  Not catchable by `try`,
+    // because the point of a budget is that a program cannot decide to
+    // ignore it.
+    JqOverBudget
+
+// A filter that failed, the value it failed with, and where in the
+// program it was.
+pub struct JqError
+    kind: JqErrorKind
+    // What `catch` binds.  For `JqUserRaised` it is exactly what the
+    // program passed to `error`; for every other kind it is the string
+    // jq would have printed, as a JSON string, so `catch .` is always
+    // meaningful.
+    value: JsonValueH
+    // Byte offset into the program text of the filter that raised.
+    at: Int
+
+// Build a runtime error.
+//
+// ```novo
+// use std.json
+// use jqerror
+//
+// fn main() [io]
+//     match json.parse("\"no such field\"")
+//         None    => println("unreachable")
+//         Some(v) => println("${jqerror.error(JqCannotIndex, v, 7).at}")
+// ```
+pub fn error(kind: JqErrorKind, value: JsonValueH, at: Int) -> JqError []
+    todo("jsonquery-nv.jqerror.error")
+
+// The kind's own name.
+//
+// ```novo
+// use jqerror
+//
+// fn main() [io]
+//     println(jqerror.error_kind_name(JqCannotIterate))
+// ```
+pub fn error_kind_name(kind: JqErrorKind) -> Str []
+    todo("jsonquery-nv.jqerror.error_kind_name")
+
+// The error rendered as one line, the way jq prints it.
+//
+// A string value prints bare and every other value prints as JSON,
+// which is jq's own rule and the reason `error("no")` reads as `no`
+// while `error({code: 4})` reads as `{"code":4}`.
+//
+// ```novo
+// use std.json
+// use jqerror
+//
+// fn main() [io]
+//     match json.parse("\"boom\"")
+//         None    => println("unreachable")
+//         Some(v) => println(jqerror.error_message(jqerror.error(JqUserRaised, v, 0)))
+// ```
+pub fn error_message(e: JqError) -> Str []
+    todo("jsonquery-nv.jqerror.error_message")
+
+// What `catch` binds.
+//
+// Published on its own because the interesting half of a jq error
+// handler never looks at the message: it looks at the value.
+//
+// ```novo
+// use std.json
+// use jqerror
+//
+// fn main() [io]
+//     match json.parse("{\"code\":4}")
+//         None    => println("unreachable")
+//         Some(v) => println(json.stringify(jqerror.error_value(jqerror.error(JqUserRaised, v, 0))))
+// ```
+pub fn error_value(e: JqError) -> JsonValueH []
+    todo("jsonquery-nv.jqerror.error_value")
+
+// Whether `try`/`catch` may catch this error.
+//
+// Every kind but `JqOverBudget` is catchable.  A budget a program could
+// catch is not a budget, and a service that accepts programs from
+// outside is exactly the caller that sets one.
+//
+// ```novo
+// use jqerror
+//
+// fn main() [io]
+//     println("${jqerror.is_catchable(JqOverBudget)}")
+// ```
+pub fn is_catchable(kind: JqErrorKind) -> Bool []
+    todo("jsonquery-nv.jqerror.is_catchable")

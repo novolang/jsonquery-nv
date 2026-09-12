@@ -1,0 +1,99 @@
+// jqerror_tests.nv — the two error types, and what each of them can
+// say.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: jsonquery-nv.jqerror.<fn>`.
+//
+// WHY THIS SUITE EXISTS SEPARATELY.  A message is the part of an error
+// nobody tests and everybody reads.  The properties below are the ones
+// that make a message useful rather than present: it names the SUBJECT
+// when there is one, a kind's own name is stable enough to branch on,
+// and the runtime message renders a string value bare and every other
+// value as JSON, which is jq's rule and the reason `error("no")` and
+// `error({code: 4})` do not read the same way.
+
+use std.test
+use std.json
+use std.str
+use jqerror
+use jqeval
+
+fn value_of(text: Str) -> JsonValueH
+    json.parse(text) ?? jqeval.null_value()
+
+@test
+fn test_a_parse_fault_carries_its_span_and_its_subject() [io]
+    test.case("a fault is built from a kind, a span and a subject")
+    let f = jqerror.fault(JqUnknownFunction, 5, 10, "floor_it")
+    test.assert(f.at == 5)
+    test.assert(f.to == 10)
+    test.assert(f.subject == "floor_it")
+
+    test.case("a kind with no subject carries the empty string")
+    let g = jqerror.fault(JqUnexpectedByte, 3, 4, "")
+    test.assert(g.subject == "")
+
+@test
+fn test_a_faults_kind_has_a_name_worth_branching_on() [io]
+    test.case("every kind names itself")
+    test.assert(jqerror.fault_kind_name(JqUnknownFunction) != "")
+    test.assert(jqerror.fault_kind_name(JqWrongArity) != "")
+    test.assert(jqerror.fault_kind_name(JqRefusedFunction) != "")
+
+    test.case("and two different kinds do not share a name")
+    test.assert(jqerror.fault_kind_name(JqUnknownFunction) != jqerror.fault_kind_name(JqWrongArity))
+
+@test
+fn test_a_faults_message_names_the_subject_when_there_is_one() [io]
+    test.case("an unknown function's message contains the name that was unknown")
+    let f = jqerror.fault(JqUnknownFunction, 5, 13, "floor_it")
+    test.assert(str.contains(jqerror.fault_message(f), "floor_it"))
+
+    test.case("a wrong arity's message contains the name too")
+    let g = jqerror.fault(JqWrongArity, 0, 5, "range")
+    test.assert(str.contains(jqerror.fault_message(g), "range"))
+
+    test.case("a fault with no subject still has a message")
+    test.assert(jqerror.fault_message(jqerror.fault(JqUnexpectedByte, 3, 4, "")) != "")
+
+@test
+fn test_a_runtime_error_carries_the_value_the_program_raised() [io]
+    test.case("the value comes back unchanged, object and all")
+    let raised = value_of("{\"code\":4}")
+    let e = jqerror.error(JqUserRaised, raised, 12)
+    test.assert(jqeval.equal(jqerror.error_value(e), raised))
+
+    test.case("the position is the filter that raised, not the whole program")
+    test.assert(e.at == 12)
+
+    test.case("every runtime kind names itself")
+    test.assert(jqerror.error_kind_name(JqCannotIndex) != "")
+    test.assert(jqerror.error_kind_name(JqCannotIterate) != "")
+    test.assert(jqerror.error_kind_name(JqCannotIndex) != jqerror.error_kind_name(JqCannotIterate))
+
+@test
+fn test_a_runtime_message_renders_a_string_bare_and_anything_else_as_json() [io]
+    // jq's own rule, and the reason `error("no")` reads as `no`.
+    test.case("a string value prints without its quotes")
+    let text = jqerror.error(JqUserRaised, value_of("\"boom\""), 0)
+    test.assert(jqerror.error_message(text) == "boom")
+
+    test.case("an object value prints as JSON")
+    let obj = jqerror.error(JqUserRaised, value_of("{\"code\":4}"), 0)
+    test.assert(str.contains(jqerror.error_message(obj), "code"))
+
+    test.case("a kind the program did not raise still has a message")
+    test.assert(jqerror.error_message(jqerror.error(JqCannotIterate, jqeval.null_value(), 0)) != "")
+
+@test
+fn test_a_budget_is_the_one_error_a_program_may_not_ignore() [io]
+    test.case("every ordinary runtime error is catchable")
+    test.assert(jqerror.is_catchable(JqCannotIndex))
+    test.assert(jqerror.is_catchable(JqCannotIterate))
+    test.assert(jqerror.is_catchable(JqTypeMismatch))
+    test.assert(jqerror.is_catchable(JqDivideByZero))
+    test.assert(jqerror.is_catchable(JqBadArgument))
+    test.assert(jqerror.is_catchable(JqUserRaised))
+
+    test.case("a budget is not — a limit a program could catch is not a limit")
+    test.assert(jqerror.is_catchable(JqOverBudget) == false)

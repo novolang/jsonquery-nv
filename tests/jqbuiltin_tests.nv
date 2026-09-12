@@ -1,0 +1,188 @@
+// jqbuiltin_tests.nv — the builtin table, asserted as data.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: jsonquery-nv.jqbuiltin.<fn>`.
+//
+// WHAT THIS SUITE IS FOR.  A table is the kind of thing that drifts:
+// a name added to the enum and not to `all()`, an arity written twice
+// and changed once, a refusal explained in prose and not in data.
+// Every assertion below is a consistency property over the whole table
+// rather than a fact about one entry, which is what a table wants and
+// what a list of examples cannot give it.
+
+use std.test
+use std.list
+use jqbuiltin
+
+@test
+fn test_the_table_is_consistent_with_itself() [io]
+    test.case("the table is not empty")
+    test.assert(list.len(jqbuiltin.all()) > 0)
+
+    test.case("every entry resolves from its own name and arity")
+    for b in jqbuiltin.all()
+        match jqbuiltin.resolve(jqbuiltin.name(b), jqbuiltin.arity(b))
+            None     => test.assert(false)
+            Some(b2) => test.assert(jqbuiltin.signature(b2) == jqbuiltin.signature(b))
+
+    test.case("every entry's name is a known name")
+    for b in jqbuiltin.all()
+        test.assert(jqbuiltin.is_known_name(jqbuiltin.name(b)))
+
+    test.case("every entry's arity is in its name's arity list")
+    for b in jqbuiltin.all()
+        test.assert(list.contains(jqbuiltin.arities_of(jqbuiltin.name(b)), jqbuiltin.arity(b)))
+
+    test.case("every entry has a summary")
+    for b in jqbuiltin.all()
+        test.assert(str_is_not_empty(jqbuiltin.summary(b)))
+
+fn str_is_not_empty(s: Str) -> Bool
+    s != ""
+
+@test
+fn test_a_name_and_an_arity_are_two_different_questions() [io]
+    // The reason the variant is the pair: `range/1` and `range/2` are
+    // different filters, and an error message has to be able to say
+    // which of the two the program asked for.
+    test.case("range has three forms")
+    test.assert(jqbuiltin.arities_of("range") == [1, 2, 3])
+
+    test.case("length has one")
+    test.assert(jqbuiltin.arities_of("length") == [0])
+
+    test.case("a known name at an arity it has no form for does not resolve")
+    match jqbuiltin.resolve("length", 1)
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+    test.case("but the name is still known, which is a different message")
+    test.assert(jqbuiltin.is_known_name("length"))
+
+    test.case("a name nothing has is not known")
+    test.assert(jqbuiltin.is_known_name("floor_it") == false)
+
+    test.case("and it has no arities")
+    test.assert(list.len(jqbuiltin.arities_of("floor_it")) == 0)
+
+@test
+fn test_the_brief_names_these_and_they_are_here() [io]
+    test.case("keys")
+    match jqbuiltin.resolve("keys", 0)
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+
+    test.case("length")
+    match jqbuiltin.resolve("length", 0)
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+
+    test.case("to_entries")
+    match jqbuiltin.resolve("to_entries", 0)
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+
+    test.case("sort_by")
+    match jqbuiltin.resolve("sort_by", 1)
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+
+    test.case("group_by")
+    match jqbuiltin.resolve("group_by", 1)
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+
+    test.case("join")
+    match jqbuiltin.resolve("join", 1)
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+
+    test.case("split, on a literal separator")
+    match jqbuiltin.resolve("split", 1)
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+
+    test.case("test, the one regex builtin")
+    match jqbuiltin.resolve("test", 1)
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+
+@test
+fn test_a_filter_argument_is_marked_as_one() [io]
+    // The fact an evaluator cannot work without.  `map(.x)` runs its
+    // argument once per element; `ltrimstr("a")` evaluates its argument
+    // once and uses the value.
+    test.case("map's argument is a filter")
+    match jqbuiltin.resolve("map", 1)
+        None    => test.assert(false)
+        Some(b) => test.assert(jqbuiltin.takes_filter_argument(b, 0))
+
+    test.case("select's argument is a filter")
+    match jqbuiltin.resolve("select", 1)
+        None    => test.assert(false)
+        Some(b) => test.assert(jqbuiltin.takes_filter_argument(b, 0))
+
+    test.case("limit's SECOND argument is a filter and its first is not")
+    match jqbuiltin.resolve("limit", 2)
+        None    => test.assert(false)
+        Some(b) =>
+            test.assert(jqbuiltin.takes_filter_argument(b, 0) == false)
+            test.assert(jqbuiltin.takes_filter_argument(b, 1))
+
+    test.case("ltrimstr's argument is a value")
+    match jqbuiltin.resolve("ltrimstr", 1)
+        None    => test.assert(false)
+        Some(b) => test.assert(jqbuiltin.takes_filter_argument(b, 0) == false)
+
+@test
+fn test_a_builtin_that_can_produce_many_outputs_says_so() [io]
+    test.case("range streams")
+    match jqbuiltin.resolve("range", 1)
+        None    => test.assert(false)
+        Some(b) => test.assert(jqbuiltin.may_stream(b))
+
+    test.case("empty streams — zero outputs is a stream of zero")
+    match jqbuiltin.resolve("empty", 0)
+        None    => test.assert(false)
+        Some(b) => test.assert(jqbuiltin.may_stream(b))
+
+    test.case("length does not")
+    match jqbuiltin.resolve("length", 0)
+        None    => test.assert(false)
+        Some(b) => test.assert(jqbuiltin.may_stream(b) == false)
+
+@test
+fn test_every_refusal_is_data_with_a_reason() [io]
+    // "unknown function gsub" is the wrong answer for a name jq has.
+    test.case("the refusals are a non-empty list")
+    test.assert(list.len(jqbuiltin.absent_named()) > 0)
+
+    test.case("every refused name has a reason")
+    for n in jqbuiltin.absent_named()
+        match jqbuiltin.absence_reason(n)
+            None    => test.assert(false)
+            Some(r) => test.assert(str_is_not_empty(r))
+
+    test.case("gsub is refused, not unknown")
+    match jqbuiltin.absence_reason("gsub")
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+
+    test.case("and it is refused for a reason no layer can fix")
+    test.assert(jqbuiltin.absent_for_layer("gsub") == false)
+
+    test.case("env is refused because this package is core, which a host could answer")
+    match jqbuiltin.absence_reason("env")
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+    test.assert(jqbuiltin.absent_for_layer("env"))
+
+    test.case("a name that is neither refused nor known has no reason")
+    match jqbuiltin.absence_reason("floor_it")
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+    test.case("a refused name does not also resolve")
+    match jqbuiltin.resolve("gsub", 2)
+        None    => test.assert(true)
+        Some(_) => test.assert(false)

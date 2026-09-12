@@ -1,0 +1,489 @@
+// jqeval.nv — a program run against a value, answering the outputs it
+// produced and the error it stopped on.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE LOAD-BEARING INTERFACE IS `JqOutcome`, AND THE ARGUMENT FOR IT IS
+// ONE SENTENCE: a jq filter that fails has usually already produced
+// output, and a `Result` throws that away.
+//
+//     .users[] | (.name, error("stop"))
+//
+// emits the first name and then raises.  A signature answering
+// `Result<[JsonValueH], JqError>` has exactly two shapes to put that in
+// — the values without the error, or the error without the values —
+// and both of them lie.  `JqOutcome` has both fields, so "it produced
+// three rows and then failed on the fourth" is a value a caller can
+// hold, print the three rows from, and exit non-zero on.
+//
+// It is also what makes `try`/`catch` implementable rather than
+// approximated.  `try f catch h` runs `f`, KEEPS the outputs `f`
+// managed, and feeds `h` the error value if one arrived; an evaluator
+// whose inner call answered `Err` has already lost the outputs it
+// needs to keep.  The same shape carries `//`, whose left side
+// swallows an error, and `f?`, which is `try f` with no handler.
+//
+// `orbit/nq` answers `EOk(vals) | EErr(msg)` and is the port this comes
+// out of.  It can afford that because it has no `try`, no `error` and
+// no `//`: nothing in nq can produce output and then fail.  Adding any
+// one of the three is what forces this shape, and adding all three is
+// what this package is.
+//
+// EVALUATION CAN FAIL, WHICH IS THE DIFFERENCE FROM jsonpath-nv.
+// RFC 9535 makes every runtime disagreement produce an empty nodelist,
+// so `jpeval.select` answers a list and never a `Result`.  jq makes
+// four of them errors, and a user who knows jq must not have to
+// relearn which — so `select_path` is jsonpath-nv's walk with jq's
+// rules applied on top, in one function, and the README's table is
+// those four rows.
+//
+// THE VALUE IS THE STANDARD LIBRARY'S.  `JsonValueH` is what
+// `json.parse` answers and what `orbit/nq` already walks, so a
+// document is queried where it is.  What that costs is jsonpath-nv's
+// README under "What the standard library's JSON value cannot carry",
+// and the sharpest of the four lands here too: `{}` and `null` are the
+// same value to every accessor, so `length` over them cannot be told
+// apart without rendering.  nq carries a regression test called
+// `test_empty_object_is_not_null` for exactly that, and it is one of
+// the tests that moves here with the code.
+
+use std.json
+use jpquery
+use jqerror
+use jqlang
+
+// What a run produced, and what stopped it.
+//
+// `values` is everything the program emitted BEFORE it stopped, in
+// order.  `fault` is `None` for a run that finished.  A caller that
+// wants jq's own exit code reads both: output and no fault is 0, no
+// output is 1, a fault is 5.
+pub struct JqOutcome
+    values: [JsonValueH]
+    fault: ?jqerror.JqError
+
+// What a run will not do.
+//
+// A bound rather than a promise.  `repeat(.)` and `recurse` are both
+// unbounded by construction, and a service evaluating a program a user
+// typed wants a ceiling it chose rather than a process that does not
+// come back.
+pub struct JqLimits
+    // How many outputs the run may produce before it stops.
+    max_outputs: Int
+    // How many filter applications it may make.  The larger number,
+    // and the one that bounds the cost: `[limit(1; repeat(.))]`
+    // produces one output and applies a filter forever.
+    max_steps: Int
+    // How deeply the evaluator may recurse, which bounds `recurse` and
+    // a deeply nested program together.
+    max_depth: Int
+
+// One `$name` and what it is bound to.
+pub struct JqBinding
+    name: Str
+    value: JsonValueH
+
+// The bindings and the budget a run carries.
+//
+// Separate from the program because the program is parsed once and run
+// many times, with different `--arg` values each time.
+pub struct JqEnv
+    bindings: [JqBinding]
+    limits: JqLimits
+
+// The six JSON types, as jq names them.
+//
+// Assembled from the standard library's typed accessors, with the
+// rendering as the fallback for the one pair they cannot separate —
+// `{}` and `null`.  Published because `type` is a builtin, because
+// every error message needs it, and because a caller branching on a
+// value's kind should not write the same six-way question again.
+pub enum JqKind
+    JqKNull
+    JqKBoolean
+    JqKNumber
+    JqKString
+    JqKArray
+    JqKObject
+
+// The budget a run gets when the caller does not say.
+//
+// Generous enough that an ordinary program never meets it and finite
+// enough that a hostile one stops.
+//
+// ```novo
+// use jqeval
+//
+// fn main() [io]
+//     println("${jqeval.default_limits().max_outputs}")
+// ```
+pub fn default_limits() -> JqLimits []
+    todo("jsonquery-nv.jqeval.default_limits")
+
+// An environment with no bindings and the default budget.
+//
+// ```novo
+// use std.list
+// use jqeval
+//
+// fn main() [io]
+//     println("${list.len(jqeval.empty_env().bindings)}")
+// ```
+pub fn empty_env() -> JqEnv []
+    todo("jsonquery-nv.jqeval.empty_env")
+
+// An environment with a budget the caller chose.
+//
+// ```novo
+// use jqeval
+//
+// fn main() [io]
+//     println("${jqeval.env_with(jqeval.default_limits()).limits.max_steps}")
+// ```
+pub fn env_with(limits: JqLimits) -> JqEnv []
+    todo("jsonquery-nv.jqeval.env_with")
+
+// Bind a name, shadowing any earlier binding of it.
+//
+// ```novo
+// use std.json
+// use jqeval
+//
+// fn main() [io]
+//     match json.parse("3")
+//         None    => println("unreachable")
+//         Some(v) => println("${jqeval.bind(jqeval.empty_env(), "n", v).bindings}")
+// ```
+pub fn bind(env: JqEnv, name: Str, value: JsonValueH) -> JqEnv []
+    todo("jsonquery-nv.jqeval.bind")
+
+// What a name is bound to, or `None`.
+//
+// ```novo
+// use jqeval
+//
+// fn main() [io]
+//     match jqeval.lookup(jqeval.empty_env(), "n")
+//         None    => println("unbound")
+//         Some(_) => println("bound")
+// ```
+pub fn lookup(env: JqEnv, name: Str) -> ?JsonValueH []
+    todo("jsonquery-nv.jqeval.lookup")
+
+// Run a program over one value.
+//
+// The call nearly every caller makes.  `run_with` is the same thing
+// with bindings and a budget.
+//
+// ```novo
+// use std.json
+// use jqeval
+// use jqlang
+//
+// fn main() [io]
+//     match jqlang.parse(".users[] | .name")
+//         Err(_) => println("did not parse")
+//         Ok(p)  =>
+//             match json.parse("{\"users\":[{\"name\":\"ada\"}]}")
+//                 None    => println("not json")
+//                 Some(v) =>
+//                     for out in jqeval.run(p, v).values
+//                         println(json.stringify(out))
+// ```
+pub fn run(p: jqlang.JqProgram, input: JsonValueH) -> JqOutcome []
+    todo("jsonquery-nv.jqeval.run")
+
+// Run a program with bindings and a budget.
+//
+// ```novo
+// use std.json
+// use jqeval
+// use jqlang
+//
+// fn main() [io]
+//     match jqlang.parse_with(".a", ["n"])
+//         Err(_) => println("did not parse")
+//         Ok(p)  =>
+//             match json.parse("{\"a\":1}")
+//                 None    => println("not json")
+//                 Some(v) => println("${jqeval.failed(jqeval.run_with(p, v, jqeval.empty_env()))}")
+// ```
+pub fn run_with(p: jqlang.JqProgram, input: JsonValueH, env: JqEnv) -> JqOutcome []
+    todo("jsonquery-nv.jqeval.run_with")
+
+// Run a program over each of several values, answering one outcome
+// per input.
+//
+// What a document-per-line stream needs, and the reason it is here
+// rather than in the caller's loop: a record that fails must not stop
+// the records after it, and a caller writing the loop by hand has to
+// decide that for itself.  One outcome per input is the shape in which
+// the decision is the caller's and the default is right.
+//
+// ```novo
+// use std.json
+// use std.list
+// use jqeval
+// use jqlang
+//
+// fn main() [io]
+//     match jqlang.parse(".")
+//         Err(_) => println("did not parse")
+//         Ok(p)  =>
+//             match json.parse("1")
+//                 None    => println("not json")
+//                 Some(v) => println("${list.len(jqeval.run_stream(p, [v], jqeval.empty_env()))}")
+// ```
+pub fn run_stream(p: jqlang.JqProgram, inputs: [JsonValueH], env: JqEnv) -> [JqOutcome] []
+    todo("jsonquery-nv.jqeval.run_stream")
+
+// Apply one filter to one value.
+//
+// The recursive step, published because a caller extending the
+// language — a host package adding `input`, say — needs to evaluate
+// the sub-filters it was handed.
+//
+// ```novo
+// use std.json
+// use jqeval
+// use jqlang
+//
+// fn main() [io]
+//     match json.parse("1")
+//         None    => println("not json")
+//         Some(v) => println("${jqeval.failed(jqeval.apply(JqFIdentity(0), v, jqeval.empty_env()))}")
+// ```
+pub fn apply(f: jqlang.JqFilter, input: JsonValueH, env: JqEnv) -> JqOutcome []
+    todo("jsonquery-nv.jqeval.apply")
+
+// Run a JSONPath query with JQ's rules.
+//
+// jsonpath-nv's walk, and then the four places jq disagrees with
+// RFC 9535, applied in one function so the difference is readable
+// rather than spread through an evaluator:
+//
+//   1. a NAME selector against an object that has no such member
+//      answers `null` here and nothing under RFC 9535;
+//   2. an INDEX selector past the end of an array answers `null` here
+//      and nothing under RFC 9535;
+//   3. a name or index selector against `null` answers `null` here,
+//      which follows from 1 and 2 and is worth stating because it is
+//      what makes `.a.b.c` safe on a document missing `.a`;
+//   4. any selector against a value that is not the container it
+//      addresses — `.foo` on a number, `.[0]` on an object, `.[]` on a
+//      string — is a `JqCannotIndex` or `JqCannotIterate` ERROR here
+//      and nothing under RFC 9535.
+//
+// Rule 4 has one exception, and it is jq's: `.[]` against `null` is an
+// error even though `.foo` against `null` is not.  It looks
+// inconsistent because it is; `orbit/nq` keeps it, its README says so,
+// and a user who knows jq must not have to relearn it.
+//
+// ```novo
+// use std.json
+// use jpquery
+// use jqeval
+//
+// fn main() [io]
+//     match jpquery.parse("$['a']")
+//         Err(_) => println("bad path")
+//         Ok(q)  =>
+//             match json.parse("{}")
+//                 None    => println("not json")
+//                 Some(v) => println("${jqeval.failed(jqeval.select_path(q, v))}")
+// ```
+pub fn select_path(q: jpquery.JpQuery, v: JsonValueH) -> JqOutcome []
+    todo("jsonquery-nv.jqeval.select_path")
+
+// Run a JSONPath query with RFC 9535's rules, unchanged.
+//
+// `jpeval.select_values`, re-exported under a name that says which
+// rules it follows.  Published beside `select_path` because the choice
+// between them is a caller's: a jq program embedded in a tool that also
+// speaks JSONPath wants the same answers as everything else that
+// speaks it, and a jq user wants jq's.  Silently picking one would
+// make a document with a missing member answer `null` in one tool and
+// nothing in another with no way to see why.
+//
+// ```novo
+// use std.json
+// use std.list
+// use jpquery
+// use jqeval
+//
+// fn main() [io]
+//     match jpquery.parse("$['a']")
+//         Err(_) => println("bad path")
+//         Ok(q)  =>
+//             match json.parse("{}")
+//                 None    => println("not json")
+//                 Some(v) => println("${list.len(jqeval.select_path_rfc(q, v))}")
+// ```
+pub fn select_path_rfc(q: jpquery.JpQuery, v: JsonValueH) -> [JsonValueH] []
+    todo("jsonquery-nv.jqeval.select_path_rfc")
+
+// An outcome that produced these values and did not fail.
+//
+// ```novo
+// use std.list
+// use jqeval
+//
+// fn main() [io]
+//     println("${list.len(jqeval.produced([]).values)}")
+// ```
+pub fn produced(values: [JsonValueH]) -> JqOutcome []
+    todo("jsonquery-nv.jqeval.produced")
+
+// An outcome that produced these values and then failed.
+//
+// Both halves, because that is the case a `Result` cannot carry and
+// the reason this type exists.
+//
+// ```novo
+// use std.json
+// use jqerror
+// use jqeval
+//
+// fn main() [io]
+//     match json.parse("\"stop\"")
+//         None    => println("unreachable")
+//         Some(v) => println("${jqeval.failed(jqeval.raised([], jqerror.error(JqUserRaised, v, 0)))}")
+// ```
+pub fn raised(values: [JsonValueH], e: jqerror.JqError) -> JqOutcome []
+    todo("jsonquery-nv.jqeval.raised")
+
+// Whether a run stopped on an error.
+//
+// ```novo
+// use std.list
+// use jqeval
+//
+// fn main() [io]
+//     println("${jqeval.failed(jqeval.produced([]))}")
+// ```
+pub fn failed(o: JqOutcome) -> Bool []
+    todo("jsonquery-nv.jqeval.failed")
+
+// jq's exit code for an outcome, with `-e` on or off.
+//
+// Published because three tools will otherwise map it three ways and
+// disagree about the one case that matters: no output is 1, which is
+// how a shell script asks "did that match anything".  `-e` adds the
+// second question — was the LAST value truthy — to the same code.
+//
+// ```novo
+// use jqeval
+//
+// fn main() [io]
+//     println("${jqeval.exit_code(jqeval.produced([]), false)}")
+// ```
+pub fn exit_code(o: JqOutcome, want_status: Bool) -> Int []
+    todo("jsonquery-nv.jqeval.exit_code")
+
+// What kind of value this is.
+//
+// ```novo
+// use std.json
+// use jqeval
+//
+// fn main() [io]
+//     match json.parse("[]")
+//         None    => println("not json")
+//         Some(v) => println(jqeval.type_name(v))
+// ```
+pub fn kind(v: JsonValueH) -> JqKind []
+    todo("jsonquery-nv.jqeval.kind")
+
+// The name `type` answers: "null", "boolean", "number", "string",
+// "array", "object".
+//
+// ```novo
+// use std.json
+// use jqeval
+//
+// fn main() [io]
+//     match json.parse("true")
+//         None    => println("not json")
+//         Some(v) => println(jqeval.type_name(v))
+// ```
+pub fn type_name(v: JsonValueH) -> Str []
+    todo("jsonquery-nv.jqeval.type_name")
+
+// Whether a value is truthy.
+//
+// Only `null` and `false` are falsy.  `0`, `""`, `[]` and `{}` are
+// all true, which is jq's rule and not most languages', and it is what
+// `select`, `if`, `and`, `or` and `//` all consult.
+//
+// ```novo
+// use std.json
+// use jqeval
+//
+// fn main() [io]
+//     match json.parse("0")
+//         None    => println("not json")
+//         Some(v) => println("${jqeval.truthy(v)}")
+// ```
+pub fn truthy(v: JsonValueH) -> Bool []
+    todo("jsonquery-nv.jqeval.truthy")
+
+// jq's total order over every pair of values: negative, zero or
+// positive.
+//
+// `null < false < true < numbers < strings < arrays < objects`, with
+// arrays compared element by element and objects by their sorted keys
+// and then their values.  It is total, so a comparison never fails —
+// which is what lets `sort` and `group_by` run over records where only
+// some carry the field.
+//
+// It is jq's rather than jsonpath-nv's because RFC 9535 § 2.3.5.2.2
+// orders only numbers against numbers and strings against strings, and
+// says a cross-type comparison is simply false.  The two agree
+// everywhere the RFC has an opinion.
+//
+// ```novo
+// use std.json
+// use jqeval
+//
+// fn main() [io]
+//     match json.parse("1")
+//         None    => println("not json")
+//         Some(v) => println("${jqeval.order(v, v)}")
+// ```
+pub fn order(a: JsonValueH, b: JsonValueH) -> Int []
+    todo("jsonquery-nv.jqeval.order")
+
+// Structural equality: `1` and `1.0` are equal, member order is
+// irrelevant, and arrays compare element by element.
+//
+// `jpeval.value_equals` is the same predicate and this delegates to
+// it; there is no `json.equals` in the standard library for either of
+// them to defer to, which jsonpath-nv has already filed.
+//
+// ```novo
+// use std.json
+// use jqeval
+//
+// fn main() [io]
+//     match json.parse("[1,2]")
+//         None    => println("not json")
+//         Some(v) => println("${jqeval.equal(v, v)}")
+// ```
+pub fn equal(a: JsonValueH, b: JsonValueH) -> Bool []
+    todo("jsonquery-nv.jqeval.equal")
+
+// The JSON `null`.
+//
+// A value this package returns constantly — every missing field is one
+// — and one the standard library has no literal for.
+//
+// ```novo
+// use std.json
+// use jqeval
+//
+// fn main() [io]
+//     println(json.stringify(jqeval.null_value()))
+// ```
+pub fn null_value() -> JsonValueH []
+    todo("jsonquery-nv.jqeval.null_value")

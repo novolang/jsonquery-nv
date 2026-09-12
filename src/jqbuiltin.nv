@@ -1,0 +1,391 @@
+// jqbuiltin.nv — the builtin table, as data.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE TABLE IS A VALUE, NOT A `match` IN THE PARSER, and that is the
+// whole argument for this module existing.  A parser that decides
+// builtins with a branch can answer exactly one question — is this
+// name one of mine — and four callers need a different one:
+//
+//   * an ERROR MESSAGE needs the arities a name does have, so
+//     `range(1;2;3;4)` is told "range has 1, 2 and 3 arguments" rather
+//     than "unknown function";
+//   * COMPLETION in an editor needs the whole list with a summary
+//     line each, and re-deriving it from a `match` means writing it
+//     twice;
+//   * the EVALUATOR needs to know which arguments are FILTERS rather
+//     than values, because `map(.x)` runs its argument once per
+//     element and `limit(3; f)` must not run its second argument at
+//     all until it wants the next output;
+//   * a REFUSAL needs a reason.  Six of jq's builtins are absent here
+//     on purpose, and "unknown function gsub" is a worse answer than
+//     the truth, which is that I-Regexp has no capture groups.
+//
+// `orbit/nq` is the case in point: its parser hard-codes six names and
+// its error message hard-codes the same six in prose, a few hundred
+// lines apart, and the two are one edit away from disagreeing.
+//
+// ONE VARIANT PER NAME AND ARITY.  jq overloads on argument count —
+// `range/1`, `range/2` and `range/3` are three different filters — so
+// the variant is the pair, not the name.  `resolve("range", 2)` is the
+// lookup a parser does, and it cannot return the wrong one.
+//
+// WHAT IS NOT HERE, and why each absence is a decision rather than an
+// oversight, is `absent_named` and `absence_reason`: the six regex
+// builtins that need capture semantics, and the host builtins a `core`
+// package has no machine to answer with.
+
+// One builtin, named by what it is called and how many arguments it
+// takes.  The groups below are jq's own manual's.
+pub enum JqBuiltin
+    // ── Control and streams ──────────────────────────────────────
+    // `empty` — zero outputs.  The identity of `,`, and the filter
+    // `select(false)` reduces to.
+    JqbEmpty
+    // `error` — raise the input as an error value.
+    JqbError0
+    // `error(v)` — raise `v`.
+    JqbError1
+    // `not` — the only jq builtin spelled as a filter rather than an
+    // operator, because `!` is taken by `!=`.
+    JqbNot
+    // `recurse` — `.` and everything under it, depth first.
+    JqbRecurse0
+    // `recurse(f)` — `.`, then `f`, then `f` of that, until `f`
+    // produces nothing.
+    JqbRecurse1
+    // `range(n)` — 0, 1, … n-1, as separate outputs.
+    JqbRange1
+    // `range(from; upto)`.
+    JqbRange2
+    // `range(from; upto; by)`.
+    JqbRange3
+    // `first(f)` — the first output of `f`, and `f` is not run again.
+    JqbFirst1
+    // `last(f)`.
+    JqbLast1
+    // `limit(n; f)` — at most `n` outputs of `f`.  The laziness here
+    // is the reason `takes_filter_argument` is published: an
+    // implementation that collected `f` first would run an infinite
+    // `repeat` forever.
+    JqbLimit2
+    // `until(cond; update)`.
+    JqbUntil2
+    // `while(cond; update)`.
+    JqbWhile2
+
+    // ── Types and their shape ────────────────────────────────────
+    // `type` — "null", "boolean", "number", "string", "array",
+    // "object".
+    JqbType
+    // `length` — elements, members, codepoints, or a number's absolute
+    // value.  `null | length` is 0 and `true | length` is an error,
+    // both of which are jq's and both of which `orbit/nq` asserts.
+    JqbLength
+    // `utf8bytelength` — a string's length in BYTES, which is the one
+    // `length` is not.
+    JqbUtf8ByteLength
+    // `has(k)`.
+    JqbHas1
+    // `in(o)` — `has` with the arguments the other way round, so it
+    // composes after a pipe.
+    JqbIn1
+    // `contains(v)`.
+    JqbContains1
+    // `inside(v)` — `contains` with the arguments the other way round.
+    JqbInside1
+
+    // ── Objects and arrays ───────────────────────────────────────
+    // `keys` — an object's member names SORTED, or an array's indices.
+    // The sort is jq's and is not RFC 9535's document order.
+    JqbKeys
+    // `keys_unsorted` — the same names in the order the document has
+    // them.  Separate from `keys` because the standard library's JSON
+    // value is what carries the order, and a caller round-tripping a
+    // document wants this one.
+    JqbKeysUnsorted
+    // `values` — every value that is not `null`.
+    JqbValues
+    // `to_entries` — `{"a":1}` becomes `[{"key":"a","value":1}]`.
+    JqbToEntries
+    // `from_entries` — the inverse, accepting jq's four spellings of a
+    // key (`key`, `k`, `name`, `Name`).
+    JqbFromEntries
+    // `with_entries(f)` — `to_entries | map(f) | from_entries`.
+    JqbWithEntries1
+    // `add` — the elements of an array added together, left to right.
+    JqbAdd
+    // `any` / `all` over an array of booleans.
+    JqbAny0
+    JqbAll0
+    // `any(f)` / `all(f)` over the outputs of a filter.
+    JqbAny1
+    JqbAll1
+    // `flatten` — all the way down.
+    JqbFlatten0
+    // `flatten(depth)`.
+    JqbFlatten1
+
+    // ── Selecting and mapping ────────────────────────────────────
+    // `select(f)` — the input if `f` is truthy, and nothing otherwise.
+    JqbSelect1
+    // `map(f)` — `[.[] | f]`.
+    JqbMap1
+    // `map_values(f)` — the same, keeping an object's keys.
+    JqbMapValues1
+    // `path(f)` — the PATH `f` would select, as an array of names and
+    // indices.  `jqlang.is_path_expression` is what decides whether a
+    // filter may be the argument, and the refusal is at parse time.
+    JqbPath1
+    // `paths` — every path in the input, as arrays.
+    JqbPaths0
+    // `paths(f)` — the paths whose value satisfies `f`.
+    JqbPaths1
+    // `getpath(p)` — the value at a path array, `null` where there is
+    // none.
+    JqbGetpath1
+
+    // ── Ordering ─────────────────────────────────────────────────
+    // `sort` — by jq's total order, which is `jqeval.order`.
+    JqbSort
+    // `sort_by(f)` — by the OUTPUTS of `f` as an array, which is how
+    // `sort_by(.a, .b)` sorts on two keys.
+    JqbSortBy1
+    // `group_by(f)` — sorted, then split where the key changes.
+    JqbGroupBy1
+    JqbUnique
+    JqbUniqueBy1
+    JqbReverse
+    JqbMin
+    JqbMax
+    JqbMinBy1
+    JqbMaxBy1
+
+    // ── Strings ──────────────────────────────────────────────────
+    // `tostring` — a string stays itself; everything else is its JSON.
+    JqbToString
+    JqbToNumber
+    // `tojson` / `fromjson` — the pair that makes a JSON document
+    // inside a string reachable.
+    JqbToJson
+    JqbFromJson
+    JqbAsciiDowncase
+    JqbAsciiUpcase
+    // `explode` / `implode` — codepoints, not bytes.
+    JqbExplode
+    JqbImplode
+    // `split(sep)` — on a literal separator.  jq's `split/2` is the
+    // regex form and is absent with the rest of them.
+    JqbSplit1
+    JqbJoin1
+    JqbLtrimstr1
+    JqbRtrimstr1
+    JqbStartswith1
+    JqbEndswith1
+    // `test(re)` — the one regex builtin, over I-Regexp.  `test/2`
+    // takes jq's flags string, and flags are exactly what RFC 9485
+    // removed, so it is refused by name.
+    JqbTest1
+
+    // ── Arithmetic ───────────────────────────────────────────────
+    JqbFloor
+    JqbCeil
+    JqbSqrt
+
+// Every builtin this package has, in the order the groups above are
+// written.
+//
+// The list a completion, a documentation page and a `--list-builtins`
+// flag all read, so none of them can drift from the parser.
+//
+// ```novo
+// use std.list
+// use jqbuiltin
+//
+// fn main() [io]
+//     println("${list.len(jqbuiltin.all())}")
+// ```
+pub fn all() -> [JqBuiltin] []
+    todo("jsonquery-nv.jqbuiltin.all")
+
+// What a builtin is called, without its arity.
+//
+// ```novo
+// use jqbuiltin
+//
+// fn main() [io]
+//     println(jqbuiltin.name(JqbRange2))
+// ```
+pub fn name(b: JqBuiltin) -> Str []
+    todo("jsonquery-nv.jqbuiltin.name")
+
+// How many arguments it takes.
+//
+// ```novo
+// use jqbuiltin
+//
+// fn main() [io]
+//     println("${jqbuiltin.arity(JqbRange2)}")
+// ```
+pub fn arity(b: JqBuiltin) -> Int []
+    todo("jsonquery-nv.jqbuiltin.arity")
+
+// jq's own spelling of the pair: `range/2`.
+//
+// ```novo
+// use jqbuiltin
+//
+// fn main() [io]
+//     println(jqbuiltin.signature(JqbRange2))
+// ```
+pub fn signature(b: JqBuiltin) -> Str []
+    todo("jsonquery-nv.jqbuiltin.signature")
+
+// One line describing what it does, for a completion list or an error.
+//
+// ```novo
+// use jqbuiltin
+//
+// fn main() [io]
+//     println(jqbuiltin.summary(JqbKeys))
+// ```
+pub fn summary(b: JqBuiltin) -> Str []
+    todo("jsonquery-nv.jqbuiltin.summary")
+
+// The builtin a name and an argument count denote.
+//
+// The lookup the parser makes, and the reason the variant is the pair
+// rather than the name: there is no way for this to answer `range/1`
+// when the program wrote `range/2`.
+//
+// ```novo
+// use jqbuiltin
+//
+// fn main() [io]
+//     match jqbuiltin.resolve("range", 2)
+//         None    => println("no such builtin")
+//         Some(b) => println(jqbuiltin.signature(b))
+// ```
+pub fn resolve(name_text: Str, argument_count: Int) -> ?JqBuiltin []
+    todo("jsonquery-nv.jqbuiltin.resolve")
+
+// Whether any builtin is called this, at any arity.
+//
+// What separates "there is no such function" from "there is, but not
+// with that many arguments", which are two different things to be told.
+//
+// ```novo
+// use jqbuiltin
+//
+// fn main() [io]
+//     println("${jqbuiltin.is_known_name("range")}")
+// ```
+pub fn is_known_name(name_text: Str) -> Bool []
+    todo("jsonquery-nv.jqbuiltin.is_known_name")
+
+// The argument counts a name has forms for, ascending.
+//
+// The message a `JqWrongArity` fault is built from: `range` answers
+// `[1, 2, 3]`, and `length` answers `[0]`.
+//
+// ```novo
+// use jqbuiltin
+//
+// fn main() [io]
+//     println("${jqbuiltin.arities_of("range")}")
+// ```
+pub fn arities_of(name_text: Str) -> [Int] []
+    todo("jsonquery-nv.jqbuiltin.arities_of")
+
+// Whether argument `index` is a FILTER rather than a value.
+//
+// The fact an evaluator cannot work without and a table of names and
+// arities does not carry.  `map(.x)` runs its argument once per
+// element with the element as input; `ltrimstr("a")` evaluates its
+// argument once against the same input and uses the value.  An
+// implementation that guessed would either break `map` or run the `f`
+// in `limit(3; repeat(1))` forever.
+//
+// ```novo
+// use jqbuiltin
+//
+// fn main() [io]
+//     println("${jqbuiltin.takes_filter_argument(JqbMap1, 0)}")
+// ```
+pub fn takes_filter_argument(b: JqBuiltin, index: Int) -> Bool []
+    todo("jsonquery-nv.jqbuiltin.takes_filter_argument")
+
+// Whether a builtin can produce more than one output for one input.
+//
+// `range`, `recurse`, `paths` and `empty` can; `length` cannot.  A
+// caller sizing a buffer, or a linter warning that `[limit(1; f)]` is
+// the same as `[first(f)]`, reads this rather than a list of names.
+//
+// ```novo
+// use jqbuiltin
+//
+// fn main() [io]
+//     println("${jqbuiltin.may_stream(JqbRange1)}")
+// ```
+pub fn may_stream(b: JqBuiltin) -> Bool []
+    todo("jsonquery-nv.jqbuiltin.may_stream")
+
+// The jq builtins this package refuses BY NAME, with a reason each.
+//
+// Published as data because "unknown function" is the wrong answer for
+// a name jq has: a user who wrote `gsub` did not misspell anything,
+// and telling them so sends them looking for a typo.  Two groups:
+//
+//   * the regex family — `match`, `capture`, `scan`, `splits`, `sub`,
+//     `gsub`, and `test/2` — which need capture groups and match
+//     offsets.  I-Regexp (RFC 9485) has no capture semantics at all,
+//     and `jpregex` answers a `Bool`; inventing offsets here would
+//     mean inventing a pattern language beside the portable one, which
+//     is the thing the choice of I-Regexp was made to avoid;
+//   * the host family — `env`, `$ENV`, `input`, `inputs`,
+//     `input_line_number`, `now`, `localtime`, `strftime`,
+//     `halt_error`, `debug` — which read a machine.  A `core` package
+//     has no environment, no clock and no standard input, and a jq
+//     program that silently answered `null` for `env.HOME` would be
+//     worse than one that refused.
+//
+// ```novo
+// use std.list
+// use jqbuiltin
+//
+// fn main() [io]
+//     println("${list.len(jqbuiltin.absent_named())}")
+// ```
+pub fn absent_named() -> [Str] []
+    todo("jsonquery-nv.jqbuiltin.absent_named")
+
+// Why that name is absent, or `None` when it is not a jq builtin at
+// all.
+//
+// ```novo
+// use jqbuiltin
+//
+// fn main() [io]
+//     match jqbuiltin.absence_reason("gsub")
+//         None    => println("not a refusal")
+//         Some(r) => println(r)
+// ```
+pub fn absence_reason(name_text: Str) -> ?Str []
+    todo("jsonquery-nv.jqbuiltin.absence_reason")
+
+// Whether a name is one a HOST could supply.
+//
+// The split inside `absent_named`, as a predicate: `env` and `input`
+// are absent because this package is `core`, so a `host` package built
+// over it could answer them, and a caller reading the refusal should
+// be told which side of that line the name falls on.  `gsub` is on the
+// other side — no layer makes I-Regexp grow capture groups.
+//
+// ```novo
+// use jqbuiltin
+//
+// fn main() [io]
+//     println("${jqbuiltin.absent_for_layer("env")}")
+// ```
+pub fn absent_for_layer(name_text: Str) -> Bool []
+    todo("jsonquery-nv.jqbuiltin.absent_for_layer")

@@ -1,0 +1,175 @@
+// jqfmt_tests.nv — the CSV typing rule, the column arithmetic and the
+// three renderings.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: jsonquery-nv.jqfmt.<fn>`.
+//
+// THE TYPING TABLE IS `orbit/nq`'s README, ASSERTED.  Its "Types read
+// out of CSV" section is a table of eight rows and every one of them is
+// a case below, because the round-trip condition is the kind of rule
+// that looks arbitrary in prose and obvious once the examples are
+// beside each other: `120` is a number, `00417` is a string, and the
+// reason is the same reason both times.
+
+use std.test
+use std.json
+use std.list
+use jqeval
+use jqfmt
+
+fn value_of(text: Str) -> JsonValueH
+    json.parse(text) ?? jqeval.null_value()
+
+@test
+fn test_a_cell_gets_the_narrowest_type_that_renders_back_as_itself() [io]
+    test.case("120 is the number 120, because 120 renders back as 120")
+    test.assert(jqeval.equal(jqfmt.cell_value("120"), value_of("120")))
+
+    test.case("-7 and 1.5 are numbers for the same reason")
+    test.assert(jqeval.equal(jqfmt.cell_value("-7"), value_of("-7")))
+    test.assert(jqeval.equal(jqfmt.cell_value("1.5"), value_of("1.5")))
+
+    test.case("true and false are booleans")
+    test.assert(jqeval.equal(jqfmt.cell_value("true"), value_of("true")))
+    test.assert(jqeval.equal(jqfmt.cell_value("false"), value_of("false")))
+
+    test.case("an empty cell is null — a blank means no value here")
+    test.assert(jqeval.equal(jqfmt.cell_value(""), jqeval.null_value()))
+
+    test.case("00417 stays a STRING: 417 does not render back as 00417")
+    test.assert(jqeval.type_name(jqfmt.cell_value("00417")) == "string")
+
+    test.case("1.50 stays a string: 1.5 does not render back as 1.50")
+    test.assert(jqeval.type_name(jqfmt.cell_value("1.50")) == "string")
+
+    test.case("+7 and 1e3 stay strings: neither renders back as written")
+    test.assert(jqeval.type_name(jqfmt.cell_value("+7")) == "string")
+    test.assert(jqeval.type_name(jqfmt.cell_value("1e3")) == "string")
+
+    test.case("anything else is a string")
+    test.assert(jqeval.type_name(jqfmt.cell_value("north")) == "string")
+
+@test
+fn test_the_round_trip_condition_is_the_rule_itself() [io]
+    test.case("417 does not render back as 00417")
+    test.assert(jqfmt.round_trips("00417", value_of("417")) == false)
+
+    test.case("120 does render back as 120")
+    test.assert(jqfmt.round_trips("120", value_of("120")))
+
+    test.case("which is why a zip code survives and a quantity does not stay text")
+    test.assert(jqeval.type_name(jqfmt.cell_value("00905")) == "string")
+    test.assert(jqeval.type_name(jqfmt.cell_value("0")) == "number")
+
+@test
+fn test_csv_becomes_objects_with_a_header_and_arrays_without_one() [io]
+    test.case("a header row names the fields")
+    match jqfmt.csv_to_json("region,units\nnorth,120\n", true)
+        None    => test.assert(false)
+        Some(v) => test.assert(list.len(jqfmt.columns(json.to_list(v) ?? [])) == 2)
+
+    test.case("without a header, rows are arrays addressed positionally")
+    match jqfmt.csv_to_json("region,units\nnorth,120\n", false)
+        None    => test.assert(false)
+        Some(v) => test.assert(list.len(json.to_list(v) ?? []) == 2)
+
+    test.case("text that is not CSV at all answers None")
+    match jqfmt.csv_to_json("", true)
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+@test
+fn test_columns_are_every_key_any_record_carries_in_the_order_first_seen() [io]
+    test.case("a record missing a column does not remove it")
+    let rows = [value_of("{\"a\":1,\"b\":2}"), value_of("{\"a\":3}")]
+    test.assert(jqfmt.columns(rows) == ["a", "b"])
+
+    test.case("a column only a later record carries is appended, not sorted in")
+    let rows2 = [value_of("{\"b\":1}"), value_of("{\"a\":2}")]
+    test.assert(jqfmt.columns(rows2) == ["b", "a"])
+
+    test.case("no rows, no columns")
+    test.assert(list.len(jqfmt.columns([])) == 0)
+
+@test
+fn test_a_cell_holding_a_container_shows_its_json_rather_than_a_blank() [io]
+    test.case("an array cell is its JSON")
+    test.assert(jqfmt.cell_text(value_of("[\"math\"]")) == "[\"math\"]")
+
+    test.case("a string cell is bare")
+    test.assert(jqfmt.cell_text(value_of("\"ada\"")) == "ada")
+
+    test.case("a null cell says null, which is different from an empty one")
+    test.assert(jqfmt.cell_text(jqeval.null_value()) == "null")
+
+@test
+fn test_a_value_with_no_table_shape_is_refused_with_a_reason() [io]
+    test.case("an array of objects is a table")
+    match jqfmt.table_problem(value_of("[{\"a\":1}]"))
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+    test.case("one object is a table of one row")
+    match jqfmt.shape(value_of("{\"a\":1}"))
+        JqShapeRow => test.assert(true)
+        _          => test.assert(false)
+
+    test.case("a bare number is not, and says why")
+    match jqfmt.table_problem(value_of("3"))
+        None    => test.assert(false)
+        Some(m) => test.assert(m != "")
+
+    test.case("an empty array is a table with no rows, which is not the same thing")
+    match jqfmt.shape(value_of("[]"))
+        JqShapeEmpty => test.assert(true)
+        _            => test.assert(false)
+
+    test.case("a ragged array is named as ragged")
+    match jqfmt.shape(value_of("[{\"a\":1}, 3]"))
+        JqShapeRagged => test.assert(true)
+        _             => test.assert(false)
+
+@test
+fn test_the_grid_is_the_cells_and_the_table_is_the_rendering() [io]
+    test.case("the grid puts the header first")
+    match jqfmt.grid(value_of("[{\"a\":1},{\"a\":2}]"))
+        None    => test.assert(false)
+        Some(g) =>
+            test.assert(list.len(g) == 3)
+            test.assert(g[0] == ["a"])
+
+    test.case("a value with no table shape has no grid")
+    match jqfmt.grid(value_of("3"))
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+    test.case("the rendering is text and never a write")
+    match jqfmt.tabular(value_of("[{\"a\":1}]"))
+        None    => test.assert(false)
+        Some(t) => test.assert(t != "")
+
+@test
+fn test_csv_out_quotes_a_nested_value_by_csvs_own_rules() [io]
+    test.case("a table renders as CSV with its header")
+    match jqfmt.csv_out(value_of("[{\"a\":1,\"b\":2}]"))
+        None    => test.assert(false)
+        Some(c) => test.assert(c != "")
+
+    test.case("a value with no table shape has no CSV")
+    match jqfmt.csv_out(value_of("3"))
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+@test
+fn test_raw_changes_only_what_happens_to_a_string() [io]
+    test.case("a string loses its quotes")
+    test.assert(jqfmt.raw(value_of("\"ada\"")) == "ada")
+
+    test.case("an object does not — raw over a container is still JSON")
+    test.assert(jqfmt.raw(value_of("{\"a\":1}")) == jqfmt.compact(value_of("{\"a\":1}")))
+
+    test.case("compact is one line")
+    test.assert(jqfmt.compact(value_of("{\"a\":1}")) == "{\"a\":1}")
+
+    test.case("pretty takes the indent rather than deciding it")
+    test.assert(jqfmt.pretty(value_of("{\"a\":1}"), 2) != jqfmt.compact(value_of("{\"a\":1}")))

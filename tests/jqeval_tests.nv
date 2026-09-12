@@ -1,0 +1,343 @@
+// jqeval_tests.nv — the evaluator, and the four places jq's answers
+// are not RFC 9535's.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: jsonquery-nv.jqeval.<fn>`.
+//
+// THE VECTORS ARE `orbit/nq`'s OWN.  nq's `src/eval.nv` carries a
+// hundred assertions about jq's null-versus-error rule, its total order
+// and its fan-out, and every one of them is a rule this package now
+// owns.  The ones that state a rule rather than exercise a code path
+// are below, with nq's own names kept where they were good —
+// `test_a_missing_field_is_null_not_an_error` is the sentence the whole
+// table comes from.
+//
+// WHAT IS NEW HERE is everything nq could not express: an error that
+// arrives AFTER output, `try`/`catch` binding an error VALUE, and `//`
+// swallowing a failure on its left.  Those three are the reason
+// `JqOutcome` has two fields.
+
+use std.test
+use std.json
+use std.list
+use jpquery
+use jqerror
+use jqeval
+use jqlang
+
+fn value_of(text: Str) -> JsonValueH
+    json.parse(text) ?? jqeval.null_value()
+
+fn outcome_of(program_text: Str, document: Str) -> jqeval.JqOutcome
+    match jqlang.parse(program_text)
+        Err(_) => jqeval.produced([])
+        Ok(p)  => jqeval.run(p, value_of(document))
+
+@test
+fn test_an_error_does_not_erase_the_output_that_came_before_it() [io]
+    // THE LOAD-BEARING ASSERTION.  A `Result` has nowhere to put this.
+    test.case("a filter that emits and then raises reports both halves")
+    let o = outcome_of(".[] | (., error(\"stop\"))", "[1]")
+    test.assert(list.len(o.values) == 1)
+    test.assert(jqeval.failed(o))
+
+    test.case("a run that finishes has no fault")
+    test.assert(jqeval.failed(outcome_of(".", "1")) == false)
+
+    test.case("a run that matched nothing is not a failure")
+    let empty = outcome_of("select(false)", "1")
+    test.assert(list.len(empty.values) == 0)
+    test.assert(jqeval.failed(empty) == false)
+
+@test
+fn test_an_error_is_a_value_and_catch_binds_it() [io]
+    test.case("`error` raises whatever it was given, object and all")
+    let o = outcome_of("try error({code: 4}) catch .code", "null")
+    test.assert(list.len(o.values) == 1)
+    test.assert(jqeval.failed(o) == false)
+    test.assert(jqeval.equal(o.values[0], value_of("4")))
+
+    test.case("a raised error carries the value, not a rendering of it")
+    let raised = outcome_of("error({code: 4})", "null")
+    match raised.fault
+        None    => test.assert(false)
+        Some(e) =>
+            match e.kind
+                JqUserRaised => test.assert(jqeval.equal(jqerror.error_value(e), value_of("{\"code\":4}")))
+                _            => test.assert(false)
+
+    test.case("`f?` swallows the error and produces nothing")
+    let swallowed = outcome_of("(1 | .a)?", "null")
+    test.assert(list.len(swallowed.values) == 0)
+    test.assert(jqeval.failed(swallowed) == false)
+
+    test.case("a budget is not catchable — a program may not decide to ignore one")
+    test.assert(jqerror.is_catchable(JqOverBudget) == false)
+    test.assert(jqerror.is_catchable(JqCannotIndex))
+
+@test
+fn test_the_alternative_operator_swallows_a_failure_on_its_left() [io]
+    test.case("`.a.b // \"none\"` answers the right side when the left errors")
+    let o = outcome_of(".a.b // \"none\"", "{\"a\": 3}")
+    test.assert(list.len(o.values) == 1)
+    test.assert(jqeval.failed(o) == false)
+
+    test.case("and when the left is null")
+    test.assert(list.len(outcome_of(".a // 7", "{}").values) == 1)
+
+    test.case("but not when the left produced a truthy value")
+    test.assert(jqeval.equal(outcome_of(".a // 7", "{\"a\": 1}").values[0], value_of("1")))
+
+@test
+fn test_a_missing_field_is_null_not_an_error() [io]
+    // nq's own assertion name, and the sentence the whole table comes
+    // from: reaching INTO a container that has no such place is `null`;
+    // reaching into something that is not a container at all is an
+    // error.
+    test.case("a field an object does not have")
+    test.assert(jqeval.equal(outcome_of(".foo", "{}").values[0], jqeval.null_value()))
+
+    test.case("a field of null")
+    test.assert(jqeval.equal(outcome_of(".foo", "null").values[0], jqeval.null_value()))
+
+    test.case("an index past the end of an array")
+    test.assert(jqeval.equal(outcome_of(".[3]", "[1,2]").values[0], jqeval.null_value()))
+
+    test.case("a field of a number is an error")
+    match outcome_of(".foo", "3").fault
+        None    => test.assert(false)
+        Some(e) =>
+            match e.kind
+                JqCannotIndex => test.assert(true)
+                _             => test.assert(false)
+
+    test.case("indexing an object with a number is an error")
+    match outcome_of(".[3]", "{}").fault
+        None    => test.assert(false)
+        Some(e) =>
+            match e.kind
+                JqCannotIndex => test.assert(true)
+                _             => test.assert(false)
+
+    test.case("iterating a scalar is an error, and so is iterating null")
+    match outcome_of(".[]", "3").fault
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+    match outcome_of(".[]", "null").fault
+        None    => test.assert(false)
+        Some(e) =>
+            match e.kind
+                JqCannotIterate => test.assert(true)
+                _               => test.assert(false)
+
+@test
+fn test_jq_and_rfc_9535_answer_the_same_path_differently() [io]
+    // The four rows of the README's table, asserted against each other
+    // through the same parsed query, which is what makes the difference
+    // a fact rather than a paragraph.
+    test.case("a missing member: jq answers null, RFC 9535 answers nothing")
+    match jpquery.parse("$['a']")
+        Err(_) => test.assert(false)
+        Ok(q)  =>
+            let doc = value_of("{}")
+            test.assert(list.len(jqeval.select_path(q, doc).values) == 1)
+            test.assert(list.len(jqeval.select_path_rfc(q, doc)) == 0)
+
+    test.case("an index past the end: the same split")
+    match jpquery.parse("$[3]")
+        Err(_) => test.assert(false)
+        Ok(q)  =>
+            let doc = value_of("[1,2]")
+            test.assert(list.len(jqeval.select_path(q, doc).values) == 1)
+            test.assert(list.len(jqeval.select_path_rfc(q, doc)) == 0)
+
+    test.case("a name selector against a number: jq raises, RFC 9535 answers nothing")
+    match jpquery.parse("$['a']")
+        Err(_) => test.assert(false)
+        Ok(q)  =>
+            let doc = value_of("3")
+            test.assert(jqeval.failed(jqeval.select_path(q, doc)))
+            test.assert(list.len(jqeval.select_path_rfc(q, doc)) == 0)
+
+    test.case("a wildcard against null: jq raises, RFC 9535 answers nothing")
+    match jpquery.parse("$[*]")
+        Err(_) => test.assert(false)
+        Ok(q)  =>
+            let doc = jqeval.null_value()
+            test.assert(jqeval.failed(jqeval.select_path(q, doc)))
+            test.assert(list.len(jqeval.select_path_rfc(q, doc)) == 0)
+
+    test.case("where the two agree, they agree")
+    match jpquery.parse("$['a']")
+        Err(_) => test.assert(false)
+        Ok(q)  =>
+            let doc = value_of("{\"a\": 1}")
+            test.assert(list.len(jqeval.select_path(q, doc).values) == 1)
+            test.assert(list.len(jqeval.select_path_rfc(q, doc)) == 1)
+
+@test
+fn test_a_stage_maps_one_value_to_a_stream() [io]
+    test.case("iteration fans out")
+    test.assert(list.len(outcome_of(".[]", "[1,2,3]").values) == 3)
+
+    test.case("a pipe after a fan-out runs per value")
+    test.assert(list.len(outcome_of(".[] | .a", "[{\"a\":1},{\"a\":2}]").values) == 2)
+
+    test.case("a comma concatenates two streams")
+    test.assert(list.len(outcome_of("(1, 2, 3)", "null").values) == 3)
+
+    test.case("an array construction turns a stream back into one value")
+    let collected = outcome_of("[.[] | .a]", "[{\"a\":1},{\"a\":2}]")
+    test.assert(list.len(collected.values) == 1)
+
+    test.case("iterating an object yields its values")
+    test.assert(list.len(outcome_of(".[]", "{\"a\":1,\"b\":2}").values) == 2)
+
+@test
+fn test_only_null_and_false_are_falsy() [io]
+    test.case("zero is truthy, which is jq's rule and not most languages'")
+    test.assert(jqeval.truthy(value_of("0")))
+
+    test.case("an empty string is truthy")
+    test.assert(jqeval.truthy(value_of("\"\"")))
+
+    test.case("an empty array is truthy")
+    test.assert(jqeval.truthy(value_of("[]")))
+
+    test.case("null is not")
+    test.assert(jqeval.truthy(jqeval.null_value()) == false)
+
+    test.case("false is not")
+    test.assert(jqeval.truthy(value_of("false")) == false)
+
+@test
+fn test_the_total_order_is_over_every_pair_of_values() [io]
+    // What lets `sort` and `group_by` run over records where only some
+    // carry the field.
+    test.case("null sorts before false")
+    test.assert(jqeval.order(jqeval.null_value(), value_of("false")) < 0)
+
+    test.case("false sorts before true")
+    test.assert(jqeval.order(value_of("false"), value_of("true")) < 0)
+
+    test.case("a boolean sorts before a number")
+    test.assert(jqeval.order(value_of("true"), value_of("0")) < 0)
+
+    test.case("a number sorts before a string")
+    test.assert(jqeval.order(value_of("9"), value_of("\"a\"")) < 0)
+
+    test.case("a string sorts before an array")
+    test.assert(jqeval.order(value_of("\"z\""), value_of("[]")) < 0)
+
+    test.case("an array sorts before an object")
+    test.assert(jqeval.order(value_of("[]"), value_of("{}")) < 0)
+
+    test.case("equality is structural — 1 and 1.0 are one value")
+    test.assert(jqeval.equal(value_of("1"), value_of("1.0")))
+
+    test.case("and member order is not part of it")
+    test.assert(jqeval.equal(value_of("{\"a\":1,\"b\":2}"), value_of("{\"b\":2,\"a\":1}")))
+
+@test
+fn test_every_type_names_itself() [io]
+    test.case("the six names `type` answers")
+    test.assert(jqeval.type_name(jqeval.null_value()) == "null")
+    test.assert(jqeval.type_name(value_of("true")) == "boolean")
+    test.assert(jqeval.type_name(value_of("1")) == "number")
+    test.assert(jqeval.type_name(value_of("\"s\"")) == "string")
+    test.assert(jqeval.type_name(value_of("[]")) == "array")
+    test.assert(jqeval.type_name(value_of("{}")) == "object")
+
+@test
+fn test_an_empty_object_is_not_null() [io]
+    // nq's regression test, kept by name.  The standard library's JSON
+    // value answers zero keys and `None` from every typed accessor for
+    // both, so the six-way question has to fall back to the rendering
+    // for exactly this pair.
+    test.case("{} and null are different kinds")
+    match jqeval.kind(value_of("{}"))
+        JqKObject => test.assert(true)
+        _         => test.assert(false)
+    match jqeval.kind(jqeval.null_value())
+        JqKNull => test.assert(true)
+        _       => test.assert(false)
+
+@test
+fn test_a_stream_of_documents_is_one_outcome_each() [io]
+    // A record that fails must not stop the records after it, which is
+    // the caller's decision only if the shape lets them make it.
+    test.case("three documents, three outcomes")
+    match jqlang.parse(".a")
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            let docs = [value_of("{\"a\":1}"), value_of("3"), value_of("{\"a\":2}")]
+            let outs = jqeval.run_stream(p, docs, jqeval.empty_env())
+            test.assert(list.len(outs) == 3)
+            test.assert(jqeval.failed(outs[0]) == false)
+            test.assert(jqeval.failed(outs[1]))
+            test.assert(jqeval.failed(outs[2]) == false)
+
+@test
+fn test_a_budget_stops_a_program_that_does_not() [io]
+    test.case("the default budget is finite")
+    test.assert(jqeval.default_limits().max_steps > 0)
+    test.assert(jqeval.default_limits().max_outputs > 0)
+    test.assert(jqeval.default_limits().max_depth > 0)
+
+    test.case("an unbounded program stops on the budget rather than not returning")
+    match jqlang.parse("repeat(.)")
+        Err(_) => test.assert(true)
+        Ok(p)  =>
+            let o = jqeval.run_with(p, value_of("1"), jqeval.empty_env())
+            match o.fault
+                None    => test.assert(false)
+                Some(e) =>
+                    match e.kind
+                        JqOverBudget => test.assert(true)
+                        _            => test.assert(false)
+
+@test
+fn test_the_exit_code_answers_did_that_match_anything() [io]
+    test.case("output and no fault is 0")
+    test.assert(jqeval.exit_code(outcome_of(".", "1"), false) == 0)
+
+    test.case("no output is 1, unconditionally")
+    test.assert(jqeval.exit_code(outcome_of("select(false)", "1"), false) == 1)
+
+    test.case("with -e, a falsy last value is 1 as well")
+    test.assert(jqeval.exit_code(outcome_of(".a", "{}"), true) == 1)
+
+    test.case("and a truthy one is still 0")
+    test.assert(jqeval.exit_code(outcome_of(".a", "{\"a\":1}"), true) == 0)
+
+@test
+fn test_one_filter_can_be_applied_on_its_own() [io]
+    // The recursive step, published so a host package extending the
+    // language can evaluate the sub-filters it was handed.
+    test.case("the identity filter answers its input")
+    let o = jqeval.apply(JqFIdentity(0), value_of("3"), jqeval.empty_env())
+    test.assert(list.len(o.values) == 1)
+    test.assert(jqeval.equal(o.values[0], value_of("3")))
+
+    test.case("a budget the caller chose travels in the environment")
+    let env = jqeval.env_with(jqeval.default_limits())
+    test.assert(env.limits.max_steps == jqeval.default_limits().max_steps)
+
+@test
+fn test_a_binding_is_looked_up_by_name() [io]
+    test.case("an empty environment binds nothing")
+    match jqeval.lookup(jqeval.empty_env(), "n")
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+    test.case("a bound name comes back")
+    let env = jqeval.bind(jqeval.empty_env(), "n", value_of("3"))
+    match jqeval.lookup(env, "n")
+        None    => test.assert(false)
+        Some(v) => test.assert(jqeval.equal(v, value_of("3")))
+
+    test.case("a later binding shadows an earlier one")
+    let shadowed = jqeval.bind(env, "n", value_of("4"))
+    match jqeval.lookup(shadowed, "n")
+        None    => test.assert(false)
+        Some(v) => test.assert(jqeval.equal(v, value_of("4")))

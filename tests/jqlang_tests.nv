@@ -1,0 +1,247 @@
+// jqlang_tests.nv — the program language: what parses, what is refused,
+// and where the caret goes.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: jsonquery-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE REFUSALS ARE HALF THE SUITE, and each one is a mistake somebody
+// has typed at a real jq.  A parser that accepts everything and answers
+// nothing is the failure mode this package is a rewrite of: `orbit/nq`
+// catches a bad regular expression at parse time precisely so it is a
+// usage error with a caret rather than a filter that quietly matches
+// no records, and the same principle covers every row below.
+//
+// THE VECTORS ARE jq's OWN MANUAL where it has an example, and
+// `orbit/nq`'s assertions where the two overlap — `.a | .b` and `.a.b`
+// producing identical trees is nq's `test_a_pipe_between_paths_is_one_longer_path`,
+// and it moves here with the code.
+
+use std.test
+use std.list
+use jqbuiltin
+use jqlang
+
+@test
+fn test_the_shapes_of_a_program_that_nq_could_not_parse() [io]
+    test.case("an array construction is a program, not a parse error")
+    match jqlang.parse("[.users[] | select(.age > 30)]")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    test.case("an object construction is a program")
+    match jqlang.parse("{name: .n, age: .a}")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    test.case("arithmetic is a program")
+    match jqlang.parse(".a + .b * 2")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    test.case("a reduce is a program")
+    match jqlang.parse("reduce .[] as \$x (0; . + \$x)")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    test.case("a definition is a program")
+    match jqlang.parse("def twice(f): f | f; twice(.a)")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    test.case("an interpolated string is a program")
+    match jqlang.parse("\"hello, \\(.name)\"")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_pipe_between_two_paths_is_one_longer_path() [io]
+    // `orbit/nq` asserts this of its own AST and it is the reason `|`
+    // needs no precedence table: two spellings, one tree.
+    test.case("`.a | .b` and `.a.b` render the same")
+    match jqlang.parse(".a | .b")
+        Err(_) => test.assert(false)
+        Ok(a)  =>
+            match jqlang.parse(".a.b")
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert(jqlang.render(a) == jqlang.render(b))
+
+@test
+fn test_the_postfix_question_mark_is_try_with_no_handler() [io]
+    test.case("`.a?` and `try .a` render the same, because they are one filter")
+    match jqlang.parse(".a?")
+        Err(_) => test.assert(false)
+        Ok(a)  =>
+            match jqlang.parse("try .a")
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert(jqlang.render(a) == jqlang.render(b))
+
+@test
+fn test_every_refusal_names_what_was_wrong_and_where() [io]
+    test.case("an unknown function is refused by name, not as a syntax error")
+    match jqlang.parse(".users[] | floor_it")
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f.kind
+                JqUnknownFunction => test.assert(f.subject == "floor_it")
+                _                 => test.assert(false)
+
+    test.case("a known name at the wrong arity is a different refusal")
+    match jqlang.parse("range(1; 2; 3; 4)")
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f.kind
+                JqWrongArity => test.assert(f.subject == "range")
+                _            => test.assert(false)
+
+    test.case("a builtin this package refuses by name says so")
+    match jqlang.parse("gsub(\"a\"; \"b\")")
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f.kind
+                JqRefusedFunction => test.assert(f.subject == "gsub")
+                _                 => test.assert(false)
+
+    test.case("a variable nothing binds is refused before the program runs")
+    match jqlang.parse(".a + \$missing")
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f.kind
+                JqUnboundVariable => test.assert(f.subject == "missing")
+                _                 => test.assert(false)
+
+    test.case("a dangling pipe is refused at the end of the program")
+    match jqlang.parse(".a |")
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f.kind
+                JqDanglingOperator => test.assert(f.at == 3)
+                _                  => test.assert(false)
+
+    test.case("an unterminated string points at its opening quote")
+    match jqlang.parse("\"abc")
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f.kind
+                JqUnterminatedString => test.assert(f.at == 0)
+                _                    => test.assert(false)
+
+    test.case("a bracket with no partner is refused")
+    match jqlang.parse("[.a")
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f.kind
+                JqUnclosedBracket => test.assert(true)
+                _                 => test.assert(false)
+
+    test.case("a path RFC 9535 refuses is a path fault, and the inner fault survives")
+    match jqlang.parse(".a[?length(.*) > 1]")
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f.kind
+                JqBadPath =>
+                    match jqlang.path_fault(f)
+                        None    => test.assert(false)
+                        Some(_) => test.assert(true)
+                _         => test.assert(false)
+
+@test
+fn test_a_supplied_variable_is_not_unbound() [io]
+    test.case("`--arg limit 3` is `parse_with`, and then the program parses")
+    match jqlang.parse_with(".a + \$limit", ["limit"])
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    test.case("free_variables answers exactly what a caller must supply")
+    match jqlang.parse_with(".a + \$limit + \$offset", ["limit", "offset"])
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(jqlang.free_variables(p) == ["limit", "offset"])
+
+    test.case("a program that binds its own variable has none free")
+    match jqlang.parse(".a as \$x | \$x + 1")
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(list.len(jqlang.free_variables(p)) == 0)
+
+@test
+fn test_a_path_expression_is_told_apart_from_a_value_expression() [io]
+    // jq's own rule, and the one most ports skip.  `path(f)` means
+    // nothing for a filter that computes a value that was never in the
+    // input.
+    test.case("a path is a path expression")
+    match jqlang.parse(".a.b")
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(jqlang.is_path_expression(p.root))
+
+    test.case("arithmetic over a path is not")
+    match jqlang.parse(".a + 1")
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(jqlang.is_path_expression(p.root) == false)
+
+    test.case("an `if` whose branches are both paths is one")
+    match jqlang.parse("if .x then .a else .b end")
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(jqlang.is_path_expression(p.root))
+
+@test
+fn test_a_program_reports_what_it_calls() [io]
+    test.case("the definitions it declares come back in source order")
+    match jqlang.parse("def a: .; def b: .; a")
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(jqlang.defined_names(p) == ["a", "b"])
+
+    test.case("the builtins it calls come back without repeats")
+    match jqlang.parse("map(.a) | map(.b) | length")
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(list.len(jqlang.called_builtins(p)) == 2)
+
+    test.case("a call carries the builtin it resolved to")
+    match jqlang.parse("length")
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            match p.root
+                JqFCall(_, callee, args) =>
+                    test.assert(list.len(args) == 0)
+                    match callee
+                        JqCBuiltin(b) => test.assert(jqbuiltin.name(b) == "length")
+                        JqCDefined(_) => test.assert(false)
+                _                        => test.assert(false)
+
+@test
+fn test_a_render_is_a_normalisation() [io]
+    test.case("whitespace does not survive a round trip")
+    match jqlang.parse(".a   |   .b")
+        Err(_) => test.assert(false)
+        Ok(a)  =>
+            match jqlang.parse(".a|.b")
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert(jqlang.render(a) == jqlang.render(b))
+
+    test.case("a rendered program parses back to the same rendering")
+    match jqlang.parse("{name: .n} | select(.name != null)")
+        Err(_) => test.assert(false)
+        Ok(a)  =>
+            match jqlang.parse(jqlang.render(a))
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert(jqlang.render(a) == jqlang.render(b))
+
+@test
+fn test_a_filter_knows_where_it_started() [io]
+    test.case("the identity filter of an empty program starts at 0")
+    match jqlang.parse(".")
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(jqlang.position(p.root) == 0)
+
+    test.case("depth counts the nesting a caller may want to bound")
+    match jqlang.parse(".a | .b | .c")
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(jqlang.depth(p.root) >= 2)
+
+    test.case("one filter renders on its own, without the program around it")
+    test.assert(jqlang.render_filter(JqFIdentity(0)) == ".")
+
+    test.case("a field is built from two filters and keeps both")
+    let f = jqlang.field(JqFLiteral(0, JqLString("a")), JqFIdentity(0))
+    test.assert(jqlang.render_filter(f.value) == ".")
+
+    test.case("a program built in code carries the source it was given")
+    test.assert(jqlang.program(".", JqFIdentity(0)).source == ".")

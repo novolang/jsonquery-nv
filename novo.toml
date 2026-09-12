@@ -1,0 +1,54 @@
+[package]
+name        = "jsonquery-nv"
+version     = "0.0.1"
+description = "jq's program language as a typed value: the pipe, object and array construction, select, map, reduce, if/then/else, try/catch, `as` bindings, string interpolation and a builtin table published as data with arity — parsed to positioned faults, and evaluated over the standard library's JSON value to a list of outputs.  Paths are jsonpath-nv's, with jq's four divergences from RFC 9535 named.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`: a parse of a string the caller typed, and a walk over a value
+# the caller already parsed.  No function declares an effect — a jq
+# program reads no file and consults no clock, which is why `env`,
+# `input` and the date builtins are named as absent rather than
+# quietly added.
+layer       = "core"
+
+category    = "tooling"
+
+tags        = ["jq", "json", "query", "filter", "jsonpath", "sans-io", "dogfood"]
+repository  = "https://github.com/novolang/jsonquery-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Running a jq program over a JSON value"
+
+[dependencies]
+# jsonpath-nv, and nothing else.
+#
+# THE PATH LANGUAGE IS ITS, NOT A SECOND ONE.  A jq path — `.a.b[0]`,
+# `.[]`, `.users[1:3]` — and a JSONPath query are the same walk over the
+# same value, so `JqFPath` holds a `jpquery.JpQuery` and `jqeval` runs
+# it through `jpeval.select`.  What that buys over the hand-written
+# scanner it replaces is the part jq has and `orbit/nq` never did:
+# filter selectors, slices, descendant segments and the five function
+# extensions.  What it costs is the four places jq's answers differ from
+# RFC 9535's, and those are named in the README and applied in one
+# function, `jqeval.select_path`, rather than spread through the walk.
+#
+# NOT std.regex.  `test/1` is over `jpregex`, the I-Regexp subset of
+# RFC 9485, because a jq program that matched with `(?i)` here and
+# nowhere else would be portable-looking and not portable.  The cost is
+# named too: `match`, `capture`, `scan`, `splits`, `sub` and `gsub` are
+# absent, because I-Regexp has no capture semantics at all and
+# `jpregex` answers a `Bool`.  `jqbuiltin.absence_reason` publishes
+# that as data.
+jsonpath-nv = "^0.0.1"

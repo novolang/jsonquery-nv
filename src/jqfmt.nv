@@ -1,0 +1,317 @@
+// jqfmt.nv — the renderers, and the CSV-to-JSON typing rule that makes
+// a spreadsheet queryable.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// WHY THE RENDERERS ARE IN THE PACKAGE AT ALL.  A query language and a
+// way to print its answers look like two concerns, and for JSON output
+// they are — `json.stringify` is the standard library's.  Two of these
+// are not:
+//
+//   * `cell_value` is a TYPING RULE, and it changes what queries mean.
+//     A CSV cell has no type, so `select(.units > 100)` over a column
+//     read as strings compares a string with a number and, under jq's
+//     total order, matches every row.  The rule that avoids it belongs
+//     beside the comparison it feeds, not in a caller;
+//   * `columns` is the column arithmetic a tabular view needs, and it
+//     is the one place the document ORDER of an object's members is
+//     load-bearing — columns are every key any record carries, in the
+//     order first seen, which is why `keys_unsorted` exists beside
+//     `keys` in the builtin table.
+//
+// The rest are here because the alternative is `orbit/nq` keeping a
+// `table.nv` that three other tools would each rewrite.  With these,
+// nq's CLI is argv, files, stdout and exit codes: one file.
+//
+// A LIBRARY DOES NOT PRINT.  Every call here answers text.  `pretty`
+// takes an indent rather than consulting a terminal, `tabular` takes a
+// value rather than a file handle, and nothing in the module has an
+// effect row — which is what keeps the package `core` and lets one
+// rendering go to a screen, a file and a test.
+
+use std.json
+
+// What shape a value has, for the purpose of drawing it as a table.
+//
+// A table needs rows and columns, and only two JSON shapes have them:
+// an array of objects (rows are elements, columns are keys) and a
+// single object (one row).  Everything else has to be refused with a
+// reason, which is what `table_problem` is for.
+pub enum JqShape
+    // An array of objects: rows are its elements.
+    JqShapeRows
+    // One object: one row.
+    JqShapeRow
+    // An array of scalars: one column, no header.
+    JqShapeColumn
+    // A scalar.  Not a table.
+    JqShapeScalar
+    // An empty array.  A table with no rows, which is different from
+    // not a table.
+    JqShapeEmpty
+    // An array whose elements are not all the same shape.  Not a
+    // table, and the one a user most often has by accident.
+    JqShapeRagged
+
+// The type a CSV cell gets: the NARROWEST one whose rendering is
+// byte-identical to the cell's own text.
+//
+// The round-trip condition is the whole rule, and it is what keeps a
+// zip code intact: `00417` is a string because `417` does not render
+// back as `00417`, and `1.50` is a string because `1.5` does not
+// render back as `1.50`.  `120` is a number because it does.  An empty
+// cell is `null`.
+//
+// Without any inference a numeric comparison over a CSV column
+// compares strings and matches everything; with naive inference an
+// identifier column loses its leading zeros.  The round trip is the
+// line between the two, and it is checkable rather than a heuristic —
+// `round_trips` is the same rule as a predicate.
+//
+// ```novo
+// use std.json
+// use jqfmt
+//
+// fn main() [io]
+//     println(json.stringify(jqfmt.cell_value("00417")))
+// ```
+pub fn cell_value(text: Str) -> JsonValueH []
+    todo("jsonquery-nv.jqfmt.cell_value")
+
+// Whether a value renders back as exactly this text.
+//
+// The condition `cell_value` decides by, published so the rule can be
+// asserted directly rather than inferred from a table of examples.
+//
+// ```novo
+// use std.json
+// use jqfmt
+//
+// fn main() [io]
+//     match json.parse("417")
+//         None    => println("not json")
+//         Some(v) => println("${jqfmt.round_trips("00417", v)}")
+// ```
+pub fn round_trips(text: Str, v: JsonValueH) -> Bool []
+    todo("jsonquery-nv.jqfmt.round_trips")
+
+// Read CSV text as a JSON value.
+//
+// With a header row, each record becomes an object keyed by the header
+// names; without one, each record becomes an array so `.[0]` is the
+// first column.  Inventing names like `col1` for a headerless file
+// would put names in the query that appear in no file anybody has.
+//
+// `None` when the text is not CSV at all.  A malformed record is the
+// caller's exit code to choose, which is why this answers an optional
+// rather than raising: the decision "stop, and say which line" belongs
+// to whatever is reading the file.
+//
+// ```novo
+// use std.json
+// use jqfmt
+//
+// fn main() [io]
+//     match jqfmt.csv_to_json("a,b\n1,2\n", true)
+//         None    => println("not csv")
+//         Some(v) => println(json.stringify(v))
+// ```
+pub fn csv_to_json(text: Str, has_header: Bool) -> ?JsonValueH []
+    todo("jsonquery-nv.jqfmt.csv_to_json")
+
+// What shape a value has.
+//
+// ```novo
+// use std.json
+// use jqfmt
+//
+// fn main() [io]
+//     match json.parse("[]")
+//         None    => println("not json")
+//         Some(v) =>
+//             match jqfmt.shape(v)
+//                 JqShapeEmpty => println("a table with no rows")
+//                 _            => println("something else")
+// ```
+pub fn shape(v: JsonValueH) -> JqShape []
+    todo("jsonquery-nv.jqfmt.shape")
+
+// The column names of a set of rows: every key any record carries, in
+// the order first seen.
+//
+// First seen rather than sorted, because a CSV read back out should
+// come out in the order it went in, and because the first record's
+// order is the one a person recognises.  A record missing a column
+// gets `null` rather than a blank, so an absent field and an empty
+// string stay distinguishable in the output.
+//
+// ```novo
+// use std.json
+// use jqfmt
+//
+// fn main() [io]
+//     match json.parse("{\"a\":1}")
+//         None    => println("not json")
+//         Some(v) => println("${jqfmt.columns([v])}")
+// ```
+pub fn columns(rows: [JsonValueH]) -> [Str] []
+    todo("jsonquery-nv.jqfmt.columns")
+
+// One cell's text: a string bare, and every other value as its JSON.
+//
+// A cell holding an array or an object shows that value's JSON rather
+// than a blank.  Honest rather than pretty — flatten first if you want
+// it pretty — and it means every cell in a column is something a
+// reader can copy back into a query.
+//
+// ```novo
+// use std.json
+// use jqfmt
+//
+// fn main() [io]
+//     match json.parse("[1,2]")
+//         None    => println("not json")
+//         Some(v) => println(jqfmt.cell_text(v))
+// ```
+pub fn cell_text(v: JsonValueH) -> Str []
+    todo("jsonquery-nv.jqfmt.cell_text")
+
+// The table as rows of cell text, header first, or `None` when the
+// value has no table shape.
+//
+// The step below `tabular`, published because a caller drawing its own
+// table — with box characters, with colour, into a terminal widget —
+// wants the cells and not a rendering.  `table-nv` is that caller, and
+// the width arithmetic is its business rather than this package's.
+//
+// ```novo
+// use std.json
+// use jqfmt
+//
+// fn main() [io]
+//     match json.parse("[{\"a\":1}]")
+//         None    => println("not json")
+//         Some(v) =>
+//             match jqfmt.grid(v)
+//                 None    => println("not a table")
+//                 Some(g) => println("${g}")
+// ```
+pub fn grid(v: JsonValueH) -> ?[[Str]] []
+    todo("jsonquery-nv.jqfmt.grid")
+
+// Why this value cannot be drawn as a table, or `None` when it can.
+//
+// A sentence naming the shape that was found, because "cannot tabulate
+// that" sends a user looking at their data and "an array of numbers
+// has no columns — pipe it through `map({value: .})`" sends them to the
+// fix.
+//
+// ```novo
+// use std.json
+// use jqfmt
+//
+// fn main() [io]
+//     match json.parse("3")
+//         None    => println("not json")
+//         Some(v) =>
+//             match jqfmt.table_problem(v)
+//                 None    => println("tabulates")
+//                 Some(m) => println(m)
+// ```
+pub fn table_problem(v: JsonValueH) -> ?Str []
+    todo("jsonquery-nv.jqfmt.table_problem")
+
+// The table as aligned columns, or `None` when the value has no table
+// shape.
+//
+// Padded to the widest cell per column, one space between columns,
+// header first.  The alignment is by CODEPOINTS: a cell's width in
+// terminal cells is `table-nv`'s question, and answering it here would
+// need a Unicode table this package has no business carrying.  A
+// caller with CJK data wants `grid` and `table-nv`.
+//
+// ```novo
+// use std.json
+// use jqfmt
+//
+// fn main() [io]
+//     match json.parse("[{\"a\":1}]")
+//         None    => println("not json")
+//         Some(v) =>
+//             match jqfmt.tabular(v)
+//                 None    => println("not a table")
+//                 Some(t) => println(t)
+// ```
+pub fn tabular(v: JsonValueH) -> ?Str []
+    todo("jsonquery-nv.jqfmt.tabular")
+
+// The table as CSV, or `None` when the value has no table shape.
+//
+// A column holding an array or an object gets that value's JSON,
+// quoted by CSV's own rules — so the output is valid CSV and a nested
+// value survives it as text rather than being dropped.
+//
+// ```novo
+// use std.json
+// use jqfmt
+//
+// fn main() [io]
+//     match json.parse("[{\"a\":1}]")
+//         None    => println("not json")
+//         Some(v) =>
+//             match jqfmt.csv_out(v)
+//                 None    => println("not a table")
+//                 Some(c) => println(c)
+// ```
+pub fn csv_out(v: JsonValueH) -> ?Str []
+    todo("jsonquery-nv.jqfmt.csv_out")
+
+// One value as one line of JSON.
+//
+// ```novo
+// use std.json
+// use jqfmt
+//
+// fn main() [io]
+//     match json.parse("{\"a\":1}")
+//         None    => println("not json")
+//         Some(v) => println(jqfmt.compact(v))
+// ```
+pub fn compact(v: JsonValueH) -> Str []
+    todo("jsonquery-nv.jqfmt.compact")
+
+// One value as indented JSON.
+//
+// The indent is an argument rather than a setting, so two renderings
+// in one program cannot disagree about it.
+//
+// ```novo
+// use std.json
+// use jqfmt
+//
+// fn main() [io]
+//     match json.parse("{\"a\":1}")
+//         None    => println("not json")
+//         Some(v) => println(jqfmt.pretty(v, 2))
+// ```
+pub fn pretty(v: JsonValueH, indent: Int) -> Str []
+    todo("jsonquery-nv.jqfmt.pretty")
+
+// One value with a string printed bare, and anything else as JSON.
+//
+// jq's `-r`, and the reason it is a rendering rather than a flag on
+// the evaluator: it changes only what happens to a STRING, so
+// `raw` over an object still gives JSON and the output of a query that
+// selects paths is something to hand to another command.
+//
+// ```novo
+// use std.json
+// use jqfmt
+//
+// fn main() [io]
+//     match json.parse("\"ada\"")
+//         None    => println("not json")
+//         Some(v) => println(jqfmt.raw(v))
+// ```
+pub fn raw(v: JsonValueH) -> Str []
+    todo("jsonquery-nv.jqfmt.raw")
