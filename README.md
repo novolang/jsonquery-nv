@@ -1,335 +1,276 @@
 # jsonquery-nv
 
-jq's program language as a typed value, parsed to positioned faults and
-evaluated over the standard library's JSON value.
+[jq](https://jqlang.github.io/jq/manual/v1.7/) is a command-line JSON
+processor. Its manual describes it as "like `sed` for JSON data", and a jq
+program as a **filter**: "it takes an input, and produces an output". This
+package brings jq's program language to novo-lang. A program is parsed into a
+typed value, and that value is run over the JSON value the standard library's
+`std.json` produces. The paths inside a program are
+[jsonpath-nv](https://novo-lang.org/packages/jsonpath-nv)'s, so a jq path and a
+JSONPath query are the same walk over the same document.
 
-**Status: NOT IMPLEMENTED — interface only.**  Every `pub fn` body is a
-`todo()`, so the signatures, the effect rows and the tests are published
-and nothing is implemented.  The first implementation is the `0.1.0`
-published over this.
+**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
+its full signature, but every body is a `todo()` that panics when called. The
+package is published so its design can be reviewed and depended on before it is
+implemented. Version 0.1.0 will be the first working release.
 
-## What this is
+## What it is
 
-A jq program is not a path.  A path picks values out of a document; a jq
-program is a pipeline of filters, each of which takes one value and
-produces a stream of zero or more — so `.users[]` produces many,
-`select(.age > 30)` produces zero or one, and `.name` produces exactly
-one, and all three are the same kind of thing.  That model is what makes
-`[.users[] | select(.age > 30) | .name]` one expression rather than
-three passes.
+A **filter** takes one JSON value and produces a **stream** of zero or more JSON
+values. That is the whole model. `.name` produces exactly one value.
+`select(.age > 30)` produces zero or one. `.users[]` produces one per element of
+an array. All three are filters, and because they are the same kind of thing
+they compose.
 
-This package is that model, split the way the layers want it:
+Filters compose two ways. The **pipe**, `f | g`, feeds every output of `f` to
+`g` in turn. The **comma**, `f, g`, produces the outputs of `f` and then those
+of `g`. Square brackets collect a stream back into one value, so
+`[.users[] | select(.age > 30) | .name]` is a single expression that answers one
+array.
 
-| module | holds |
-| --- | --- |
-| `jqlang` | the program as a typed value, and the parser that answers one |
-| `jqbuiltin` | the builtin table, as data with arity |
-| `jqeval` | the evaluator: a program and a value in, an outcome out |
-| `jqerror` | a parse fault and a runtime error, which are two types |
-| `jqfmt` | the renderings, and the CSV typing rule |
+A **path** is the part of a filter that names places in the input: `.a.b`,
+`.[0]`, `.users[1:3]`, `..`. A filter every one of whose outputs came from
+somewhere in the input is a **path expression**, and only a path expression can
+be handed to `path(f)`. `.a` is one. `.a + 1` is not.
 
-Paths inside a program are **jsonpath-nv's**: `JqFPath` holds a
-`jpquery.JpQuery` and the evaluator runs it through `jpeval.select`.
-That is where the filter selectors, slices and descendant segments come
-from, and it is also where jq and RFC 9535 disagree — the table below is
-those four rows.
+A **builtin** is a filter with a name, such as `length`, `map(f)` or
+`range(n)`. jq overloads a builtin name on the number of arguments it is given,
+so `range(n)`, `range(from; upto)` and `range(from; upto; by)` are three
+different filters. The number of arguments is the **arity**, and a builtin in
+this package is identified by the pair of name and arity.
 
-## Adding it, and checking it
+A jq program can fail while running, and it can fail after it has already
+produced output. `.users[] | (.name, error("stop"))` emits the first name and
+then raises. A run therefore answers both halves: the values that were produced
+and the error that stopped it.
 
-```console
-$ novo pkg add jsonquery-nv
-$ novo pkg build
+A runtime error in jq is itself a JSON value. `error({code: 4})` raises an
+object, and `try f catch .code` binds that object and reads a member out of it.
+
+## Install
+
+```
+novo pkg add jsonquery-nv
 ```
 
-`novo pkg add` says `NOT IMPLEMENTED — interface only` on the way in,
-because an interface resolves, downloads and builds exactly like an
-implemented package and the difference only shows the first time
-something calls it.
-
-## The one example that will work
+## Example
 
 ```novo
 use std.json
+use jqlang
 use jqeval
 use jqfmt
-use jqlang
 
 fn main() [io]
+    // Parse the program once. Everything that can be wrong with a program
+    // is wrong here: an unknown builtin, a wrong arity, an unbound $name.
     match jqlang.parse(".users[] | select(.age >= 30) | .name")
-        Err(f) =>
-            println("bad program at ${f.at}")
+        Err(f) => println("the program is bad at byte ${f.at}")
         Ok(p)  =>
+            // Read the document with the standard library's JSON parser.
             match json.parse("{\"users\":[{\"name\":\"ada\",\"age\":36},{\"name\":\"bob\",\"age\":24}]}")
-                None    => println("not json")
+                None    => println("the input is not JSON")
                 Some(v) =>
+                    // Run the program. The outcome carries the values it
+                    // produced and the error it stopped on, if any.
                     let out = jqeval.run(p, v)
                     for value in out.values
                         println(jqfmt.raw(value))
                     // ada
+
+                    // jq's own exit code: 0 for output, 1 for none, 5 for a failure.
+                    println("${jqeval.exit_code(out, false)}")
 ```
 
-## The load-bearing interface
+Build and test with `novo pkg build` and `novo test`. Today `novo test` fails on
+purpose: every test reaches a `not implemented` panic.
 
-`JqOutcome`, and the argument for it is one sentence: **a jq filter that
-fails has usually already produced output, and a `Result` throws that
-away.**
+## What the package contains
 
-```novo norun:pseudo
-pub struct JqOutcome
-    values: [JsonValueH]
-    fault: ?jqerror.JqError
-```
-
-```
-.users[] | (.name, error("stop"))
-```
-
-emits the first name and then raises.  A signature answering
-`Result<[JsonValueH], JqError>` has exactly two shapes to put that in —
-the values without the error, or the error without the values — and both
-of them lie.  With both fields, "it produced three rows and then failed
-on the fourth" is a value a caller can hold, print the three rows from,
-and exit non-zero on.
-
-It is also what makes `try`/`catch` implementable rather than
-approximated.  `try f catch h` runs `f`, **keeps** the outputs `f`
-managed, and feeds `h` the error value if one arrived; an evaluator
-whose inner call answered `Err` has already lost the outputs it needs to
-keep.  The same shape carries `//`, whose left side swallows an error,
-and `f?`, which is `try f` with no handler.
-
-`orbit/nq`, which this comes out of, answers `EOk(vals) | EErr(msg)` and
-can afford to: it has no `try`, no `error` and no `//`, so nothing in it
-can produce output and then fail.  Adding any one of the three forces
-this shape, and adding all three is what this package is.
-
-## A runtime error is a VALUE, and that is why there are two error types
-
-`jqerror.JqFault` is a program that does not parse.  It has a byte span
-into the program text, nothing can catch it, and there is no program to
-run.  `jqlang.parse` answers it, once.
-
-`jqerror.JqError` is a filter that failed while running, and in jq a
-runtime error **is a value**:
-
-```
-try error({code: 4, path: .p}) catch .code
-```
-
-raises an object and reads a member out of it.  So `JqError` carries a
-`JsonValueH` and `error_message` is a *rendering* of that value rather
-than the thing itself.  A port whose payload is a `Str` can express
-`error("no")` and cannot express the line above, which is the shape
-every non-trivial jq program that handles failures is written in.
-
-The position survives into the runtime too: `JqError.at` is the byte
-offset of the filter that raised, so a caller can point a caret at `.a`
-in `.users[] | .a.b` when the run fails on a record forty thousand lines
-in.  jq itself cannot do this; the offset is already in the parsed
-program, so keeping it costs one field.
-
-## The builtin table is data, not a `match` in the parser
-
-Four callers need four different questions answered about a builtin, and
-only a value can answer all four: an **error message** needs the arities
-a name does have, so `range(1;2;3;4)` is told "range has 1, 2 and 3
-arguments"; **completion** needs the whole list with a summary each; the
-**evaluator** needs to know which arguments are filters rather than
-values, because `map(.x)` runs its argument once per element and
-`limit(3; f)` must not run its second argument until it wants the next
-output; and a **refusal** needs a reason.
-
-`orbit/nq` is the case in point.  Its parser hard-codes six names, its
-error message hard-codes the same six in prose a few hundred lines away,
-and the two are one edit from disagreeing.
-
-One variant per **name and arity**, because jq overloads on argument
-count: `range/1`, `range/2` and `range/3` are three different filters,
-and `jqbuiltin.resolve("range", 2)` cannot return the wrong one.
-
-## Where jq and RFC 9535 answer the same path differently
-
-Paths are jsonpath-nv's, so this table is the whole cost of that, and it
-is applied in one function — `jqeval.select_path` — rather than spread
-through an evaluator.  `jqeval.select_path_rfc` is the same walk with
-the RFC's own answers, published beside it because the choice belongs to
-the caller.
-
-| the path | jq, and here | RFC 9535 |
-| --- | --- | --- |
-| `.foo` on an object without `foo` | `null` | selects nothing |
-| `.[3]` on a shorter array | `null` | selects nothing |
-| `.foo` on `null` | `null` | selects nothing |
-| `.foo` on a number, `.[0]` on an object, `.[]` on a string | an **error** | selects nothing |
-
-The last row has one exception and it is jq's: `.[]` against `null` is
-an error even though `.foo` against `null` is not.  It looks
-inconsistent because it is.  `orbit/nq` keeps it, its README says so,
-and a user who knows jq must not have to relearn it.
-
-Two more differences are not about paths and are worth stating here
-because they are the two a reader trips over next:
-
-- **`keys` sorts.**  jq's `keys` answers an object's member names in
-  sorted order and `keys_unsorted` answers them in document order.
-  RFC 9535 has no `keys` at all, and its wildcard visits members in
-  document order.  Both are in the builtin table, separately, because
-  `jqfmt.columns` needs the document order and a comparison needs the
-  sort.
-- **Comparison never fails.**  jq's `<` is a total order over every pair
-  of values — `null < false < true < numbers < strings < arrays <
-  objects` — so `1 < "a"` is true.  RFC 9535 § 2.3.5.2.2 orders only
-  numbers against numbers and strings against strings and calls
-  everything else false.  `jqeval.order` is jq's; the two agree
-  everywhere the RFC has an opinion.
-
-## The pattern language is I-Regexp, and six builtins are absent because of it
-
-`test/1` matches with **I-Regexp** (RFC 9485) through jsonpath-nv's
-`jpregex`, which has no anchors, no backreferences, no lookaround, no
-lazy quantifiers and **no capture semantics at all**.  That is the point
-of RFC 9485: what is left matches the same strings everywhere.
-
-So the six jq builtins that need capture groups or match offsets are
-absent, by name, with a reason: `match`, `capture`, `scan`, `splits`,
-`sub`, `gsub` — and `test/2`, whose second argument is jq's flags
-string, which is exactly what I-Regexp removed.  `jqbuiltin.absent_named`
-and `jqbuiltin.absence_reason` publish that as data, because "unknown
-function gsub" is the wrong answer for a name jq has: a user who wrote
-`gsub` did not misspell anything, and telling them so sends them looking
-for a typo.
-
-**This is a missing row on the grid, and naming it is the honest form of
-the refusal.**  What those six want is a `core` regular-expression
-engine that answers match POSITIONS and capture groups — `jpregex`
-answers a `Bool`, and `std.regex` is PCRE-shaped, so a jq program using
-it here would work against this implementation and answer differently
-against a conforming one across a wire.  Until such a package exists,
-`jqbuiltin.absent_for_layer` says which absences a `host` package could
-close (`env`, `input`, the clock) and which no layer can (`gsub` and its
-five siblings).
-
-## What else is absent, and why
-
-- **The assignment operators** — `=`, `|=`, `+=`, and `del` by
-  assignment.  Not hard, but a different half of jq: they need a path to
-  *write* to rather than a value to read, and the piece that would carry
-  it is `jpeval.path_steps`, which turns a normalized path back into a
-  walk.  `path(f)` and `getpath(p)` are here, so the reading half is
-  complete and the writing half is a named later step rather than a
-  silence.
-- **The host builtins** — `env`, `$ENV`, `input`, `inputs`, `now`,
-  `strftime`, `halt_error`, `debug`.  A `core` package has no
-  environment, no clock and no standard input, and a program that
-  silently answered `null` for `env.HOME` would be worse than one that
-  refuses.  These are the absences a `host` package built over this one
-  could close.
-- **`@base64` and the other `@` formats**, and SQL-style operators.  No
-  consumer asks yet.
-
-## What `orbit/nq` keeps, and what it takes
-
-nq is the dogfood package this is cut out of.  The split is a file
-boundary that already existed: `src/query.nv`, `src/eval.nv` and
-`src/table.nv` are pure and `src/main.nv` is the only one that touches
-the machine.
-
-**nq keeps** `src/main.nv`, and after the swap that is the whole
-package: argv, several files or standard input, the `--nd` and `-s`
-input modes, stdout, and the exit code that answers "did that match
-anything" so a shell script can branch on it.
-
-**nq takes**, replacing code it has today:
-
-| nq symbol | this package |
+| Module | Contents |
 | --- | --- |
-| `query.parse` / `query.Parsed` / `query.Stage` / `query.Step` / `query.Op` / `query.Lit` | `jqlang.parse`, `jqlang.JqProgram`, `jqlang.JqFilter`, `jqlang.JqBinOp`, `jqlang.JqLiteral` |
-| `query.show` / `show_stage` / `show_path` / `show_op` / `show_lit` | `jqlang.render`, `jqlang.render_filter` |
-| `eval.run` / `eval.apply` / `eval.apply_path` / `eval.EvalOut` | `jqeval.run`, `jqeval.apply`, `jqeval.select_path`, `jqeval.JqOutcome` |
-| `eval.kind` / `eval.type_name` / `eval.K_NULL` … `eval.K_OBJ` | `jqeval.kind`, `jqeval.type_name`, `jqeval.JqKind` |
-| `eval.cmp` / `eval.eq` / `eval.compare` | `jqeval.order`, `jqeval.equal` |
-| `eval.jnull` | `jqeval.null_value` |
-| `table.cell_value` / `table.csv_to_json` | `jqfmt.cell_value`, `jqfmt.round_trips`, `jqfmt.csv_to_json` |
-| `table.columns` / `table.cell_text` / `table.grid` / `table.tabular` / `table.csv_out` | the same names in `jqfmt` |
-| `table.shape` / `table.Shape` / `table.table_problem` | `jqfmt.shape`, `jqfmt.JqShape`, `jqfmt.table_problem` |
-| `main.render` / `main.truthy` / `main.exit_code` | `jqfmt.compact` / `jqfmt.pretty` / `jqfmt.raw`, `jqeval.truthy`, `jqeval.exit_code` |
+| `jqlang` | A jq program as a typed value, and the parser that answers one. Every node carries the byte offset it starts at. |
+| `jqbuiltin` | The builtin table as data: one entry per name and arity, with its signature, its summary, which of its arguments are filters, and the names this package refuses with a reason. |
+| `jqeval` | Running a program over a value: the outcome, the bindings, the evaluation limits, jq's total order, jq's truthiness, and the two path calls. |
+| `jqerror` | The two error types. One is a program that did not parse. The other is a filter that failed while running. |
+| `jqfmt` | Turning a JSON value into text: compact, pretty and raw, a table, CSV out, and the rule that gives a CSV cell a type. |
 
-What nq **gains** by taking them: array and object construction (`[…]`
-and `{…}` are parse errors in nq today), arithmetic, `reduce`,
-`foreach`, `try`/`catch`, `//`, `as` bindings, string interpolation,
-`def`, and every path form RFC 9535 has that nq's three-step scanner did
-not — slices, descendant segments and filter selectors, so
-`.users[?@.age > 30]` becomes expressible.
+## How to choose an entry point
 
-What nq **loses**, and it is a decision rather than a free upgrade:
-`~=` accepts a PCRE pattern today through `std.regex`, and `test` here
-accepts I-Regexp, which has no `(?i)`.  jsonpath-nv's README already
-flagged that narrowing as nq's owner's call; it is the same call, and
-the answer this package assumes is that portability wins.
+**Parse once, run many times.** `jqlang.parse` is where every mistake in a
+program is caught, so a service that accepts programs from outside parses at the
+edge. `jqeval.run` then runs the parsed program over one value.
 
-Three of nq's `main.nv` behaviours are **not** taken and stay its own,
-because they are about a stream of documents rather than about a
-program: the `--nd` line-per-document reader, `-s` slurping, and the
-rule that a malformed record on line 2 stops the run before line 1 is
-printed.  `jqeval.run_stream` is the piece that supports the first of
-them without making the decision.
+**`jqeval.run_with` is `run` plus an environment.** The environment carries the
+`$name` bindings a `--arg` flag would supply and the limits the run is held to.
+`jqeval.run_stream` runs one program over a list of documents and answers one
+outcome each.
 
-## The layer, and why
+**`jqlang.parse_with` is for a program that reads `$names` the caller will
+bind.** Passing the names up front stops them being reported as unbound.
 
-`core`.  A parse of a string the caller typed, and a walk over a value
-the caller already holds.  No function declares an effect, which is
-checkable rather than a claim: the shard audit's `effect-budget` row
-measures every `pub fn`'s declared row against `core`'s empty budget.
+**`jqeval.select_path` follows jq's rules and `jqeval.select_path_rfc` follows
+RFC 9535's.** The two disagree in four places, listed below. Pick the first for
+a tool whose users know jq, and the second for a tool that also speaks JSONPath
+and must answer the same way everywhere.
 
-**No device claim, and the reason is not this package's arithmetic.**
-`std.json` is refused at `@tier(embedded)`, so there is no
-`tests/embedded_probe.nv` here and there cannot be one until the value
-this queries builds for a microcontroller.  jsonpath-nv reached the same
-wall for the same reason and filed it; a jq engine over a JSON value
-that does not exist on the device would be a claim with nothing behind
-it.
+**`jqfmt.compact`, `.pretty` and `.raw` are the three renderings.** `raw` prints
+a string without its quotes and everything else as JSON, which is what a shell
+pipeline wants. `jqfmt.tabular` and `.csv_out` answer `None` for a value that is
+not a table, and `jqfmt.table_problem` says why.
 
-## What the standard library's JSON value cannot carry
+## The rules a user needs
 
-Inherited from jsonpath-nv, which filed all of it, and repeated here
-because it is load-bearing for two calls in this package:
+1. **A filter answers a stream, not a value.** Zero outputs, one, or many. jq
+   manual, "Invoking jq".
+2. **Reaching into a container that has no such place is `null`. Reaching into
+   something that is not a container is an error.** This is jq's rule, and it is
+   where jq and RFC 9535 disagree. jq manual, "Basic filters"; RFC 9535 section
+   2.3.
 
-- **`{}` and `null` are the same value to every typed accessor.**  Both
-  answer zero keys and `None` from `to_str`, `to_int`, `to_float`,
-  `to_bool` and `to_list`; only `json.stringify` separates them.  So
-  `jqeval.kind` assembles the six types from the accessors and falls
-  back to the rendering for exactly this pair, and `length` over `{}`
-  and over `null` are two different answers that cost a render to tell
-  apart.  `orbit/nq` carries a regression test called
-  `test_empty_object_is_not_null`, and it moves here with the code.
-- **There is no deep equality.**  `jqeval.equal` and `jqeval.order`
-  exist partly because there is no `json.equals` to defer to.
-- **Reaching one element of an array materialises all of it**, because
-  `json.to_list` is the only way in.
+   | The path | jq, and this package | RFC 9535 |
+   | --- | --- | --- |
+   | `.foo` on an object without `foo` | `null` | selects nothing |
+   | `.[3]` on a shorter array | `null` | selects nothing |
+   | `.foo` on `null` | `null` | selects nothing |
+   | `.foo` on a number, `.[0]` on an object, `.[]` on a string | an error | selects nothing |
 
-All of it is filed against the toolchain as
-`std-json-cannot-tell-an-empty-object-from-null-and-has-no-deep-equality`,
-with `json.is_null`, `json.type_of` and `json.equals` as the smallest
-things that would close it.
+3. **`.[]` on `null` is an error, even though `.foo` on `null` is `null`.** jq
+   answers the two differently, and this package keeps that. jq manual, "Basic
+   filters".
+4. **A run answers the values it produced and the error it stopped on.**
+   `JqOutcome` has both fields, because a filter that fails has usually already
+   produced output. Read `values` for the rows and `fault` for the failure.
+5. **A runtime error is a JSON value.** `JqError.value` is what `catch` binds.
+   For `error(v)` it is exactly what the program passed. For every other kind it
+   is the string jq would have printed, as a JSON string. jq manual, "Error
+   Suppression / Optional Operator".
+6. **`f?` is `try f` with no handler**, and the parser builds the same node for
+   both. A round trip through `jqlang.render` prints `try f`. jq manual, "try-catch".
+7. **Only `null` and `false` are falsy.** `0`, `""` and `[]` are all true, so
+   `0 and 1` is true. jq manual, "if-then-else".
+8. **Comparison never fails.** jq orders every pair of values:
+   `null < false < true < numbers < strings < arrays < objects`, so `1 < "a"` is
+   true. RFC 9535 section 2.3.5.2.2 orders only like against like.
+   `jqeval.order` is jq's order. jq manual, "sort, sort_by, group_by".
+9. **`keys` sorts and `keys_unsorted` does not.** `keys` answers an object's
+   member names in sorted order. `keys_unsorted` answers them in document order,
+   which is what a table's column order needs. jq manual, "keys, keys_unsorted".
+10. **A builtin is a name and an arity.** `jqbuiltin.resolve("range", 2)` finds
+    exactly one entry. A call with a count no form has is a parse fault naming
+    the counts that do exist, from `jqbuiltin.arities_of`.
+11. **Everything wrong with a program is wrong at parse time.** An unknown
+    builtin, a wrong arity, an unbound `$name` and a path RFC 9535 refuses are
+    all `JqFault`, with half-open byte offsets `at` and `to` into the program
+    text. After a successful parse a program can only be slow.
+12. **`test/1` matches with I-Regexp, not PCRE.** RFC 9485 has no anchors, no
+    backreferences, no lookaround, no lazy quantifiers and no capture groups.
+    A pattern that works here matches the same strings in every conforming
+    implementation.
+13. **Numbers are `Float`, however they were written.** JSON has one number
+    type, so a program that says `> 30` matches a value stored as `30.5`.
+14. **`{}` and `null` are the same value to every typed accessor of
+    `std.json`.** Only the rendering separates them, so `length` over an empty
+    object and over `null` are two answers that cost a render to tell apart.
+15. **A run is bounded.** `JqLimits` caps the outputs produced, the filter
+    applications made, and the depth recursed. A refusal for exceeding a limit is not
+    catchable by `try`. `jqeval.default_limits` is the set a caller gets when it
+    does not choose one.
+16. **A CSV cell gets the narrowest type whose rendering is byte-identical to
+    the cell's own text.** `120` is the number 120. `00417` is a string, because
+    `417` does not render back as `00417`. `1.50` is a string for the same
+    reason. An empty cell is `null`. `jqfmt.round_trips` is that rule as a
+    predicate.
 
-## The reference implementation
+## What is not included
 
-jq 1.7 (MIT) — its manual is the specification for the grammar, the
-builtin table and the null-versus-error rule, and its own test suite
-(`tests/jq.test`, a program, an input and the exact outputs) is the
-oracle when the bodies land.  `orbit/nq` is the second reference: it is
-this language's subset already written in novo-lang, with a hundred
-assertions about the rules the two share, and those assertions are the
-first thing `tests/jqeval_tests.nv` restates.
+- **Six regex builtins: `match`, `capture`, `scan`, `splits`, `sub` and
+  `gsub`, and `test/2`.** Each needs capture groups or match offsets, and
+  I-Regexp has no capture semantics at all. `jqbuiltin.absent_named` and
+  `jqbuiltin.absence_reason` publish the refusals as data, so a program that
+  writes `gsub` is told what is missing rather than that the name is unknown.
+- **The assignment operators `=`, `|=`, `+=` and `del` by assignment.** They
+  need a path to write to rather than a value to read. `path(f)` and `getpath(p)`
+  are here, so the reading half of paths is complete.
+- **The builtins that read a machine: `env`, `$ENV`, `input`, `inputs`,
+  `input_line_number`, `now`, `localtime`, `strftime`, `halt_error` and
+  `debug`.** Nothing in this package opens a file, reads the environment or
+  consults a clock. `jqbuiltin.absent_for_layer` says which absences a package
+  with those permissions could close and which no package can.
+- **`@base64` and the other `@` formats, and the SQL-style operators.**
+- **A command line.** This package has no argv, no file reading, no standard
+  input and no output. It answers text and values.
+- **Running on a microcontroller.** `std.json`, the value this package queries,
+  does not build for a device with no heap allocator. There is no probe here and
+  there cannot be one until it does.
 
-## Status
+## Related packages
 
-Every function is `todo()`.  The four suites under `tests/` are red on
-`not implemented`, which is the expected result until the bodies land:
+- [jsonpath-nv](https://novo-lang.org/packages/jsonpath-nv) is the RFC 9535
+  JSONPath implementation this package's paths are. It answers a nodelist and
+  never fails. Use it directly for a tool that speaks JSONPath and nothing else.
+- [table-nv](https://novo-lang.org/packages/table-nv) draws a table for a
+  terminal, with widths, borders and alignment. `jqfmt.grid` answers the cells
+  and leaves the drawing to a caller.
+- `std.json` in the standard library parses and renders JSON. It is where the
+  value this package queries comes from, and `json.stringify` is what
+  `jqfmt.compact` is written over.
 
-```console
-$ novo test tests/jqlang_tests.nv
-$ novo test tests/jqbuiltin_tests.nv
-$ novo test tests/jqeval_tests.nv
-$ novo test tests/jqfmt_tests.nv
+## Tests
+
+```bash
+novo test tests                            # every suite
+novo test tests/jqlang_tests.nv            # what parses, what is refused, where the caret goes
+novo test tests/jqbuiltin_tests.nv         # the builtin table, as data
+novo test tests/jqeval_tests.nv            # the evaluator and the four divergences
+novo test tests/jqerror_tests.nv           # what each error type can say
+novo test tests/jqfmt_tests.nv             # the CSV typing rule and the renderings
 ```
+
+`novo test` fails on purpose today. Every assertion reaches a `not implemented:
+jsonquery-nv.<module>.<fn>` panic, because every body is a `todo()`. The tests
+are the specification the implementation will have to satisfy.
+
+The reference is jq 1.7. Its manual is the specification for the grammar, the
+builtin table and the rule that separates `null` from an error, and its own test
+suite, `tests/jq.test`, is a list of a program, an input and the exact outputs it
+must produce.
+
+The suite asserts that every entry in the builtin table resolves from its own
+name and arity, that a missing field is `null` and indexing a number is an
+error, that an error arriving after output keeps the output, that `try`/`catch`
+binds an error value, that `//` swallows a failure on its left, and that a CSV
+cell takes the narrowest type that renders back as itself.
+
+## Implementation status
+
+| Item | Implemented |
+| --- | --- |
+| `jqlang.JqProgram`, `.JqFilter`, `.JqCallee`, `.JqLiteral`, `.JqBinOp`, `.JqField`, `.JqPattern`, `.JqPatternEntry`, `.JqStrPart` | declared |
+| `jqlang.parse`, `.parse_with`, `.program`, `.field` | no |
+| `jqlang.render`, `.render_filter`, `.position` | no |
+| `jqlang.free_variables`, `.defined_names`, `.called_builtins`, `.is_path_expression`, `.depth`, `.path_fault` | no |
+| `jqbuiltin.JqBuiltin`, the 69 name-and-arity entries | declared |
+| `jqbuiltin.all`, `.name`, `.arity`, `.signature`, `.summary` | no |
+| `jqbuiltin.resolve`, `.is_known_name`, `.arities_of` | no |
+| `jqbuiltin.takes_filter_argument`, `.may_stream` | no |
+| `jqbuiltin.absent_named`, `.absence_reason`, `.absent_for_layer` | no |
+| `jqeval.JqOutcome`, `.JqLimits`, `.JqBinding`, `.JqEnv`, `.JqKind` | declared |
+| `jqeval.default_limits`, `.empty_env`, `.env_with`, `.bind`, `.lookup` | no |
+| `jqeval.run`, `.run_with`, `.run_stream`, `.apply` | no |
+| `jqeval.select_path`, `.select_path_rfc` | no |
+| `jqeval.produced`, `.raised`, `.failed`, `.exit_code` | no |
+| `jqeval.kind`, `.type_name`, `.truthy`, `.order`, `.equal`, `.null_value` | no |
+| `jqerror.JqFaultKind`, `.JqFault`, `.JqErrorKind`, `.JqError` | declared |
+| `jqerror.fault`, `.fault_kind_name`, `.fault_message` | no |
+| `jqerror.error`, `.error_kind_name`, `.error_message`, `.error_value`, `.is_catchable` | no |
+| `jqfmt.JqShape` | declared |
+| `jqfmt.cell_value`, `.round_trips`, `.csv_to_json` | no |
+| `jqfmt.shape`, `.columns`, `.cell_text`, `.grid`, `.table_problem`, `.tabular`, `.csv_out` | no |
+| `jqfmt.compact`, `.pretty`, `.raw` | no |
+
+## Licence
+
+Apache-2.0. See `LICENSE`.
+
+<!-- docs/writing-a-readme.md is the style guide for this page. -->

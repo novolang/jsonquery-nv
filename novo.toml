@@ -1,6 +1,6 @@
 [package]
 name        = "jsonquery-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "jq's program language as a typed value: the pipe, object and array construction, select, map, reduce, if/then/else, try/catch, `as` bindings, string interpolation and a builtin table published as data with arity — parsed to positioned faults, and evaluated over the standard library's JSON value to a list of outputs.  Paths are jsonpath-nv's, with jq's four divergences from RFC 9535 named.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 

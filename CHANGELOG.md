@@ -5,6 +5,10 @@ All notable changes to jsonquery-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.2 — 2026-09-15
+
+README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+
 ## 0.0.1 — 2026-09-11
 
 The **interface**: every signature and every effect row, and no bodies.
@@ -52,3 +56,38 @@ The **interface**: every signature and every effect row, and no bodies.
   there is no probe and there cannot be one until the value this queries
   builds for a microcontroller.
 - **One dependency**, jsonpath-nv, by registry range.
+
+### Design notes
+
+- **`orbit/nq` is the package this interface was cut out of.** nq keeps
+  `src/main.nv` — argv, several files or standard input, the `--nd` and
+  `-s` input modes, stdout, and the exit code a shell script branches
+  on. Everything in `src/query.nv`, `src/eval.nv` and `src/table.nv` is
+  replaced: `query.parse` by `jqlang.parse`, `query.show` by
+  `jqlang.render`, `eval.run` and `eval.EvalOut` by `jqeval.run` and
+  `jqeval.JqOutcome`, `eval.cmp` by `jqeval.order`, and every symbol in
+  `table.nv` by the same name in `jqfmt`. What nq gains is array and
+  object construction, arithmetic, `reduce`, `foreach`, `try`/`catch`,
+  `//`, `as` bindings, string interpolation, `def`, and the path forms
+  its three-step scanner never had. What nq loses is PCRE in `~=`,
+  because `test` here is I-Regexp; portability was chosen over
+  `(?i)`. Three of nq's behaviours stay its own, because they are about
+  a stream of documents rather than about a program: the `--nd`
+  line-per-document reader, `-s` slurping, and the rule that a
+  malformed record on line 2 stops the run before line 1 is printed.
+- **The standard library's JSON value has three limits this interface
+  is shaped around**, all filed against the toolchain as
+  `std-json-cannot-tell-an-empty-object-from-null-and-has-no-deep-equality`.
+  `{}` and `null` answer the same thing to every typed accessor, so
+  `jqeval.kind` falls back to the rendering for that pair alone. There
+  is no deep equality, which is part of why `jqeval.equal` and
+  `jqeval.order` exist. Reaching one element of an array materialises
+  all of it, because `json.to_list` is the only way in. `json.is_null`,
+  `json.type_of` and `json.equals` are the smallest additions that
+  would close the filing.
+- **The six regex builtins are a missing capability rather than a
+  choice.** Closing them needs a regular-expression engine with no
+  machine effects that answers match positions and capture groups.
+  `jpregex` answers a `Bool`, and `std.regex` is PCRE-shaped, so a jq
+  program using it here would answer differently against a conforming
+  implementation across a wire.
