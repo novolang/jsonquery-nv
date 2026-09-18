@@ -51,4 +51,4 @@ novo        = ">= 0.8.9"
 # absent, because I-Regexp has no capture semantics at all and
 # `jpregex` answers a `Bool`.  `jqbuiltin.absence_reason` publishes
 # that as data.
-jsonpath-nv = "^0.0.1"
+jsonpath-nv = "^0.0.2"

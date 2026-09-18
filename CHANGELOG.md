@@ -7,7 +7,21 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
 ## 0.0.2 — 2026-09-15
 
-README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+README rewritten to the package README style guide (docs/writing-a-readme.md).
+
+`JqFault` now declares the `impl Error` its own `Result` positions
+require.  `Result<T, E>` has carried the bound `E: Error` since SPEC
+§ 3.4, and the compiler enforced it only when `E` was declared in the
+module that named it — so `Result<_, jqerror.JqFault>` was accepted
+across modules with no impl anywhere.  The impl is the signature this
+package always meant; nothing else about the interface changed.
+`JqError` needs none: a runtime error travels in `jqeval.JqOutcome`,
+never in a `Result`.
+
+`jsonpath-nv` is now taken at `^0.0.2`, the version whose `JpFault`
+declares the same impl — under the caret rule `^0.0.x` means exactly
+that version, so `^0.0.1` would have resolved a `JpFault` that is not
+an `Error` and `jqlang.select_path`'s delegate would not build.
 
 ## 0.0.1 — 2026-09-11
 

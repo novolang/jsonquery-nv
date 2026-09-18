@@ -97,6 +97,20 @@ pub struct JqFault
     // whole call and the name is the part a message wants.
     subject: Str
 
+// `JqFault` is an `Error`, which is what lets `Result<T, JqFault>`
+// exist at all — `jqlang.parse` and `jqlang.parse_with`, the only two
+// signatures in this package that answer a `Result`, both answer with
+// one.  `JqError` needs no impl: a runtime error travels in
+// `jqeval.JqOutcome`, beside the outputs the filter had already
+// produced, and never in a `Result`.
+impl Error for JqFault
+    // The one-line message: `jqerror.fault_message`'s sentence, the
+    // kind's name and, where there is one, the subject.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("jsonquery-nv.JqFault.message")
+
 // Build a fault.
 //
 // ```novo
