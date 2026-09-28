@@ -3,6 +3,6 @@
 [jsonpath-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.0.2"
-version = "0.0.2"
-hash = "4693a37feebc585848c0bc2deb68cc235cc8fadb2cdba475c18469b2f7ef1527"
+req = "^0.1.0"
+version = "0.1.0"
+hash = "3ae4bd48c6d6618ebfd3b3b8166f0ba8a238b9c9d1c946d3d5bee3d891cf9e6a"
