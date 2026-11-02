@@ -1948,26 +1948,18 @@ fn int_or_null(v: ?Int) -> JsonValueH []
 fn pick_slice<T>(xs: [T], sl: jpquery.JpSlice) -> [T] []
     let n = list.len(xs)
     let step = sl.step ?? 1
-    var out: [T] = []
     if step == 0
-        return out
-    // workaround(a-list-map-closure-that-returns-an-element-of-a-captured-list-leaks-it):
-    // `list.range(0, count) |> list.map((k) => xs[lower + k * step])` leaks
-    // the picked elements, so the picks are pushed one by one.
+        return []
     if step > 0
         let lower = held(counted(sl.start ?? 0, n), 0, n)
         let upper = held(counted(sl.end ?? n, n), 0, n)
         let count = (upper - lower + step - 1) / step
-        for k in 0..count
-            list.push(out, xs[lower + k * step])
-        return out
+        return list.range(0, count) |> list.map(k => xs[lower + k * step])
     let upper = held(counted(sl.start ?? n - 1, n), 0 - 1, n - 1)
     let lower = held(counted(sl.end ?? 0 - n - 1, n), 0 - 1, n - 1)
     let back = 0 - step
     let count = (upper - lower + back - 1) / back
-    for k in 0..count
-        list.push(out, xs[upper + k * step])
-    out
+    list.range(0, count) |> list.map(k => xs[upper + k * step])
 
 // An index counted from the end when it is negative.
 fn counted(k: Int, n: Int) -> Int []
