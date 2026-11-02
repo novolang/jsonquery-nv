@@ -1,8 +1,5 @@
 // jqbuiltin_tests.nv — the builtin table, asserted as data.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: jsonquery-nv.jqbuiltin.<fn>`.
-//
 // WHAT THIS SUITE IS FOR.  A table is the kind of thing that drifts:
 // a name added to the enum and not to `all()`, an arity written twice
 // and changed once, a refusal explained in prose and not in data.
@@ -60,7 +57,7 @@ fn test_a_name_and_an_arity_are_two_different_questions() [io]
     test.assert(jqbuiltin.is_known_name("length"))
 
     test.case("a name nothing has is not known")
-    test.assert(jqbuiltin.is_known_name("floor_it") == false)
+    test.assert(not jqbuiltin.is_known_name("floor_it"))
 
     test.case("and it has no arities")
     test.assert(list.len(jqbuiltin.arities_of("floor_it")) == 0)
@@ -126,13 +123,13 @@ fn test_a_filter_argument_is_marked_as_one() [io]
     match jqbuiltin.resolve("limit", 2)
         None    => test.assert(false)
         Some(b) =>
-            test.assert(jqbuiltin.takes_filter_argument(b, 0) == false)
+            test.assert(not jqbuiltin.takes_filter_argument(b, 0))
             test.assert(jqbuiltin.takes_filter_argument(b, 1))
 
     test.case("ltrimstr's argument is a value")
     match jqbuiltin.resolve("ltrimstr", 1)
         None    => test.assert(false)
-        Some(b) => test.assert(jqbuiltin.takes_filter_argument(b, 0) == false)
+        Some(b) => test.assert(not jqbuiltin.takes_filter_argument(b, 0))
 
 @test
 fn test_a_builtin_that_can_produce_many_outputs_says_so() [io]
@@ -149,7 +146,7 @@ fn test_a_builtin_that_can_produce_many_outputs_says_so() [io]
     test.case("length does not")
     match jqbuiltin.resolve("length", 0)
         None    => test.assert(false)
-        Some(b) => test.assert(jqbuiltin.may_stream(b) == false)
+        Some(b) => test.assert(not jqbuiltin.may_stream(b))
 
 @test
 fn test_every_refusal_is_data_with_a_reason() [io]
@@ -169,7 +166,7 @@ fn test_every_refusal_is_data_with_a_reason() [io]
         Some(_) => test.assert(true)
 
     test.case("and it is refused for a reason no layer can fix")
-    test.assert(jqbuiltin.absent_for_layer("gsub") == false)
+    test.assert(not jqbuiltin.absent_for_layer("gsub"))
 
     test.case("env is refused because this package is core, which a host could answer")
     match jqbuiltin.absence_reason("env")

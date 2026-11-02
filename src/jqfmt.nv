@@ -1,8 +1,6 @@
 // jqfmt.nv — the renderers, and the CSV-to-JSON typing rule that makes
 // a spreadsheet queryable.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // WHY THE RENDERERS ARE IN THE PACKAGE AT ALL.  A query language and a
 // way to print its answers look like two concerns, and for JSON output
 // they are — `json.stringify` is the standard library's.  Two of these
@@ -29,7 +27,242 @@
 // effect row — which is what keeps the package `core` and lets one
 // rendering go to a screen, a file and a test.
 
+use std.csv
 use std.json
+use std.list
+use std.str
+
+// ── Cells ────────────────────────────────────────────────────────────
+
+// A row's cell by position, or the empty cell for a row that stops
+// short — which the typing rule turns into `null`.
+fn cell_at(row: [Str], i: Int) -> Str []
+    if i < list.len(row)
+        return row[i]
+    ""
+
+// One record of a headerless file: its cells typed, addressed by
+// position.
+fn typed_row(row: [Str]) -> JsonValueH []
+    var out: [JsonValueH] = []
+    for cell in row
+        list.push(out, cell_value(cell))
+    json.array(out)
+
+// One record of a file with a header: keyed by the header names, with
+// `null` for a cell the record does not carry and no key for a cell no
+// name covers.
+fn named_row(names: [Str], row: [Str]) -> JsonValueH []
+    var out: [(Str, JsonValueH)] = []
+    var i = 0
+    for name in names
+        list.push(out, (name, cell_value(cell_at(row, i))))
+        i = i + 1
+    json.object(out)
+
+// ── Shapes ───────────────────────────────────────────────────────────
+
+// What an element is for the purpose of sharing a shape with its
+// siblings: a row when it is an object, a column when it is a scalar,
+// and neither when it is an array.
+fn element_class(v: JsonValueH) -> Str []
+    let t = json.type_of(v)
+    if t == "object"
+        return "object"
+    if t == "array"
+        return "array"
+    "scalar"
+
+// Which table shape an array's elements share, or ragged when they do
+// not share one.
+fn classify(items: [JsonValueH]) -> JqShape []
+    let first = element_class(items[0])
+    if first == "array"
+        return JqShapeRagged
+    var same = true
+    for item in items
+        if element_class(item) != first
+            same = false
+    if not same
+        return JqShapeRagged
+    if first == "object"
+        return JqShapeRows
+    JqShapeColumn
+
+// A type name as a plural, for the sentence that refuses an array of
+// scalars.
+fn plural(kind: Str) -> Str []
+    match kind
+        "number"  => "numbers"
+        "string"  => "strings"
+        "boolean" => "booleans"
+        _         => "nulls"
+
+// What an array of scalars holds, called by its type when they agree
+// and `scalars` when they do not.
+fn element_word(items: [JsonValueH]) -> Str []
+    let first = json.type_of(items[0])
+    var same = true
+    for item in items
+        if json.type_of(item) != first
+            same = false
+    if same
+        return plural(first)
+    "scalars"
+
+// A type name with its article, for the sentence that refuses a scalar.
+fn article_for(kind: Str) -> Str []
+    if kind == "null"
+        return "null"
+    "a " + kind
+
+// Why an array of scalars is not a table.
+fn column_problem(items: [JsonValueH]) -> Str []
+    "an array of " + element_word(items) + " has no columns — pipe it through `map({value: .})`"
+
+// Why a scalar is not a table.
+fn scalar_problem(v: JsonValueH) -> Str []
+    article_for(json.type_of(v)) + " is not a table — wrap it in an object for one row, or an array of objects for many"
+
+// Why an array whose elements do not share a shape is not a table.
+fn ragged_problem() -> Str []
+    "a ragged array is not a table — a table is an array of objects, and these elements are not all the same shape"
+
+// ── Tables ───────────────────────────────────────────────────────────
+
+// The rows a tabulatable value holds, in order.
+fn grid_rows(v: JsonValueH) -> [JsonValueH] []
+    match shape(v)
+        JqShapeRow   => [v]
+        JqShapeEmpty => []
+        _            => json.to_list(v) ?? []
+
+// One row of the grid: every column's cell text, `null` for a column
+// the record does not carry.
+fn row_cells(names: [Str], row: JsonValueH) -> [Str] []
+    var out: [Str] = []
+    for name in names
+        list.push(out, cell_text(json.get(row, name) ?? json.null()))
+    out
+
+// The column names, then one row of cell text each.  The header row is
+// always present, so a table with no columns is one empty row.
+fn text_grid(v: JsonValueH) -> [[Str]] []
+    let rows = grid_rows(v)
+    var names = columns(rows)
+    var out: [[Str]] = []
+    list.push(out, names)
+    for row in rows
+        list.push(out, row_cells(names, row))
+    out
+
+// A cell's width in codepoints, which is what the alignment is by.
+fn width_of(cell: Str) -> Int []
+    list.len(str.chars(cell))
+
+// A cell padded with spaces on the right to a width in codepoints.
+fn pad_to(cell: Str, width: Int) -> Str []
+    let gap = width - width_of(cell)
+    if gap <= 0
+        return cell
+    cell + str.repeat(" ", gap)
+
+// The widest cell in each column.  A grid is rectangular by
+// construction, so the header's length is the column count.
+fn column_widths(g: [[Str]]) -> [Int] []
+    var widths: [Int] = []
+    for c in 0..list.len(g[0])
+        var w = 0
+        for row in g
+            let x = width_of(row[c])
+            if x > w
+                w = x
+        list.push(widths, w)
+    widths
+
+// One line: every column padded but the last, one space between.
+fn row_line(row: [Str], widths: [Int]) -> Str []
+    var parts: [Str] = []
+    var i = 0
+    for cell in row
+        if i + 1 < list.len(row)
+            list.push(parts, pad_to(cell, widths[i]))
+        else
+            list.push(parts, cell)
+        i = i + 1
+    str.join(parts, " ")
+
+// The grid as lines.
+fn render_grid(g: [[Str]]) -> Str []
+    let widths = column_widths(g)
+    var lines: [Str] = []
+    for row in g
+        list.push(lines, row_line(row, widths))
+    str.join(lines, "\n")
+
+// Whether a field needs quotes under RFC 4180 § 2.6/2.7: a comma, a
+// quote, a CR or a LF.
+fn needs_quotes(text: Str) -> Bool []
+    if str.contains(text, ",")
+        return true
+    if str.contains(text, "\"")
+        return true
+    if str.contains(text, "\n")
+        return true
+    str.contains(text, "\r")
+
+// One cell as a CSV field.
+//
+// Hand-written rather than `csv.stringify`, which on this toolchain
+// leaks one heap `Str` per input cell: every `novo test` run of this
+// suite would print every verdict green and `the run leaked`, exit 23.
+// `csv.parse` reads this writer's output back.
+fn csv_field(cell: Str) -> Str []
+    if not needs_quotes(cell)
+        return cell
+    "\"" + str.replace_all(cell, "\"", "\"\"") + "\""
+
+// The grid as CSV records, one per line.
+fn render_csv(g: [[Str]]) -> Str []
+    var lines: [Str] = []
+    for row in g
+        var fields: [Str] = []
+        for cell in row
+            list.push(fields, csv_field(cell))
+        list.push(lines, str.join(fields, ","))
+    str.join(lines, "\n")
+
+// ── Renderings ───────────────────────────────────────────────────────
+
+// An array's members on their own lines.
+fn render_array(items: [JsonValueH], level: Int, indent: Int) -> Str []
+    if list.len(items) == 0
+        return "[]"
+    let inner = pad_to("", indent * (level + 1))
+    var parts: [Str] = []
+    for item in items
+        list.push(parts, render_pretty(item, level + 1, indent))
+    "[\n" + inner + str.join(parts, ",\n" + inner) + "\n" + pad_to("", indent * level) + "]"
+
+// An object's members on their own lines, in document order.
+fn render_object(names: [Str], v: JsonValueH, level: Int, indent: Int) -> Str []
+    if list.len(names) == 0
+        return "{}"
+    let inner = pad_to("", indent * (level + 1))
+    var parts: [Str] = []
+    for name in names
+        list.push(parts,
+            json.stringify(json.string(name)) + ": " + render_pretty(json.get(v, name) ?? json.null(), level + 1, indent))
+    "{\n" + inner + str.join(parts, ",\n" + inner) + "\n" + pad_to("", indent * level) + "}"
+
+// One value, indented by `indent` spaces per level, sitting at `level`.
+fn render_pretty(v: JsonValueH, level: Int, indent: Int) -> Str []
+    let t = json.type_of(v)
+    if t == "array"
+        return render_array(json.to_list(v) ?? [], level, indent)
+    if t == "object"
+        return render_object(json.keys(v), v, level, indent)
+    json.stringify(v)
 
 // What shape a value has, for the purpose of drawing it as a table.
 //
@@ -76,7 +309,14 @@ pub enum JqShape
 //     println(json.stringify(jqfmt.cell_value("00417")))
 // ```
 pub fn cell_value(text: Str) -> JsonValueH []
-    todo("jsonquery-nv.jqfmt.cell_value")
+    if text == ""
+        return json.null()
+    match json.parse(text)
+        None    => json.string(text)
+        Some(v) =>
+            if round_trips(text, v)
+                return v
+            json.string(text)
 
 // Whether a value renders back as exactly this text.
 //
@@ -93,7 +333,12 @@ pub fn cell_value(text: Str) -> JsonValueH []
 //         Some(v) => println("${jqfmt.round_trips("00417", v)}")
 // ```
 pub fn round_trips(text: Str, v: JsonValueH) -> Bool []
-    todo("jsonquery-nv.jqfmt.round_trips")
+    match json.type_of(v)
+        "number"  => json.stringify(v) == text
+        "boolean" => json.stringify(v) == text
+        "string"  => (json.to_str(v) ?? "") == text
+        "null"    => text == ""
+        _         => false
 
 // Read CSV text as a JSON value.
 //
@@ -117,7 +362,20 @@ pub fn round_trips(text: Str, v: JsonValueH) -> Bool []
 //         Some(v) => println(json.stringify(v))
 // ```
 pub fn csv_to_json(text: Str, has_header: Bool) -> ?JsonValueH []
-    todo("jsonquery-nv.jqfmt.csv_to_json")
+    let rows = csv.parse(text)
+    if list.len(rows) == 0
+        return None
+    if has_header
+        let header = rows[0]
+        let records = list.drop(rows, 1)
+        var objects: [JsonValueH] = []
+        for row in records
+            list.push(objects, named_row(header, row))
+        return Some(json.array(objects))
+    var arrays: [JsonValueH] = []
+    for row in rows
+        list.push(arrays, typed_row(row))
+    Some(json.array(arrays))
 
 // What shape a value has.
 //
@@ -134,7 +392,15 @@ pub fn csv_to_json(text: Str, has_header: Bool) -> ?JsonValueH []
 //                 _            => println("something else")
 // ```
 pub fn shape(v: JsonValueH) -> JqShape []
-    todo("jsonquery-nv.jqfmt.shape")
+    let t = json.type_of(v)
+    if t == "object"
+        return JqShapeRow
+    if t != "array"
+        return JqShapeScalar
+    let items = json.to_list(v) ?? []
+    if list.len(items) == 0
+        return JqShapeEmpty
+    classify(items)
 
 // The column names of a set of rows: every key any record carries, in
 // the order first seen.
@@ -155,7 +421,13 @@ pub fn shape(v: JsonValueH) -> JqShape []
 //         Some(v) => println("${jqfmt.columns([v])}")
 // ```
 pub fn columns(rows: [JsonValueH]) -> [Str] []
-    todo("jsonquery-nv.jqfmt.columns")
+    var out: [Str] = []
+    for row in rows
+        if json.type_of(row) == "object"
+            for name in json.keys(row)
+                if not list.contains(out, name)
+                    list.push(out, name)
+    out
 
 // One cell's text: a string bare, and every other value as its JSON.
 //
@@ -174,7 +446,9 @@ pub fn columns(rows: [JsonValueH]) -> [Str] []
 //         Some(v) => println(jqfmt.cell_text(v))
 // ```
 pub fn cell_text(v: JsonValueH) -> Str []
-    todo("jsonquery-nv.jqfmt.cell_text")
+    if json.type_of(v) == "string"
+        return json.to_str(v) ?? ""
+    json.stringify(v)
 
 // The table as rows of cell text, header first, or `None` when the
 // value has no table shape.
@@ -197,7 +471,13 @@ pub fn cell_text(v: JsonValueH) -> Str []
 //                 Some(g) => println("${g}")
 // ```
 pub fn grid(v: JsonValueH) -> ?[[Str]] []
-    todo("jsonquery-nv.jqfmt.grid")
+    match shape(v)
+        JqShapeRows   => Some(text_grid(v))
+        JqShapeRow    => Some(text_grid(v))
+        JqShapeEmpty  => Some(text_grid(v))
+        JqShapeColumn => None
+        JqShapeScalar => None
+        JqShapeRagged => None
 
 // Why this value cannot be drawn as a table, or `None` when it can.
 //
@@ -219,7 +499,13 @@ pub fn grid(v: JsonValueH) -> ?[[Str]] []
 //                 Some(m) => println(m)
 // ```
 pub fn table_problem(v: JsonValueH) -> ?Str []
-    todo("jsonquery-nv.jqfmt.table_problem")
+    match shape(v)
+        JqShapeRows   => None
+        JqShapeRow    => None
+        JqShapeEmpty  => None
+        JqShapeColumn => Some(column_problem(json.to_list(v) ?? []))
+        JqShapeScalar => Some(scalar_problem(v))
+        JqShapeRagged => Some(ragged_problem())
 
 // The table as aligned columns, or `None` when the value has no table
 // shape.
@@ -243,7 +529,13 @@ pub fn table_problem(v: JsonValueH) -> ?Str []
 //                 Some(t) => println(t)
 // ```
 pub fn tabular(v: JsonValueH) -> ?Str []
-    todo("jsonquery-nv.jqfmt.tabular")
+    match shape(v)
+        JqShapeRows   => Some(render_grid(text_grid(v)))
+        JqShapeRow    => Some(render_grid(text_grid(v)))
+        JqShapeEmpty  => Some(render_grid(text_grid(v)))
+        JqShapeColumn => None
+        JqShapeScalar => None
+        JqShapeRagged => None
 
 // The table as CSV, or `None` when the value has no table shape.
 //
@@ -264,7 +556,13 @@ pub fn tabular(v: JsonValueH) -> ?Str []
 //                 Some(c) => println(c)
 // ```
 pub fn csv_out(v: JsonValueH) -> ?Str []
-    todo("jsonquery-nv.jqfmt.csv_out")
+    match shape(v)
+        JqShapeRows   => Some(render_csv(text_grid(v)))
+        JqShapeRow    => Some(render_csv(text_grid(v)))
+        JqShapeEmpty  => Some(render_csv(text_grid(v)))
+        JqShapeColumn => None
+        JqShapeScalar => None
+        JqShapeRagged => None
 
 // One value as one line of JSON.
 //
@@ -278,7 +576,7 @@ pub fn csv_out(v: JsonValueH) -> ?Str []
 //         Some(v) => println(jqfmt.compact(v))
 // ```
 pub fn compact(v: JsonValueH) -> Str []
-    todo("jsonquery-nv.jqfmt.compact")
+    json.stringify(v)
 
 // One value as indented JSON.
 //
@@ -295,7 +593,7 @@ pub fn compact(v: JsonValueH) -> Str []
 //         Some(v) => println(jqfmt.pretty(v, 2))
 // ```
 pub fn pretty(v: JsonValueH, indent: Int) -> Str []
-    todo("jsonquery-nv.jqfmt.pretty")
+    render_pretty(v, 0, indent)
 
 // One value with a string printed bare, and anything else as JSON.
 //
@@ -314,4 +612,6 @@ pub fn pretty(v: JsonValueH, indent: Int) -> Str []
 //         Some(v) => println(jqfmt.raw(v))
 // ```
 pub fn raw(v: JsonValueH) -> Str []
-    todo("jsonquery-nv.jqfmt.raw")
+    if json.type_of(v) == "string"
+        return json.to_str(v) ?? ""
+    compact(v)

@@ -1,9 +1,6 @@
 // jqerror_tests.nv — the two error types, and what each of them can
 // say.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: jsonquery-nv.jqerror.<fn>`.
-//
 // WHY THIS SUITE EXISTS SEPARATELY.  A message is the part of an error
 // nobody tests and everybody reads.  The properties below are the ones
 // that make a message useful rather than present: it names the SUBJECT
@@ -96,4 +93,4 @@ fn test_a_budget_is_the_one_error_a_program_may_not_ignore() [io]
     test.assert(jqerror.is_catchable(JqUserRaised))
 
     test.case("a budget is not — a limit a program could catch is not a limit")
-    test.assert(jqerror.is_catchable(JqOverBudget) == false)
+    test.assert(not jqerror.is_catchable(JqOverBudget))

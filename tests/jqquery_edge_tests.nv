@@ -1,0 +1,339 @@
+// jqquery_edge_tests.nv — the readings the other suites leave implicit.
+//
+// WHAT THIS SUITE IS FOR.  The five suites beside it are the interface's
+// own vectors: the builtin table asserted against itself, jq's four
+// disagreements with RFC 9535, the CSV typing table.  What none of them
+// pins is where a reading was CHOSEN rather than quoted — a cell that
+// says `null`, a blank line in a CSV file, how many spaces `tabular`
+// puts after a last column, which of `keys` and `keys_unsorted` is
+// document order.  Those are the places a package drifts, so they are
+// asserted here by name rather than left to the prose.
+
+use std.test
+use std.json
+use std.list
+use std.str
+use jqbuiltin
+use jqerror
+use jqeval
+use jqfmt
+use jqlang
+
+fn value_of(text: Str) -> JsonValueH
+    json.parse(text) ?? jqeval.null_value()
+
+// A whole value as one line, or the word `none` for an absent one, so
+// a case can compare a shape in one assertion.
+fn text_of(v: ?JsonValueH) -> Str []
+    match v
+        None    => "none"
+        Some(x) => json.stringify(x)
+
+// What a program produces, as one line: `[out,out]`, with `!kind`
+// appended when the run failed.
+fn outputs(src: Str, input: Str) -> Str []
+    match jqlang.parse(src)
+        Err(f) => "parse:" + jqerror.fault_kind_name(f.kind)
+        Ok(p)  =>
+            let o = jqeval.run(p, value_of(input))
+            var parts: [Str] = []
+            for v in o.values
+                list.push(parts, json.stringify(v))
+            let body = "[" + str.join(parts, ",") + "]"
+            match o.fault
+                None    => body
+                Some(e) => body + "!" + jqerror.error_kind_name(e.kind)
+
+@test
+fn test_a_blank_cell_is_null_and_the_text_null_is_a_string() [io]
+    test.case("the two are different cells and stay different")
+    test.assert(jqeval.type_name(jqfmt.cell_value("")) == "null")
+    test.assert(jqeval.type_name(jqfmt.cell_value("null")) == "string")
+    test.assert(jqfmt.cell_value("null") == json.string("null"))
+
+    test.case("so the round-trip condition answers differently for each")
+    test.assert(jqfmt.round_trips("", jqeval.null_value()))
+    test.assert(not jqfmt.round_trips("null", jqeval.null_value()))
+
+    test.case("a cell that is two quote marks is that text, not an empty string")
+    test.assert(jqfmt.cell_value("\"\"") == json.string("\"\""))
+
+@test
+fn test_the_round_trip_predicate_decides_every_type_by_rendering() [io]
+    test.case("a string round-trips as its own bare text")
+    test.assert(jqfmt.round_trips("ada", json.string("ada")))
+    test.assert(not jqfmt.round_trips("ada", json.string("ADA")))
+
+    test.case("a boolean as its own name and nothing else")
+    test.assert(jqfmt.round_trips("true", json.bool(true)))
+    test.assert(not jqfmt.round_trips("TRUE", json.bool(true)))
+
+    test.case("a number only when its rendering is the very same bytes")
+    test.assert(jqfmt.round_trips("120", value_of("120")))
+    test.assert(not jqfmt.round_trips("1e3", value_of("1000")))
+
+    test.case("and a container never, which is why a JSON cell stays text")
+    test.assert(not jqfmt.round_trips("[1]", value_of("[1]")))
+    test.assert(not jqfmt.round_trips("{\"a\":1}", value_of("{\"a\":1}")))
+    test.assert(jqeval.type_name(jqfmt.cell_value("[1]")) == "string")
+
+@test
+fn test_a_record_that_stops_short_gets_null_and_one_that_runs_long_is_cut() [io]
+    test.case("a missing cell is null, not a blank and not an omission")
+    test.assert(text_of(jqfmt.csv_to_json("a,b\n1\n", true)) == "[{\"a\":1,\"b\":null}]")
+
+    test.case("a cell no header name covers is dropped")
+    test.assert(text_of(jqfmt.csv_to_json("a,b\n1,2,3\n", true)) == "[{\"a\":1,\"b\":2}]")
+
+    test.case("a header and no records is an empty table, not an absent one")
+    test.assert(text_of(jqfmt.csv_to_json("a,b\n", true)) == "[]")
+
+    test.case("a blank line is a record with one blank cell")
+    test.assert(text_of(jqfmt.csv_to_json("a\n\n", true)) == "[{\"a\":null}]")
+    test.assert(text_of(jqfmt.csv_to_json("\n", true)) == "[]")
+
+    test.case("no text at all is None, which is the third answer")
+    test.assert(text_of(jqfmt.csv_to_json("", true)) == "none")
+
+@test
+fn test_a_headerless_read_types_its_cells_and_keeps_the_first_row() [io]
+    test.case("without a header the first row is data, addressed by position")
+    test.assert(text_of(jqfmt.csv_to_json("a,b\n1,2\n", false)) == "[[\"a\",\"b\"],[1,2]]")
+
+    test.case("and the blank line keeps its null")
+    test.assert(text_of(jqfmt.csv_to_json("a\n\n", false)) == "[[\"a\"],[null]]")
+
+@test
+fn test_a_column_refusal_names_the_type_it_found() [io]
+    test.case("one type, plural, named")
+    test.assert(jqfmt.table_problem(value_of("[1,2]")) == Some("an array of numbers has no columns — pipe it through `map({value: .})`"))
+    test.assert(jqfmt.table_problem(value_of("[\"a\",\"b\"]")) == Some("an array of strings has no columns — pipe it through `map({value: .})`"))
+    test.assert(jqfmt.table_problem(value_of("[true,false]")) == Some("an array of booleans has no columns — pipe it through `map({value: .})`"))
+    test.assert(jqfmt.table_problem(value_of("[null,null]")) == Some("an array of nulls has no columns — pipe it through `map({value: .})`"))
+
+    test.case("several types together are scalars, which is all they are")
+    test.assert(jqfmt.table_problem(value_of("[1,\"a\"]")) == Some("an array of scalars has no columns — pipe it through `map({value: .})`"))
+
+    test.case("a scalar is refused with its own type, null taking no article")
+    test.assert(jqfmt.table_problem(value_of("3")) == Some("a number is not a table — wrap it in an object for one row, or an array of objects for many"))
+    test.assert(jqfmt.table_problem(value_of("\"x\"")) == Some("a string is not a table — wrap it in an object for one row, or an array of objects for many"))
+    test.assert(jqfmt.table_problem(value_of("true")) == Some("a boolean is not a table — wrap it in an object for one row, or an array of objects for many"))
+    test.assert(jqfmt.table_problem(value_of("null")) == Some("null is not a table — wrap it in an object for one row, or an array of objects for many"))
+
+    test.case("an array of arrays is ragged, and so is a mixed array")
+    test.assert(jqfmt.shape(value_of("[[1],[2]]")) == JqShapeRagged)
+    test.assert(jqfmt.shape(value_of("[{\"a\":1},3]")) == JqShapeRagged)
+    match jqfmt.table_problem(value_of("[[1]]"))
+        None    => test.assert(false)
+        Some(m) => test.assert(str.contains(m, "ragged"))
+
+    test.case("while two objects that carry different keys are not ragged at all")
+    match jqfmt.table_problem(value_of("[{\"a\":1},{\"b\":2}]"))
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+    test.case("all three renderings refuse together, never one of them alone")
+    match jqfmt.grid(value_of("[1,2]"))
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+    match jqfmt.grid(value_of("[[1]]"))
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+    match jqfmt.tabular(value_of("3"))
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+    match jqfmt.csv_out(value_of("[1,2]"))
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+    match jqfmt.csv_out(value_of("null"))
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+@test
+fn test_a_missing_column_is_a_null_cell_and_an_empty_string_is_an_empty_cell() [io]
+    test.case("the row that stops short shows null in the cell")
+    match jqfmt.grid(value_of("[{\"a\":1,\"b\":2},{\"a\":1}]"))
+        None    => test.assert(false)
+        Some(g) =>
+            test.assert(list.len(g) == 3)
+            test.assert(g[0] == ["a", "b"])
+            test.assert(g[2] == ["1", "null"])
+
+    test.case("a cell holding an empty string shows nothing, which is different")
+    match jqfmt.grid(value_of("[{\"a\":\"\"}]"))
+        None    => test.assert(false)
+        Some(g) => test.assert(g[1] == [""])
+
+@test
+fn test_the_table_pads_columns_but_never_the_end_of_a_line() [io]
+    test.case("a single object is a table of one row with its own keys")
+    test.assert(jqfmt.tabular(value_of("{\"a\":1,\"b\":\"x\"}")) == Some("a b\n1 x"))
+
+    test.case("a wider cell widens its column, which is why the last line is ragged at the end")
+    test.assert(jqfmt.tabular(value_of("[{\"a\":1,\"b\":\"x\"},{\"a\":100,\"b\":\"yy\"}]")) == Some("a   b\n1   x\n100 yy"))
+
+    test.case("an empty array is a table with no rows: one empty line, not None")
+    test.assert(jqfmt.tabular(value_of("[]")) == Some(""))
+    test.assert(jqfmt.csv_out(value_of("[]")) == Some(""))
+
+@test
+fn test_alignment_is_by_codepoints_which_is_what_the_doc_claims() [io]
+    test.case("a two-codepoint cell is narrower than its four bytes")
+    test.assert(jqfmt.tabular(value_of("[{\"x\":\"éé\",\"y\":\"a\"},{\"x\":\"z\",\"y\":\"b\"}]")) == Some("x  y\néé a\nz  b"))
+
+@test
+fn test_pretty_honours_the_indent_it_was_given() [io]
+    test.case("the empty containers stay on one line")
+    test.assert(jqfmt.pretty(value_of("[]"), 2) == "[]")
+    test.assert(jqfmt.pretty(value_of("{}"), 2) == "{}")
+
+    test.case("an object opens, indents its members and closes")
+    test.assert(jqfmt.pretty(value_of("{\"a\":1}"), 2) == "{\n  \"a\": 1\n}")
+
+    test.case("nesting adds one indent per level")
+    test.assert(jqfmt.pretty(value_of("{\"a\":[1,2]}"), 2) == "{\n  \"a\": [\n    1,\n    2\n  ]\n}")
+
+    test.case("indent 0 is a layout, not a refusal, and it is not compact")
+    test.assert(jqfmt.pretty(value_of("{\"a\":[1]}"), 0) == "{\n\"a\": [\n1\n]\n}")
+    test.assert(jqfmt.pretty(value_of("{\"a\":[1]}"), 0) != jqfmt.compact(value_of("{\"a\":[1]}")))
+
+@test
+fn test_csv_out_quotes_exactly_what_csv_requires() [io]
+    test.case("a comma, a quote and a newline each force the quotes")
+    test.assert(jqfmt.csv_out(value_of("[{\"x\":\"a,b\",\"y\":\"plain\"}]")) == Some("x,y\n\"a,b\",plain"))
+    test.assert(jqfmt.csv_out(value_of("[{\"x\":\"he said \\\"hi\\\"\"}]")) == Some("x\n\"he said \"\"hi\"\"\""))
+    test.assert(jqfmt.csv_out(value_of("[{\"x\":\"l1\\nl2\"}]")) == Some("x\n\"l1\nl2\""))
+
+    test.case("a nested value goes out as its JSON, quoted because of its comma")
+    test.assert(jqfmt.csv_out(value_of("[{\"x\":[1,2]}]")) == Some("x\n\"[1,2]\""))
+    test.assert(text_of(jqfmt.csv_to_json("x\n\"[1,2]\"", true)) == "[{\"x\":\"[1,2]\"}]")
+
+@test
+fn test_csv_out_reads_back_as_the_table_it_came_from() [io]
+    test.case("a header and its records survive the round trip")
+    let table = value_of("[{\"x\":\"a,b\",\"y\":\"plain\"},{\"x\":\"he said \\\"hi\\\"\",\"y\":\"l1\\nl2\"}]")
+    match jqfmt.csv_out(table)
+        None    => test.assert(false)
+        Some(c) => test.assert(text_of(jqfmt.csv_to_json(c, true)) == json.stringify(table))
+
+    test.case("a number comes back a number and a string a string")
+    test.assert(text_of(jqfmt.csv_to_json("a,b\n1,2", true)) == "[{\"a\":1,\"b\":2}]")
+
+    test.case("without the header the same text is rows of cells, first row included")
+    test.assert(text_of(jqfmt.csv_to_json("a,b\n1,2", false)) == "[[\"a\",\"b\"],[1,2]]")
+
+@test
+fn test_the_columns_of_rows_that_are_not_objects() [io]
+    test.case("a scalar row contributes nothing and does not stop the walk")
+    test.assert(jqfmt.columns([value_of("3"), value_of("{\"a\":1}")]) == ["a"])
+
+    test.case("and with no object at all there are no columns")
+    test.assert(list.len(jqfmt.columns([value_of("3")])) == 0)
+
+@test
+fn test_a_refused_function_is_refused_at_parse_time_with_its_reason() [io]
+    test.case("the regex family is refused, not unknown, and says why")
+    match jqlang.parse("gsub(\"a\";\"b\")")
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert(jqerror.fault_kind_name(f.kind) == "refused-function")
+            test.assert(f.subject == "gsub")
+    match jqbuiltin.absence_reason("gsub")
+        None    => test.assert(false)
+        Some(r) => test.assert(r.contains("I-Regexp"))
+
+    test.case("the host family is refused the same way")
+    match jqlang.parse("env")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(jqerror.fault_kind_name(f.kind) == "refused-function")
+    test.assert(jqbuiltin.absent_for_layer("env"))
+    test.assert(jqbuiltin.absent_for_layer("now"))
+
+    test.case("a name jq does not have either is merely unknown")
+    match jqlang.parse("del(.a)")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(jqerror.fault_kind_name(f.kind) == "unknown-function")
+    match jqbuiltin.absence_reason("del")
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+@test
+fn test_an_outcome_can_carry_output_and_an_error_at_once() [io]
+    test.case("the two halves are both there, which a Result could not say")
+    let e = jqerror.error(JqUserRaised, value_of("\"stop\""), 0)
+    let o = jqeval.raised([value_of("1")], e)
+    test.assert(list.len(o.values) == 1)
+    test.assert(jqeval.failed(o))
+    match o.fault
+        None    => test.assert(false)
+        Some(x) => test.assert(jqerror.error_kind_name(x.kind) == "user-raised")
+
+    test.case("and an outcome with no error is not a failure")
+    test.assert(not jqeval.failed(jqeval.produced([])))
+    test.assert(list.len(jqeval.produced([value_of("1")]).values) == 1)
+
+@test
+fn test_order_and_multiplicity_are_the_programs_own() [io]
+    test.case("comma is concatenation, so the same filter twice is two outputs in order")
+    test.assert(outputs(".a,.a", "{\"a\":1}") == "[1,1]")
+
+    test.case("an object's members iterate in document order, keys answers sorted")
+    test.assert(outputs(".[]", "{\"b\":1,\"a\":2}") == "[1,2]")
+    test.assert(outputs("keys", "{\"b\":1,\"a\":2}") == "[[\"a\",\"b\"]]")
+    test.assert(outputs("keys_unsorted", "{\"b\":1,\"a\":2}") == "[[\"b\",\"a\"]]")
+
+    test.case("a missing member is null, which is one output and not none")
+    test.assert(outputs(".a.b.c", "{}") == "[null]")
+
+    test.case("an optional path over a scalar is nothing, which is the third answer")
+    test.assert(outputs(".[]?", "3") == "[]")
+    test.assert(outputs(".a", "3") == "[]!cannot-index")
+
+@test
+fn test_the_readings_taken_from_jq_where_the_doc_does_not_say() [io]
+    test.case("test is a SEARCH: a plain substring matches, anchors are literal")
+    test.assert(outputs("test(\"b\")", "\"abc\"") == "[true]")
+    test.assert(outputs("test(\"^a+$\")", "\"aaa\"") == "[false]")
+
+    test.case("a number literal with an exponent is a number")
+    test.assert(outputs("1e3", "null") == "[1000]")
+
+    test.case("`..` is recurse, so the input itself is the first output")
+    test.assert(outputs("..", "{\"a\":1}") == "[{\"a\":1},1]")
+
+    test.case("join renders null as the empty string")
+    test.assert(outputs("join(\"-\")", "[\"a\",1,null]") == "[\"a-1-\"]")
+
+    test.case("add over nothing is null, which is jq's rule and not an error")
+    test.assert(outputs("add", "[]") == "[null]")
+
+    test.case("a quoted path name addresses a member a bare path could not")
+    test.assert(outputs(".[\"a b\"]", "{\"a b\":1}") == "[1]")
+
+    test.case("paths and path answer the routes, getpath walks one")
+    test.assert(outputs("[paths]", "{\"a\":[1]}") == "[[[\"a\"],[\"a\",0]]]")
+    test.assert(outputs("[path(.[])]", "[1,2]") == "[[[0],[1]]]")
+    test.assert(outputs("getpath([\"a\",0])", "{\"a\":[7,8]}") == "[7]")
+
+    test.case("equality is structural, so 1 and 1.0 are one value")
+    test.assert(outputs("1 == 1.0", "null") == "[true]")
+
+@test
+fn test_every_refused_name_has_a_reason_and_a_side_of_the_line() [io]
+    let host_names = ["env", "\$ENV", "input", "inputs", "input_line_number",
+                      "now", "localtime", "strftime", "halt_error", "debug"]
+    test.case("each one is explained rather than merely refused")
+    for n in jqbuiltin.absent_named()
+        match jqbuiltin.absence_reason(n)
+            None    => test.assert(false)
+            Some(r) => test.assert(str.len(r) > 0)
+
+    test.case("and each one says whether a host layer could answer it")
+    for n in jqbuiltin.absent_named()
+        test.assert(jqbuiltin.absent_for_layer(n) == list.contains(host_names, n))
+
+    test.case("the streaming and filter-argument marks answer for the entries that carry them")
+    test.assert(jqbuiltin.may_stream(JqbRange1))
+    test.assert(not jqbuiltin.may_stream(JqbLength))
+    test.assert(jqbuiltin.takes_filter_argument(JqbMap1, 0))
+    test.assert(not jqbuiltin.takes_filter_argument(JqbLength, 0))

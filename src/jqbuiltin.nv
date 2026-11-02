@@ -1,7 +1,5 @@
 // jqbuiltin.nv — the builtin table, as data.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE TABLE IS A VALUE, NOT A `match` IN THE PARSER, and that is the
 // whole argument for this module existing.  A parser that decides
 // builtins with a branch can answer exactly one question — is this
@@ -35,6 +33,9 @@
 // builtins that need capture semantics, and the host builtins a `core`
 // package has no machine to answer with.
 
+use std.list
+use std.str
+
 // One builtin, named by what it is called and how many arguments it
 // takes.  The groups below are jq's own manual's.
 pub enum JqBuiltin
@@ -67,7 +68,8 @@ pub enum JqBuiltin
     // `limit(n; f)` — at most `n` outputs of `f`.  The laziness here
     // is the reason `takes_filter_argument` is published: an
     // implementation that collected `f` first would run an infinite
-    // `repeat` forever.
+    // `recurse(.)` forever.  This one collects, which the CHANGELOG
+    // records under Known.
     JqbLimit2
     // `until(cond; update)`.
     JqbUntil2
@@ -206,7 +208,22 @@ pub enum JqBuiltin
 //     println("${list.len(jqbuiltin.all())}")
 // ```
 pub fn all() -> [JqBuiltin] []
-    todo("jsonquery-nv.jqbuiltin.all")
+    [JqbEmpty, JqbError0, JqbError1, JqbNot, JqbRecurse0, JqbRecurse1,
+     JqbRange1, JqbRange2, JqbRange3, JqbFirst1, JqbLast1, JqbLimit2,
+     JqbUntil2, JqbWhile2,
+     JqbType, JqbLength, JqbUtf8ByteLength, JqbHas1, JqbIn1, JqbContains1,
+     JqbInside1,
+     JqbKeys, JqbKeysUnsorted, JqbValues, JqbToEntries, JqbFromEntries,
+     JqbWithEntries1, JqbAdd, JqbAny0, JqbAll0, JqbAny1, JqbAll1,
+     JqbFlatten0, JqbFlatten1,
+     JqbSelect1, JqbMap1, JqbMapValues1, JqbPath1, JqbPaths0, JqbPaths1,
+     JqbGetpath1,
+     JqbSort, JqbSortBy1, JqbGroupBy1, JqbUnique, JqbUniqueBy1, JqbReverse,
+     JqbMin, JqbMax, JqbMinBy1, JqbMaxBy1,
+     JqbToString, JqbToNumber, JqbToJson, JqbFromJson, JqbAsciiDowncase,
+     JqbAsciiUpcase, JqbExplode, JqbImplode, JqbSplit1, JqbJoin1,
+     JqbLtrimstr1, JqbRtrimstr1, JqbStartswith1, JqbEndswith1, JqbTest1,
+     JqbFloor, JqbCeil, JqbSqrt]
 
 // What a builtin is called, without its arity.
 //
@@ -217,7 +234,76 @@ pub fn all() -> [JqBuiltin] []
 //     println(jqbuiltin.name(JqbRange2))
 // ```
 pub fn name(b: JqBuiltin) -> Str []
-    todo("jsonquery-nv.jqbuiltin.name")
+    match b
+        JqbEmpty          => "empty"
+        JqbError0         => "error"
+        JqbError1         => "error"
+        JqbNot            => "not"
+        JqbRecurse0       => "recurse"
+        JqbRecurse1       => "recurse"
+        JqbRange1         => "range"
+        JqbRange2         => "range"
+        JqbRange3         => "range"
+        JqbFirst1         => "first"
+        JqbLast1          => "last"
+        JqbLimit2         => "limit"
+        JqbUntil2         => "until"
+        JqbWhile2         => "while"
+        JqbType           => "type"
+        JqbLength         => "length"
+        JqbUtf8ByteLength => "utf8bytelength"
+        JqbHas1           => "has"
+        JqbIn1            => "in"
+        JqbContains1      => "contains"
+        JqbInside1        => "inside"
+        JqbKeys           => "keys"
+        JqbKeysUnsorted   => "keys_unsorted"
+        JqbValues         => "values"
+        JqbToEntries      => "to_entries"
+        JqbFromEntries    => "from_entries"
+        JqbWithEntries1   => "with_entries"
+        JqbAdd            => "add"
+        JqbAny0           => "any"
+        JqbAll0           => "all"
+        JqbAny1           => "any"
+        JqbAll1           => "all"
+        JqbFlatten0       => "flatten"
+        JqbFlatten1       => "flatten"
+        JqbSelect1        => "select"
+        JqbMap1           => "map"
+        JqbMapValues1     => "map_values"
+        JqbPath1          => "path"
+        JqbPaths0         => "paths"
+        JqbPaths1         => "paths"
+        JqbGetpath1       => "getpath"
+        JqbSort           => "sort"
+        JqbSortBy1        => "sort_by"
+        JqbGroupBy1       => "group_by"
+        JqbUnique         => "unique"
+        JqbUniqueBy1      => "unique_by"
+        JqbReverse        => "reverse"
+        JqbMin            => "min"
+        JqbMax            => "max"
+        JqbMinBy1         => "min_by"
+        JqbMaxBy1         => "max_by"
+        JqbToString       => "tostring"
+        JqbToNumber       => "tonumber"
+        JqbToJson         => "tojson"
+        JqbFromJson       => "fromjson"
+        JqbAsciiDowncase  => "ascii_downcase"
+        JqbAsciiUpcase    => "ascii_upcase"
+        JqbExplode        => "explode"
+        JqbImplode        => "implode"
+        JqbSplit1         => "split"
+        JqbJoin1          => "join"
+        JqbLtrimstr1      => "ltrimstr"
+        JqbRtrimstr1      => "rtrimstr"
+        JqbStartswith1    => "startswith"
+        JqbEndswith1      => "endswith"
+        JqbTest1          => "test"
+        JqbFloor          => "floor"
+        JqbCeil           => "ceil"
+        JqbSqrt           => "sqrt"
 
 // How many arguments it takes.
 //
@@ -228,7 +314,76 @@ pub fn name(b: JqBuiltin) -> Str []
 //     println("${jqbuiltin.arity(JqbRange2)}")
 // ```
 pub fn arity(b: JqBuiltin) -> Int []
-    todo("jsonquery-nv.jqbuiltin.arity")
+    match b
+        JqbEmpty          => 0
+        JqbError0         => 0
+        JqbError1         => 1
+        JqbNot            => 0
+        JqbRecurse0       => 0
+        JqbRecurse1       => 1
+        JqbRange1         => 1
+        JqbRange2         => 2
+        JqbRange3         => 3
+        JqbFirst1         => 1
+        JqbLast1          => 1
+        JqbLimit2         => 2
+        JqbUntil2         => 2
+        JqbWhile2         => 2
+        JqbType           => 0
+        JqbLength         => 0
+        JqbUtf8ByteLength => 0
+        JqbHas1           => 1
+        JqbIn1            => 1
+        JqbContains1      => 1
+        JqbInside1        => 1
+        JqbKeys           => 0
+        JqbKeysUnsorted   => 0
+        JqbValues         => 0
+        JqbToEntries      => 0
+        JqbFromEntries    => 0
+        JqbWithEntries1   => 1
+        JqbAdd            => 0
+        JqbAny0           => 0
+        JqbAll0           => 0
+        JqbAny1           => 1
+        JqbAll1           => 1
+        JqbFlatten0       => 0
+        JqbFlatten1       => 1
+        JqbSelect1        => 1
+        JqbMap1           => 1
+        JqbMapValues1     => 1
+        JqbPath1          => 1
+        JqbPaths0         => 0
+        JqbPaths1         => 1
+        JqbGetpath1       => 1
+        JqbSort           => 0
+        JqbSortBy1        => 1
+        JqbGroupBy1       => 1
+        JqbUnique         => 0
+        JqbUniqueBy1      => 1
+        JqbReverse        => 0
+        JqbMin            => 0
+        JqbMax            => 0
+        JqbMinBy1         => 1
+        JqbMaxBy1         => 1
+        JqbToString       => 0
+        JqbToNumber       => 0
+        JqbToJson         => 0
+        JqbFromJson       => 0
+        JqbAsciiDowncase  => 0
+        JqbAsciiUpcase    => 0
+        JqbExplode        => 0
+        JqbImplode        => 0
+        JqbSplit1         => 1
+        JqbJoin1          => 1
+        JqbLtrimstr1      => 1
+        JqbRtrimstr1      => 1
+        JqbStartswith1    => 1
+        JqbEndswith1      => 1
+        JqbTest1          => 1
+        JqbFloor          => 0
+        JqbCeil           => 0
+        JqbSqrt           => 0
 
 // jq's own spelling of the pair: `range/2`.
 //
@@ -239,7 +394,7 @@ pub fn arity(b: JqBuiltin) -> Int []
 //     println(jqbuiltin.signature(JqbRange2))
 // ```
 pub fn signature(b: JqBuiltin) -> Str []
-    todo("jsonquery-nv.jqbuiltin.signature")
+    name(b) + "/" + str.from_int(arity(b))
 
 // One line describing what it does, for a completion list or an error.
 //
@@ -250,7 +405,76 @@ pub fn signature(b: JqBuiltin) -> Str []
 //     println(jqbuiltin.summary(JqbKeys))
 // ```
 pub fn summary(b: JqBuiltin) -> Str []
-    todo("jsonquery-nv.jqbuiltin.summary")
+    match b
+        JqbEmpty          => "empty: no outputs at all"
+        JqbError0         => "error: raise the input as an error value"
+        JqbError1         => "error(v): raise v as an error value"
+        JqbNot            => "not: true when the input is false or null"
+        JqbRecurse0       => "recurse: the input and everything under it, depth first"
+        JqbRecurse1       => "recurse(f): the input, then f of it, until f is empty"
+        JqbRange1         => "range(n): 0 to n-1, one output each"
+        JqbRange2         => "range(from; upto): from to upto-1, one output each"
+        JqbRange3         => "range(from; upto; by): from to upto-1 stepping by by"
+        JqbFirst1         => "first(f): the first output of f, and f stops there"
+        JqbLast1          => "last(f): the last output of f"
+        JqbLimit2         => "limit(n; f): at most n outputs of f"
+        JqbUntil2         => "until(cond; update): update until cond is true"
+        JqbWhile2         => "while(cond; update): the input while cond is true"
+        JqbType           => "type: the input's JSON type name"
+        JqbLength         => "length: members, elements, codepoints, or a number's absolute value"
+        JqbUtf8ByteLength => "utf8bytelength: a string's length in bytes"
+        JqbHas1           => "has(k): whether the input has the key or index k"
+        JqbIn1            => "in(o): whether o has the input as a key or index"
+        JqbContains1      => "contains(v): whether the input contains v"
+        JqbInside1        => "inside(v): whether v contains the input"
+        JqbKeys           => "keys: an object's member names sorted, or an array's indices"
+        JqbKeysUnsorted   => "keys_unsorted: the member names in document order"
+        JqbValues         => "values: the input unless it is null"
+        JqbToEntries      => "to_entries: an object as a list of key and value pairs"
+        JqbFromEntries    => "from_entries: a list of key and value pairs as an object"
+        JqbWithEntries1   => "with_entries(f): to_entries, map(f), from_entries"
+        JqbAdd            => "add: the elements of an array added together, left to right"
+        JqbAny0           => "any: whether any element of an array of booleans is true"
+        JqbAll0           => "all: whether every element of an array of booleans is true"
+        JqbAny1           => "any(f): whether f is true for any output"
+        JqbAll1           => "all(f): whether f is true for every output"
+        JqbFlatten0       => "flatten: the nested arrays, all the way down"
+        JqbFlatten1       => "flatten(depth): the nested arrays to depth levels"
+        JqbSelect1        => "select(f): the input when f is truthy, nothing otherwise"
+        JqbMap1           => "map(f): f applied to every element, as an array"
+        JqbMapValues1     => "map_values(f): f applied to every element, keeping keys"
+        JqbPath1          => "path(f): the path f selects, as an array of names and indices"
+        JqbPaths0         => "paths: every path in the input, as arrays"
+        JqbPaths1         => "paths(f): the paths whose value satisfies f"
+        JqbGetpath1       => "getpath(p): the value at a path array, null where there is none"
+        JqbSort           => "sort: the elements in jq's total order"
+        JqbSortBy1        => "sort_by(f): the elements in the order of f's outputs"
+        JqbGroupBy1       => "group_by(f): the elements sorted and split where the key changes"
+        JqbUnique         => "unique: the sorted elements with duplicates removed"
+        JqbUniqueBy1      => "unique_by(f): the elements with duplicate keys removed"
+        JqbReverse        => "reverse: the elements in the opposite order"
+        JqbMin            => "min: the smallest element by jq's total order"
+        JqbMax            => "max: the largest element by jq's total order"
+        JqbMinBy1         => "min_by(f): the element whose f output is smallest"
+        JqbMaxBy1         => "max_by(f): the element whose f output is largest"
+        JqbToString       => "tostring: a string as itself, anything else as its JSON"
+        JqbToNumber       => "tonumber: a number as itself, a numeric string as the number, and any other string refused"
+        JqbToJson         => "tojson: the input as a JSON string"
+        JqbFromJson       => "fromjson: the JSON document inside a string"
+        JqbAsciiDowncase  => "ascii_downcase: the ASCII letters lowered"
+        JqbAsciiUpcase    => "ascii_upcase: the ASCII letters raised"
+        JqbExplode        => "explode: a string as its codepoints"
+        JqbImplode        => "implode: codepoints as a string"
+        JqbSplit1         => "split(sep): a string split on a literal separator"
+        JqbJoin1          => "join(sep): an array of strings joined by a separator"
+        JqbLtrimstr1      => "ltrimstr(s): the input with one leading s removed; a side that is not a string leaves the input as it was"
+        JqbRtrimstr1      => "rtrimstr(s): the input with one trailing s removed; a side that is not a string leaves the input as it was"
+        JqbStartswith1    => "startswith(s): whether the input starts with s"
+        JqbEndswith1      => "endswith(s): whether the input ends with s"
+        JqbTest1          => "test(re): whether the input matches an I-Regexp pattern"
+        JqbFloor          => "floor: the input rounded down"
+        JqbCeil           => "ceil: the input rounded up"
+        JqbSqrt           => "sqrt: the input's square root, `null` for an input below zero"
 
 // The builtin a name and an argument count denote.
 //
@@ -267,7 +491,12 @@ pub fn summary(b: JqBuiltin) -> Str []
 //         Some(b) => println(jqbuiltin.signature(b))
 // ```
 pub fn resolve(name_text: Str, argument_count: Int) -> ?JqBuiltin []
-    todo("jsonquery-nv.jqbuiltin.resolve")
+    var found: ?JqBuiltin = None
+    for b in all()
+        if name(b) == name_text
+            if arity(b) == argument_count
+                found = Some(b)
+    found
 
 // Whether any builtin is called this, at any arity.
 //
@@ -281,7 +510,11 @@ pub fn resolve(name_text: Str, argument_count: Int) -> ?JqBuiltin []
 //     println("${jqbuiltin.is_known_name("range")}")
 // ```
 pub fn is_known_name(name_text: Str) -> Bool []
-    todo("jsonquery-nv.jqbuiltin.is_known_name")
+    var known = false
+    for b in all()
+        if name(b) == name_text
+            known = true
+    known
 
 // The argument counts a name has forms for, ascending.
 //
@@ -295,7 +528,13 @@ pub fn is_known_name(name_text: Str) -> Bool []
 //     println("${jqbuiltin.arities_of("range")}")
 // ```
 pub fn arities_of(name_text: Str) -> [Int] []
-    todo("jsonquery-nv.jqbuiltin.arities_of")
+    var out: [Int] = []
+    for b in all()
+        if name(b) == name_text
+            if not list.contains(out, arity(b))
+                list.push(out, arity(b))
+    out = list.sort(out)
+    out
 
 // Whether argument `index` is a FILTER rather than a value.
 //
@@ -304,7 +543,7 @@ pub fn arities_of(name_text: Str) -> [Int] []
 // element with the element as input; `ltrimstr("a")` evaluates its
 // argument once against the same input and uses the value.  An
 // implementation that guessed would either break `map` or run the `f`
-// in `limit(3; repeat(1))` forever.
+// in `limit(3; recurse(.))` forever.
 //
 // ```novo
 // use jqbuiltin
@@ -313,7 +552,27 @@ pub fn arities_of(name_text: Str) -> [Int] []
 //     println("${jqbuiltin.takes_filter_argument(JqbMap1, 0)}")
 // ```
 pub fn takes_filter_argument(b: JqBuiltin, index: Int) -> Bool []
-    todo("jsonquery-nv.jqbuiltin.takes_filter_argument")
+    match b
+        JqbRecurse1     => index == 0
+        JqbFirst1       => index == 0
+        JqbLast1        => index == 0
+        JqbLimit2       => index == 1
+        JqbUntil2       => index == 0 or index == 1
+        JqbWhile2       => index == 0 or index == 1
+        JqbWithEntries1 => index == 0
+        JqbAny1         => index == 0
+        JqbAll1         => index == 0
+        JqbSelect1      => index == 0
+        JqbMap1         => index == 0
+        JqbMapValues1   => index == 0
+        JqbPath1        => index == 0
+        JqbPaths1       => index == 0
+        JqbSortBy1      => index == 0
+        JqbGroupBy1     => index == 0
+        JqbUniqueBy1    => index == 0
+        JqbMinBy1       => index == 0
+        JqbMaxBy1       => index == 0
+        _               => false
 
 // Whether a builtin can produce more than one output for one input.
 //
@@ -328,7 +587,19 @@ pub fn takes_filter_argument(b: JqBuiltin, index: Int) -> Bool []
 //     println("${jqbuiltin.may_stream(JqbRange1)}")
 // ```
 pub fn may_stream(b: JqBuiltin) -> Bool []
-    todo("jsonquery-nv.jqbuiltin.may_stream")
+    match b
+        JqbEmpty    => true
+        JqbRecurse0 => true
+        JqbRecurse1 => true
+        JqbRange1   => true
+        JqbRange2   => true
+        JqbRange3   => true
+        JqbLimit2   => true
+        JqbWhile2   => true
+        JqbPath1    => true
+        JqbPaths0   => true
+        JqbPaths1   => true
+        _           => false
 
 // The jq builtins this package refuses BY NAME, with a reason each.
 //
@@ -357,7 +628,9 @@ pub fn may_stream(b: JqBuiltin) -> Bool []
 //     println("${list.len(jqbuiltin.absent_named())}")
 // ```
 pub fn absent_named() -> [Str] []
-    todo("jsonquery-nv.jqbuiltin.absent_named")
+    ["match", "capture", "scan", "splits", "sub", "gsub", "test",
+     "env", "\$ENV", "input", "inputs", "input_line_number", "now",
+     "localtime", "strftime", "halt_error", "debug"]
 
 // Why that name is absent, or `None` when it is not a jq builtin at
 // all.
@@ -371,7 +644,25 @@ pub fn absent_named() -> [Str] []
 //         Some(r) => println(r)
 // ```
 pub fn absence_reason(name_text: Str) -> ?Str []
-    todo("jsonquery-nv.jqbuiltin.absence_reason")
+    match name_text
+        "match"             => Some("I-Regexp (RFC 9485) has no capture groups, so a filter that answers match objects cannot be built on it")
+        "capture"           => Some("capture names captured groups, and I-Regexp (RFC 9485) has no capture groups")
+        "scan"              => Some("scan answers every match with its capture groups, and I-Regexp (RFC 9485) has none")
+        "splits"            => Some("splits is the regex form of split, and I-Regexp (RFC 9485) has no capture groups to split on")
+        "sub"               => Some("sub replaces the text a regex matched and needs capture groups, neither of which I-Regexp (RFC 9485) carries")
+        "gsub"              => Some("gsub replaces the text a regex matched and needs capture groups, neither of which I-Regexp (RFC 9485) carries")
+        "test"              => Some("test/1 is here over I-Regexp; test/2 takes jq's flags string, and flags are what RFC 9485 removed")
+        "env"               => Some("env reads the process environment, and this package is core: a host layer could answer it")
+        "\$ENV"             => Some("\$ENV reads the process environment, and this package is core: a host layer could answer it")
+        "input"             => Some("input reads standard input, and this package is core: a host layer could answer it")
+        "inputs"            => Some("inputs reads standard input, and this package is core: a host layer could answer it")
+        "input_line_number" => Some("input_line_number counts standard input's lines, and this package is core: a host layer could answer it")
+        "now"               => Some("now reads the clock, and this package is core: a host layer could answer it")
+        "localtime"         => Some("localtime reads the clock and the local offset, and this package is core: a host layer could answer it")
+        "strftime"          => Some("strftime reads the clock and a time zone, and this package is core: a host layer could answer it")
+        "halt_error"        => Some("halt_error stops the process, and this package is core: a host layer could answer it")
+        "debug"             => Some("debug writes to jq's debug stream, and this package is core: a host layer could answer it")
+        _                   => None
 
 // Whether a name is one a HOST could supply.
 //
@@ -388,4 +679,15 @@ pub fn absence_reason(name_text: Str) -> ?Str []
 //     println("${jqbuiltin.absent_for_layer("env")}")
 // ```
 pub fn absent_for_layer(name_text: Str) -> Bool []
-    todo("jsonquery-nv.jqbuiltin.absent_for_layer")
+    match name_text
+        "env"               => true
+        "\$ENV"             => true
+        "input"             => true
+        "inputs"            => true
+        "input_line_number" => true
+        "now"               => true
+        "localtime"         => true
+        "strftime"          => true
+        "halt_error"        => true
+        "debug"             => true
+        _                   => false

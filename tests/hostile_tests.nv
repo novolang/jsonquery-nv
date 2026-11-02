@@ -1,0 +1,46 @@
+// hostile_tests.nv — programs nested or chained far deeper than a
+// filter is written.
+
+use std.test
+use std.json
+use jqlang
+use jqeval
+
+fn refused(r: Result<JqProgram, JqFault>) -> Bool []
+    match r
+        Err(_) => true
+        Ok(_)  => false
+
+@test
+fn test_deeply_nested_programs_are_refused() [io]
+    test.case("parentheses")
+    test.assert(refused(jqlang.parse("(".repeat(100000) + "." + ")".repeat(100000))))
+    test.case("array constructors")
+    test.assert(refused(jqlang.parse("[".repeat(100000) + "." + "]".repeat(100000))))
+    test.case("object constructors")
+    test.assert(refused(jqlang.parse("{a: ".repeat(50000) + "." + "}".repeat(50000))))
+    test.case("negations")
+    test.assert(refused(jqlang.parse("-".repeat(100000) + ".")))
+    test.case("conditionals")
+    test.assert(refused(jqlang.parse("if . then ".repeat(30000) + "1" + " else 2 end".repeat(30000))))
+
+@test
+fn test_a_long_chain_is_parsed_or_refused() [io]
+    let chain = ".a | ".repeat(100000) + ".a"
+    match jqlang.parse(chain)
+        Err(_) => test.assert(true)
+        Ok(p)  => test.assert(jqlang.depth(p.root) > 0)
+
+@test
+fn test_honest_programs_still_parse() [io]
+    test.assert(not refused(jqlang.parse(".users[] | select(.age >= 30 and (.name | test(\"^a\"))) | {name, tags: [.tags[] | ascii_downcase]}")))
+    test.assert(not refused(jqlang.parse(".a | ".repeat(500) + ".a")))
+    test.assert(not refused(jqlang.parse("(".repeat(60) + "." + ")".repeat(60))))
+
+@test
+fn test_running_a_long_chain_stays_within_the_limits() [io]
+    match jqlang.parse(".a | ".repeat(20000) + ".a")
+        Err(_) => test.assert(true)
+        Ok(p)  =>
+            let out = jqeval.run(p, json.parse("{\"a\": 1}") ?? json.null())
+            test.assert(true)

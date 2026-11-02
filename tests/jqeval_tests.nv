@@ -1,9 +1,6 @@
 // jqeval_tests.nv — the evaluator, and the four places jq's answers
 // are not RFC 9535's.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: jsonquery-nv.jqeval.<fn>`.
-//
 // THE VECTORS ARE `orbit/nq`'s OWN.  nq's `src/eval.nv` carries a
 // hundred assertions about jq's null-versus-error rule, its total order
 // and its fan-out, and every one of them is a rule this package now
@@ -42,19 +39,19 @@ fn test_an_error_does_not_erase_the_output_that_came_before_it() [io]
     test.assert(jqeval.failed(o))
 
     test.case("a run that finishes has no fault")
-    test.assert(jqeval.failed(outcome_of(".", "1")) == false)
+    test.assert(not jqeval.failed(outcome_of(".", "1")))
 
     test.case("a run that matched nothing is not a failure")
     let empty = outcome_of("select(false)", "1")
     test.assert(list.len(empty.values) == 0)
-    test.assert(jqeval.failed(empty) == false)
+    test.assert(not jqeval.failed(empty))
 
 @test
 fn test_an_error_is_a_value_and_catch_binds_it() [io]
     test.case("`error` raises whatever it was given, object and all")
     let o = outcome_of("try error({code: 4}) catch .code", "null")
     test.assert(list.len(o.values) == 1)
-    test.assert(jqeval.failed(o) == false)
+    test.assert(not jqeval.failed(o))
     test.assert(jqeval.equal(o.values[0], value_of("4")))
 
     test.case("a raised error carries the value, not a rendering of it")
@@ -69,10 +66,10 @@ fn test_an_error_is_a_value_and_catch_binds_it() [io]
     test.case("`f?` swallows the error and produces nothing")
     let swallowed = outcome_of("(1 | .a)?", "null")
     test.assert(list.len(swallowed.values) == 0)
-    test.assert(jqeval.failed(swallowed) == false)
+    test.assert(not jqeval.failed(swallowed))
 
     test.case("a budget is not catchable — a program may not decide to ignore one")
-    test.assert(jqerror.is_catchable(JqOverBudget) == false)
+    test.assert(not jqerror.is_catchable(JqOverBudget))
     test.assert(jqerror.is_catchable(JqCannotIndex))
 
 @test
@@ -80,7 +77,7 @@ fn test_the_alternative_operator_swallows_a_failure_on_its_left() [io]
     test.case("`.a.b // \"none\"` answers the right side when the left errors")
     let o = outcome_of(".a.b // \"none\"", "{\"a\": 3}")
     test.assert(list.len(o.values) == 1)
-    test.assert(jqeval.failed(o) == false)
+    test.assert(not jqeval.failed(o))
 
     test.case("and when the left is null")
     test.assert(list.len(outcome_of(".a // 7", "{}").values) == 1)
@@ -205,10 +202,10 @@ fn test_only_null_and_false_are_falsy() [io]
     test.assert(jqeval.truthy(value_of("[]")))
 
     test.case("null is not")
-    test.assert(jqeval.truthy(jqeval.null_value()) == false)
+    test.assert(not jqeval.truthy(jqeval.null_value()))
 
     test.case("false is not")
-    test.assert(jqeval.truthy(value_of("false")) == false)
+    test.assert(not jqeval.truthy(value_of("false")))
 
 @test
 fn test_the_total_order_is_over_every_pair_of_values() [io]
@@ -273,9 +270,9 @@ fn test_a_stream_of_documents_is_one_outcome_each() [io]
             let docs = [value_of("{\"a\":1}"), value_of("3"), value_of("{\"a\":2}")]
             let outs = jqeval.run_stream(p, docs, jqeval.empty_env())
             test.assert(list.len(outs) == 3)
-            test.assert(jqeval.failed(outs[0]) == false)
+            test.assert(not jqeval.failed(outs[0]))
             test.assert(jqeval.failed(outs[1]))
-            test.assert(jqeval.failed(outs[2]) == false)
+            test.assert(not jqeval.failed(outs[2]))
 
 @test
 fn test_a_budget_stops_a_program_that_does_not() [io]
@@ -320,8 +317,8 @@ fn test_one_filter_can_be_applied_on_its_own() [io]
     test.assert(jqeval.equal(o.values[0], value_of("3")))
 
     test.case("a budget the caller chose travels in the environment")
-    let env = jqeval.env_with(jqeval.default_limits())
-    test.assert(env.limits.max_steps == jqeval.default_limits().max_steps)
+    let scope = jqeval.env_with(jqeval.default_limits())
+    test.assert(scope.limits.max_steps == jqeval.default_limits().max_steps)
 
 @test
 fn test_a_binding_is_looked_up_by_name() [io]
@@ -331,13 +328,13 @@ fn test_a_binding_is_looked_up_by_name() [io]
         Some(_) => test.assert(false)
 
     test.case("a bound name comes back")
-    let env = jqeval.bind(jqeval.empty_env(), "n", value_of("3"))
-    match jqeval.lookup(env, "n")
+    let scope = jqeval.bind(jqeval.empty_env(), "n", value_of("3"))
+    match jqeval.lookup(scope, "n")
         None    => test.assert(false)
         Some(v) => test.assert(jqeval.equal(v, value_of("3")))
 
     test.case("a later binding shadows an earlier one")
-    let shadowed = jqeval.bind(env, "n", value_of("4"))
+    let shadowed = jqeval.bind(scope, "n", value_of("4"))
     match jqeval.lookup(shadowed, "n")
         None    => test.assert(false)
         Some(v) => test.assert(jqeval.equal(v, value_of("4")))

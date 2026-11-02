@@ -1,9 +1,6 @@
 // jqfmt_tests.nv — the CSV typing rule, the column arithmetic and the
 // three renderings.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: jsonquery-nv.jqfmt.<fn>`.
-//
 // THE TYPING TABLE IS `orbit/nq`'s README, ASSERTED.  Its "Types read
 // out of CSV" section is a table of eight rows and every one of them is
 // a case below, because the round-trip condition is the kind of rule
@@ -52,7 +49,7 @@ fn test_a_cell_gets_the_narrowest_type_that_renders_back_as_itself() [io]
 @test
 fn test_the_round_trip_condition_is_the_rule_itself() [io]
     test.case("417 does not render back as 00417")
-    test.assert(jqfmt.round_trips("00417", value_of("417")) == false)
+    test.assert(not jqfmt.round_trips("00417", value_of("417")))
 
     test.case("120 does render back as 120")
     test.assert(jqfmt.round_trips("120", value_of("120")))

@@ -9,11 +9,6 @@ typed value, and that value is run over the JSON value the standard library's
 [jsonpath-nv](https://novo-lang.org/packages/jsonpath-nv)'s, so a jq path and a
 JSONPath query are the same walk over the same document.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
-its full signature, but every body is a `todo()` that panics when called. The
-package is published so its design can be reviewed and depended on before it is
-implemented. Version 0.1.0 will be the first working release.
-
 ## What it is
 
 A **filter** takes one JSON value and produces a **stream** of zero or more JSON
@@ -82,8 +77,7 @@ fn main() [io]
                     println("${jqeval.exit_code(out, false)}")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test` fails on
-purpose: every test reaches a `not implemented` panic.
+Build and test with `novo pkg build` and `novo test`.
 
 ## What the package contains
 
@@ -175,7 +169,9 @@ not a table, and `jqfmt.table_problem` says why.
 15. **A run is bounded.** `JqLimits` caps the outputs produced, the filter
     applications made, and the depth recursed. A refusal for exceeding a limit is not
     catchable by `try`. `jqeval.default_limits` is the set a caller gets when it
-    does not choose one.
+    does not choose one. `limit` and `first` collect their filter argument, so one
+    that crosses a cap answers its value *and* reports `over-budget`, where jq
+    stops the argument and reports nothing; the CHANGELOG records it under Known.
 16. **A CSV cell gets the narrowest type whose rendering is byte-identical to
     the cell's own text.** `120` is the number 120. `00417` is a string, because
     `417` does not render back as `00417`. `1.50` is a string for the same
@@ -197,6 +193,12 @@ not a table, and `jqfmt.table_problem` says why.
   `debug`.** Nothing in this package opens a file, reads the environment or
   consults a clock. `jqbuiltin.absent_for_layer` says which absences a package
   with those permissions could close and which no package can.
+- **jq's library-defined helpers: `repeat`, `walk`, `children`, `isempty`,
+  `del`, the type filters (`numbers`, `strings`, `values`, `nulls`,
+  `booleans`, `arrays`, `objects`, `iterables`, `scalars`) and the rest of
+  the family jq writes in jq.** They are not in the table, so they answer
+  an unknown function. `jqbuiltin.absent_named` publishes the names that
+  carry a written reason; a name outside that list has none.
 - **`@base64` and the other `@` formats, and the SQL-style operators.**
 - **A command line.** This package has no argv, no file reading, no standard
   input and no output. It answers text and values.
@@ -225,11 +227,10 @@ novo test tests/jqbuiltin_tests.nv         # the builtin table, as data
 novo test tests/jqeval_tests.nv            # the evaluator and the four divergences
 novo test tests/jqerror_tests.nv           # what each error type can say
 novo test tests/jqfmt_tests.nv             # the CSV typing rule and the renderings
+novo test tests/jqquery_edge_tests.nv      # the readings chosen where the prose is silent
+novo test tests/jqcover_tests.nv           # every arm of every dispatch, reached with a carrying input
+novo test tests/jqarms_tests.nv            # the arms no program can reach, and the ceilings
 ```
-
-`novo test` fails on purpose today. Every assertion reaches a `not implemented:
-jsonquery-nv.<module>.<fn>` panic, because every body is a `todo()`. The tests
-are the specification the implementation will have to satisfy.
 
 The reference is jq 1.7. Its manual is the specification for the grammar, the
 builtin table and the rule that separates `null` from an error, and its own test
@@ -241,33 +242,6 @@ name and arity, that a missing field is `null` and indexing a number is an
 error, that an error arriving after output keeps the output, that `try`/`catch`
 binds an error value, that `//` swallows a failure on its left, and that a CSV
 cell takes the narrowest type that renders back as itself.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `jqlang.JqProgram`, `.JqFilter`, `.JqCallee`, `.JqLiteral`, `.JqBinOp`, `.JqField`, `.JqPattern`, `.JqPatternEntry`, `.JqStrPart` | declared |
-| `jqlang.parse`, `.parse_with`, `.program`, `.field` | no |
-| `jqlang.render`, `.render_filter`, `.position` | no |
-| `jqlang.free_variables`, `.defined_names`, `.called_builtins`, `.is_path_expression`, `.depth`, `.path_fault` | no |
-| `jqbuiltin.JqBuiltin`, the 69 name-and-arity entries | declared |
-| `jqbuiltin.all`, `.name`, `.arity`, `.signature`, `.summary` | no |
-| `jqbuiltin.resolve`, `.is_known_name`, `.arities_of` | no |
-| `jqbuiltin.takes_filter_argument`, `.may_stream` | no |
-| `jqbuiltin.absent_named`, `.absence_reason`, `.absent_for_layer` | no |
-| `jqeval.JqOutcome`, `.JqLimits`, `.JqBinding`, `.JqEnv`, `.JqKind` | declared |
-| `jqeval.default_limits`, `.empty_env`, `.env_with`, `.bind`, `.lookup` | no |
-| `jqeval.run`, `.run_with`, `.run_stream`, `.apply` | no |
-| `jqeval.select_path`, `.select_path_rfc` | no |
-| `jqeval.produced`, `.raised`, `.failed`, `.exit_code` | no |
-| `jqeval.kind`, `.type_name`, `.truthy`, `.order`, `.equal`, `.null_value` | no |
-| `jqerror.JqFaultKind`, `.JqFault`, `.JqErrorKind`, `.JqError` | declared |
-| `jqerror.fault`, `.fault_kind_name`, `.fault_message` | no |
-| `jqerror.error`, `.error_kind_name`, `.error_message`, `.error_value`, `.is_catchable` | no |
-| `jqfmt.JqShape` | declared |
-| `jqfmt.cell_value`, `.round_trips`, `.csv_to_json` | no |
-| `jqfmt.shape`, `.columns`, `.cell_text`, `.grid`, `.table_problem`, `.tabular`, `.csv_out` | no |
-| `jqfmt.compact`, `.pretty`, `.raw` | no |
 
 ## Licence
 

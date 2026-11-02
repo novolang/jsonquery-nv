@@ -1,8 +1,6 @@
 // jqerror.nv — the two things that can go wrong, and why they are two
 // types rather than one.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A PARSE FAULT AND A RUNTIME ERROR ARE NOT THE SAME KIND OF THING, and
 // a port that spells both as a string loses the difference that makes
 // `try`/`catch` work.
@@ -35,7 +33,8 @@ use std.json
 // value of a positioned fault is that the message names the mistake
 // rather than the token the scanner happened to be looking at.
 pub enum JqFaultKind
-    // A byte that cannot start anything at this point in the grammar.
+    // A byte that cannot start anything at this point in the grammar,
+    // including one that opens a construct nested more than 128 deep.
     JqUnexpectedByte
     // A string literal that runs to the end of the program.
     JqUnterminatedString
@@ -91,10 +90,12 @@ pub struct JqFault
     at: Int
     to: Int
     // The name a `JqUnknownFunction`, `JqWrongArity`,
-    // `JqRefusedFunction` or `JqUnboundVariable` was about, and the
-    // empty string for every other kind.  Carried rather than re-cut
-    // from the source, because `at`/`to` for a wrong arity span the
-    // whole call and the name is the part a message wants.
+    // `JqRefusedFunction` or `JqUnboundVariable` was about; the
+    // RFC 9535 path text a `JqBadPath` was refused for, which
+    // `jqlang.path_fault` hands back to the delegate; and the empty
+    // string for every other kind.  Carried rather than re-cut from
+    // the source, because `at`/`to` for a wrong arity span the whole
+    // call and the name is the part a message wants.
     subject: Str
 
 // `JqFault` is an `Error`, which is what lets `Result<T, JqFault>`
@@ -106,10 +107,8 @@ pub struct JqFault
 impl Error for JqFault
     // The one-line message: `jqerror.fault_message`'s sentence, the
     // kind's name and, where there is one, the subject.
-    //
-    // Panics with `not implemented` until the bodies land.
     fn message(self) -> Str
-        todo("jsonquery-nv.JqFault.message")
+        fault_message(self)
 
 // Build a fault.
 //
@@ -121,10 +120,14 @@ impl Error for JqFault
 //     println("${f.at}")
 // ```
 pub fn fault(kind: JqFaultKind, at: Int, to: Int, subject: Str) -> JqFault []
-    todo("jsonquery-nv.jqerror.fault")
+    JqFault { kind: kind, at: at, to: to, subject: subject }
 
 // The kind's own name, for a caller that wants to branch on text or
 // print a machine-readable code.
+//
+// Lower case with hyphens, like every other name this package
+// publishes, and fixed for the life of the release: a program may
+// quote one.
 //
 // ```novo
 // use jqerror
@@ -133,7 +136,22 @@ pub fn fault(kind: JqFaultKind, at: Int, to: Int, subject: Str) -> JqFault []
 //     println(jqerror.fault_kind_name(JqWrongArity))
 // ```
 pub fn fault_kind_name(kind: JqFaultKind) -> Str []
-    todo("jsonquery-nv.jqerror.fault_kind_name")
+    match kind
+        JqUnexpectedByte     => "unexpected-byte"
+        JqUnterminatedString => "unterminated-string"
+        JqBadEscape          => "bad-escape"
+        JqBadInterpolation   => "bad-interpolation"
+        JqBadNumber          => "bad-number"
+        JqUnclosedBracket    => "unclosed-bracket"
+        JqDanglingOperator   => "dangling-operator"
+        JqUnknownFunction    => "unknown-function"
+        JqWrongArity         => "wrong-arity"
+        JqRefusedFunction    => "refused-function"
+        JqUnboundVariable    => "unbound-variable"
+        JqBadPath            => "bad-path"
+        JqBadPattern         => "bad-pattern"
+        JqBadObjectKey       => "bad-object-key"
+        JqTrailingInput      => "trailing-input"
 
 // One line of English naming the mistake and, where there is one, the
 // subject.
@@ -145,7 +163,10 @@ pub fn fault_kind_name(kind: JqFaultKind) -> Str []
 //     println(jqerror.fault_message(jqerror.fault(JqUnknownFunction, 5, 10, "floor")))
 // ```
 pub fn fault_message(f: JqFault) -> Str []
-    todo("jsonquery-nv.jqerror.fault_message")
+    let where_text = " at bytes ${f.at} to ${f.to} of the program"
+    if f.subject == ""
+        return fault_kind_name(f.kind) + where_text
+    fault_kind_name(f.kind) + " '" + f.subject + "'" + where_text
 
 // Why a filter failed while running.
 //
@@ -205,7 +226,7 @@ pub struct JqError
 //         Some(v) => println("${jqerror.error(JqCannotIndex, v, 7).at}")
 // ```
 pub fn error(kind: JqErrorKind, value: JsonValueH, at: Int) -> JqError []
-    todo("jsonquery-nv.jqerror.error")
+    JqError { kind: kind, value: value, at: at }
 
 // The kind's own name.
 //
@@ -216,7 +237,14 @@ pub fn error(kind: JqErrorKind, value: JsonValueH, at: Int) -> JqError []
 //     println(jqerror.error_kind_name(JqCannotIterate))
 // ```
 pub fn error_kind_name(kind: JqErrorKind) -> Str []
-    todo("jsonquery-nv.jqerror.error_kind_name")
+    match kind
+        JqCannotIndex   => "cannot-index"
+        JqCannotIterate => "cannot-iterate"
+        JqTypeMismatch  => "type-mismatch"
+        JqDivideByZero  => "divide-by-zero"
+        JqBadArgument   => "bad-argument"
+        JqUserRaised    => "user-raised"
+        JqOverBudget    => "over-budget"
 
 // The error rendered as one line, the way jq prints it.
 //
@@ -234,7 +262,7 @@ pub fn error_kind_name(kind: JqErrorKind) -> Str []
 //         Some(v) => println(jqerror.error_message(jqerror.error(JqUserRaised, v, 0)))
 // ```
 pub fn error_message(e: JqError) -> Str []
-    todo("jsonquery-nv.jqerror.error_message")
+    json.to_str(e.value) ?? json.stringify(e.value)
 
 // What `catch` binds.
 //
@@ -251,7 +279,7 @@ pub fn error_message(e: JqError) -> Str []
 //         Some(v) => println(json.stringify(jqerror.error_value(jqerror.error(JqUserRaised, v, 0))))
 // ```
 pub fn error_value(e: JqError) -> JsonValueH []
-    todo("jsonquery-nv.jqerror.error_value")
+    e.value
 
 // Whether `try`/`catch` may catch this error.
 //
@@ -266,4 +294,4 @@ pub fn error_value(e: JqError) -> JsonValueH []
 //     println("${jqerror.is_catchable(JqOverBudget)}")
 // ```
 pub fn is_catchable(kind: JqErrorKind) -> Bool []
-    todo("jsonquery-nv.jqerror.is_catchable")
+    kind != JqOverBudget

@@ -1,8 +1,6 @@
 // jqlang.nv — a jq program as a typed value, and the parse that
 // produces one.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE WHOLE GRAMMAR IS IN ONE MODULE because jq's grammar is mutually
 // recursive at every level: a filter holds filters, an object's key is
 // a filter, a string's interpolation is a filter, and a `reduce`'s
@@ -36,8 +34,11 @@
 // `getpath(p)` are here, so the reading half of paths is complete and
 // the writing half is a named later step rather than a silence.
 
+use std.list
+use std.str
 use jperror
 use jpquery
+use jpquery.{ JpQuery }
 use jqbuiltin
 use jqerror
 
@@ -66,10 +67,13 @@ pub struct JqProgram
 pub enum JqFilter
     // `.` — the input, unchanged.
     JqFIdentity(at: Int)
-    // `.a.b[0]`, `.[]`, `.users[?@.age > 30]`, `..` — a path, held as
-    // the JSONPath query it is.  jq's spellings that RFC 9535 has no
+    // `.a.b[0]`, `.[]`, `.users[?@.age > 30]` — a path, held as the
+    // JSONPath query it is.  jq's spellings that RFC 9535 has no
     // syntax for are rewritten at parse time: `.[]` is `[*]`, and a
-    // bare `.name` is `['name']`.
+    // bare `.name` is `['name']`.  A bare `..` is NOT one of these:
+    // jq's recursive descent yields the input itself and RFC 9535's
+    // descendant segment does not, so `..` parses as the `recurse`
+    // builtin, which is what jq defines it to be.
     JqFPath(at: Int, query: jpquery.JpQuery)
     // `f | g` — every output of `f` fed to `g` in turn.
     JqFPipe(at: Int, left: JqFilter, right: JqFilter)
@@ -228,7 +232,7 @@ pub enum JqStrPart
 //         Ok(p)  => println(jqlang.render(p))
 // ```
 pub fn parse(source: Str) -> Result<JqProgram, jqerror.JqFault> []
-    todo("jsonquery-nv.jqlang.parse")
+    parse_with(source, [])
 
 // Parse with a set of variable names treated as supplied.
 //
@@ -245,7 +249,16 @@ pub fn parse(source: Str) -> Result<JqProgram, jqerror.JqFault> []
 //         Ok(p)  => println(jqlang.render(p))
 // ```
 pub fn parse_with(source: Str, supplied: [Str]) -> Result<JqProgram, jqerror.JqFault> []
-    todo("jsonquery-nv.jqlang.parse_with")
+    var s = Scan { text: source, supplied: supplied, i: 0, fault: None,
+                   bound: [], defs: [], dollars: [], depth: 0 }
+    skip_space(var s)
+    let root = parse_exp(var s)
+    if faulted(s)
+        return Err(error_fault(s))
+    skip_space(var s)
+    if here(s) >= 0
+        return Err(jqerror.fault(JqTrailingInput, s.i, str.len(source), ""))
+    Ok(JqProgram { source: source, root: root })
 
 // Build a program from a filter and the text it came from.
 //
@@ -258,7 +271,7 @@ pub fn parse_with(source: Str, supplied: [Str]) -> Result<JqProgram, jqerror.JqF
 //     println(jqlang.program(".", JqFIdentity(0)).source)
 // ```
 pub fn program(source: Str, root: JqFilter) -> JqProgram []
-    todo("jsonquery-nv.jqlang.program")
+    JqProgram { source: source, root: root }
 
 // Build one field of an object construction.
 //
@@ -270,7 +283,7 @@ pub fn program(source: Str, root: JqFilter) -> JqProgram []
 //     println(jqlang.render_filter(f.value))
 // ```
 pub fn field(key: JqFilter, value: JqFilter) -> JqField []
-    todo("jsonquery-nv.jqlang.field")
+    JqField { key: key, value: value }
 
 // The program rendered back as jq text, in one canonical spelling.
 //
@@ -287,7 +300,7 @@ pub fn field(key: JqFilter, value: JqFilter) -> JqField []
 //         Ok(p)  => println(jqlang.render(p))
 // ```
 pub fn render(p: JqProgram) -> Str []
-    todo("jsonquery-nv.jqlang.render")
+    render_filter(p.root)
 
 // One filter rendered as jq text.
 //
@@ -298,7 +311,7 @@ pub fn render(p: JqProgram) -> Str []
 //     println(jqlang.render_filter(JqFIdentity(0)))
 // ```
 pub fn render_filter(f: JqFilter) -> Str []
-    todo("jsonquery-nv.jqlang.render_filter")
+    render_prec(f, 0)
 
 // Where a filter starts, as a byte offset into the program's source.
 //
@@ -312,7 +325,25 @@ pub fn render_filter(f: JqFilter) -> Str []
 //     println("${jqlang.position(JqFIdentity(7))}")
 // ```
 pub fn position(f: JqFilter) -> Int []
-    todo("jsonquery-nv.jqlang.position")
+    match f
+        JqFIdentity(at)               => at
+        JqFPath(at, _)                => at
+        JqFPipe(at, _, _)             => at
+        JqFComma(at, _, _)            => at
+        JqFLiteral(at, _)             => at
+        JqFArray(at, _)               => at
+        JqFObject(at, _)              => at
+        JqFBinary(at, _, _, _)        => at
+        JqFNegate(at, _)              => at
+        JqFIf(at, _, _, _)            => at
+        JqFTry(at, _, _)              => at
+        JqFReduce(at, _, _, _, _)     => at
+        JqFForeach(at, _, _, _, _, _) => at
+        JqFBind(at, _, _, _)          => at
+        JqFVariable(at, _)            => at
+        JqFCall(at, _, _)             => at
+        JqFDefine(at, _, _, _, _)     => at
+        JqFInterpolate(at, _)         => at
 
 // The `$names` a program reads and nothing in it binds.
 //
@@ -329,7 +360,9 @@ pub fn position(f: JqFilter) -> Int []
 //         Ok(p)  => println("${jqlang.free_variables(p)}")
 // ```
 pub fn free_variables(p: JqProgram) -> [Str] []
-    todo("jsonquery-nv.jqlang.free_variables")
+    var out: [Str] = []
+    walk_vars(p.root, [], var out)
+    out
 
 // The names a program's `def`s declare, in the order they are written.
 //
@@ -342,7 +375,9 @@ pub fn free_variables(p: JqProgram) -> [Str] []
 //         Ok(p)  => println("${jqlang.defined_names(p)}")
 // ```
 pub fn defined_names(p: JqProgram) -> [Str] []
-    todo("jsonquery-nv.jqlang.defined_names")
+    var out: [Str] = []
+    walk_defs(p.root, var out)
+    out
 
 // The builtins a program calls, without repeats.
 //
@@ -359,7 +394,9 @@ pub fn defined_names(p: JqProgram) -> [Str] []
 //         Ok(p)  => println("${list.len(jqlang.called_builtins(p))}")
 // ```
 pub fn called_builtins(p: JqProgram) -> [jqbuiltin.JqBuiltin] []
-    todo("jsonquery-nv.jqlang.called_builtins")
+    var out: [jqbuiltin.JqBuiltin] = []
+    walk_builtins(p.root, var out)
+    out
 
 // Whether a filter is a PATH EXPRESSION — one that names places in the
 // input rather than computing new values.
@@ -380,7 +417,20 @@ pub fn called_builtins(p: JqProgram) -> [jqbuiltin.JqBuiltin] []
 //         Ok(p)  => println("${jqlang.is_path_expression(p.root)}")
 // ```
 pub fn is_path_expression(f: JqFilter) -> Bool []
-    todo("jsonquery-nv.jqlang.is_path_expression")
+    match f
+        JqFIdentity(_)                      => true
+        JqFPath(_, _)                       => true
+        JqFPipe(_, a, b)                    => is_path_expression(a) and is_path_expression(b)
+        JqFComma(_, a, b)                   => is_path_expression(a) and is_path_expression(b)
+        JqFIf(_, _, t, e)                   => is_path_expression(t) and is_path_expression(e)
+        JqFTry(_, b, h)                     => is_path_expression(b) and is_empty_call(h)
+        JqFBinary(_, JqOpAlternative, a, b) =>
+            is_path_expression(a) and is_path_expression(b)
+        JqFCall(_, callee, args)            =>
+            match callee
+                JqCBuiltin(b) => builtin_is_path(b, args)
+                JqCDefined(_) => false
+        _                                   => false
 
 // How deeply a filter nests.
 //
@@ -396,7 +446,25 @@ pub fn is_path_expression(f: JqFilter) -> Bool []
 //         Ok(p)  => println("${jqlang.depth(p.root)}")
 // ```
 pub fn depth(f: JqFilter) -> Int []
-    todo("jsonquery-nv.jqlang.depth")
+    match f
+        JqFIdentity(_)               => 1
+        JqFLiteral(_, _)             => 1
+        JqFVariable(_, _)            => 1
+        JqFPath(_, q)                => 1 + list.len(q.segments)
+        JqFNegate(_, b)              => 1 + depth(b)
+        JqFArray(_, b)               => 1 + depth(b)
+        JqFPipe(_, a, b)             => 1 + max_of([depth(a), depth(b)])
+        JqFComma(_, a, b)            => 1 + max_of([depth(a), depth(b)])
+        JqFBinary(_, _, a, b)        => 1 + max_of([depth(a), depth(b)])
+        JqFIf(_, c, t, e)            => 1 + max_of([depth(c), depth(t), depth(e)])
+        JqFTry(_, b, h)              => 1 + max_of([depth(b), depth(h)])
+        JqFReduce(_, s, _, i, u)     => 1 + max_of([depth(s), depth(i), depth(u)])
+        JqFForeach(_, s, _, i, u, x) => 1 + max_of([depth(s), depth(i), depth(u), depth(x)])
+        JqFBind(_, s, _, b)          => 1 + max_of([depth(s), depth(b)])
+        JqFObject(_, fields)         => 1 + fields_depth(fields)
+        JqFCall(_, _, args)          => 1 + args_depth(args)
+        JqFDefine(_, _, _, b, rest)  => 1 + max_of([depth(b), depth(rest)])
+        JqFInterpolate(_, parts)     => 1 + parts_depth(parts)
 
 // The JSONPath fault behind a `JqBadPath`, when there is one.
 //
@@ -417,4 +485,1843 @@ pub fn depth(f: JqFilter) -> Int []
 //         Ok(_)  => println("parsed")
 // ```
 pub fn path_fault(f: jqerror.JqFault) -> ?jperror.JpFault []
-    todo("jsonquery-nv.jqlang.path_fault")
+    if f.kind != JqBadPath
+        return None
+    match jpquery.parse(f.subject)
+        Err(g) => Some(g)
+        Ok(_)  => None
+
+// ── The scan ─────────────────────────────────────────────────────────
+
+// One `def` in scope: its name and how many arguments it takes.  A
+// definition's parameters are pushed as entries of arity 0, so a body
+// that calls one resolves to the same `JqCDefined` a plain name does.
+struct JqDefSig
+    name: Str
+    arity: Int
+
+// The scanner's whole state.  `i` and the three scope lists are
+// written by the parser, so this struct is passed as `var s`.
+struct Scan
+    text: Str
+    supplied: [Str]
+    var i: Int
+    var fault: ?jqerror.JqFault
+    var bound: [Str]
+    var defs: [JqDefSig]
+    var dollars: [Str]
+    // How many expressions, operands and terms are open at the cursor.
+    var depth: Int
+
+// The most expressions, operands and terms open at once.
+const MAX_NESTING = 128
+
+// Whether one more level is allowed; at the limit a fault is recorded
+// and the caller returns a placeholder without recursing.
+fn enter(var s: Scan) -> Bool
+    if s.depth >= MAX_NESTING
+        fault_at(var s, JqUnexpectedByte, s.i, s.i + 1, "")
+        return false
+    s.depth = s.depth + 1
+    true
+
+// Record a fault, keeping the first one: the parser carries on with a
+// placeholder tree so that one mistake is one message.
+fn fault_at(var s: Scan, kind: jqerror.JqFaultKind, at: Int, to: Int, subject: Str)
+    if s.fault == None
+        s.fault = Some(jqerror.fault(kind, at, to, subject))
+
+fn faulted(s: Scan) -> Bool
+    s.fault != None
+
+// The first fault, for a caller that has already checked `faulted`.
+fn error_fault(s: Scan) -> jqerror.JqFault
+    s.fault ?? jqerror.fault(JqUnexpectedByte, 0, 0, "")
+
+// The byte at the cursor plus `k`, or -1 past either end.
+fn byte(s: Scan, k: Int) -> Int
+    str.byte_at(s.text, s.i + k) ?? -1
+
+// The byte at the cursor, or -1 at the end of the program.
+fn here(s: Scan) -> Int
+    byte(s, 0)
+
+fn is_digit(c: Int) -> Bool
+    c >= '0' and c <= '9'
+
+fn is_word_first(c: Int) -> Bool
+    c >= 'A' and c <= 'Z' or c >= 'a' and c <= 'z' or c == '_'
+
+fn is_word_byte(c: Int) -> Bool
+    is_word_first(c) or is_digit(c)
+
+// Whitespace, and jq's `#` comment, which runs to the end of the line.
+fn skip_space(var s: Scan)
+    var done = false
+    while not done
+        let c = here(s)
+        if c == ' ' or c == '\t' or c == '\n' or c == '\r'
+            s.i = s.i + 1
+        elif c == '#'
+            while here(s) >= 0 and here(s) != 10
+                s.i = s.i + 1
+        else
+            done = true
+
+// An identifier, consuming it.  The empty string when there is none.
+fn take_word(var s: Scan) -> Str
+    if not is_word_first(here(s))
+        return ""
+    var k = s.i
+    let n = str.len(s.text)
+    while k < n and is_word_byte(str.byte_at(s.text, k) ?? 0)
+        k = k + 1
+    let out = str.slice(s.text, s.i, k)
+    s.i = k
+    out
+
+// The identifier at the cursor, without consuming it.
+fn peek_word(s: Scan) -> Str
+    if not is_word_first(here(s))
+        return ""
+    var k = s.i
+    let n = str.len(s.text)
+    while k < n and is_word_byte(str.byte_at(s.text, k) ?? 0)
+        k = k + 1
+    str.slice(s.text, s.i, k)
+
+// Consume a whole word when it is the one wanted.  The word boundary
+// matters: `and` must not match the `and` of `andy`.
+fn match_word(var s: Scan, word: Str) -> Bool
+    if peek_word(s) != word
+        return false
+    s.i = s.i + str.len(word)
+    true
+
+// Whether anything can start an expression at the cursor.  What
+// separates "a dangling `|`" from "the next term is nonsense".
+fn can_start(s: Scan) -> Bool
+    let c = here(s)
+    if c < 0
+        return false
+    if c == ')' or c == ']' or c == '}' or c == ';' or c == ',' or c == '|' or c == '?' or c == '='
+        return false
+    let w = peek_word(s)
+    if w == "then" or w == "else" or w == "elif" or w == "end" or w == "catch" or w == "as"
+        return false
+    true
+
+// ── Literals ─────────────────────────────────────────────────────────
+
+// A number: digits, an optional fraction and an optional exponent.
+// The fraction and the exponent are only consumed when they are
+// complete, so `1.` is `1` followed by a path step and `1e` is a
+// `JqBadNumber`.
+fn parse_number(var s: Scan, at: Int) -> JqFilter
+    var k = s.i
+    let n = str.len(s.text)
+    while k < n and is_digit(str.byte_at(s.text, k) ?? 0)
+        k = k + 1
+    if k + 1 < n and (str.byte_at(s.text, k) ?? 0) == 46 and is_digit(str.byte_at(s.text, k + 1) ?? 0)
+        k = k + 1
+        while k < n and is_digit(str.byte_at(s.text, k) ?? 0)
+            k = k + 1
+    if k < n and ((str.byte_at(s.text, k) ?? 0) == 101 or (str.byte_at(s.text, k) ?? 0) == 69)
+        var j = k + 1
+        let sign = str.byte_at(s.text, j) ?? -1
+        if sign == '+' or sign == '-'
+            j = j + 1
+        if j < n and is_digit(str.byte_at(s.text, j) ?? -1)
+            k = j
+            while k < n and is_digit(str.byte_at(s.text, k) ?? 0)
+                k = k + 1
+        else
+            fault_at(var s, JqBadNumber, at, j + 1, "")
+            return JqFIdentity(at)
+    let text = str.slice(s.text, s.i, k)
+    s.i = k
+    match str.to_float(text)
+        None    =>
+            fault_at(var s, JqBadNumber, at, k, "")
+            JqFIdentity(at)
+        Some(f) => JqFLiteral(at, JqLNumber(f))
+
+// One hex digit, -1 when the byte is not one.
+fn hex_value(c: Int) -> Int
+    if c >= '0' and c <= '9'
+        return c - 48
+    if c >= 'a' and c <= 'f'
+        return c - 87
+    if c >= 'A' and c <= 'F'
+        return c - 55
+    0 - 1
+
+// Four hex digits at `k`, or -1.
+fn hex4(s: Scan, k: Int) -> Int
+    var v = 0
+    var j = 0
+    while j < 4
+        let d = hex_value(str.byte_at(s.text, k + j) ?? -1)
+        if d < 0
+            return 0 - 1
+        v = v * 16 + d
+        j = j + 1
+    v
+
+// The character one escape stands for, consuming it.  `None` when the
+// escape is not one jq has.
+fn decode_escape(var s: Scan) -> ?Str
+    let bs = s.i
+    let c = byte(s, 1)
+    if c == 'n'
+        s.i = s.i + 2
+        return Some("\n")
+    if c == 't'
+        s.i = s.i + 2
+        return Some("\t")
+    if c == 'r'
+        s.i = s.i + 2
+        return Some("\r")
+    if c == 'b'
+        s.i = s.i + 2
+        return Some(str.from_char(8))
+    if c == 'f'
+        s.i = s.i + 2
+        return Some(str.from_char(12))
+    if c == '\\'
+        s.i = s.i + 2
+        return Some("\\")
+    if c == '"'
+        s.i = s.i + 2
+        return Some("\"")
+    if c == '/'
+        s.i = s.i + 2
+        return Some("/")
+    if c == 'u'
+        let cp = hex4(s, s.i + 2)
+        if cp < 0
+            fault_at(var s, JqBadEscape, bs, bs + 2, "")
+            return None
+        if cp >= 55296 and cp <= 56319
+            // A high surrogate: only a following low one is a character.
+            if byte(s, 6) == 92 and byte(s, 7) == 117
+                let lo = hex4(s, s.i + 8)
+                if lo >= 56320 and lo <= 57343
+                    s.i = s.i + 12
+                    return Some(str.from_char(65536 + (cp - 55296) * 1024 + (lo - 56320)))
+            fault_at(var s, JqBadEscape, bs, bs + 6, "")
+            return None
+        if cp >= 56320 and cp <= 57343
+            fault_at(var s, JqBadEscape, bs, bs + 6, "")
+            return None
+        s.i = s.i + 6
+        return Some(str.from_char(cp))
+    fault_at(var s, JqBadEscape, bs, bs + 2, "")
+    None
+
+// A string literal, in or out of a path.  `None` when the quote never
+// closes.
+fn scan_text_until(var s: Scan, quote: Int) -> ?Str
+    let open = s.i
+    s.i = s.i + 1
+    var out = ""
+    var chunk = s.i
+    var ok = true
+    var done = false
+    while not done
+        let c = here(s)
+        if c < 0
+            fault_at(var s, JqUnterminatedString, open, open + 1, "")
+            ok = false
+            done = true
+        elif c == '\\'
+            out = out + str.slice(s.text, chunk, s.i)
+            match decode_escape(var s)
+                None     =>
+                    ok = false
+                    done = true
+                Some(ch) =>
+                    out = out + ch
+            chunk = s.i
+        elif c == quote
+            out = out + str.slice(s.text, chunk, s.i)
+            s.i = s.i + 1
+            done = true
+        else
+            s.i = s.i + 1
+    if ok
+        Some(out)
+    else
+        None
+
+// A string literal: one `JqFLiteral`, or a `JqFInterpolate` when it
+// has any `\(…)` in it.
+fn parse_string_at(var s: Scan, at: Int) -> JqFilter
+    s.i = s.i + 1
+    var parts: [JqStrPart] = []
+    var text = ""
+    var chunk = s.i
+    var interpolated = false
+    var ok = true
+    var done = false
+    while not done
+        let c = here(s)
+        if c < 0
+            fault_at(var s, JqUnterminatedString, at, at + 1, "")
+            ok = false
+            done = true
+        elif c == '\\'
+            if byte(s, 1) == 40
+                text = text + str.slice(s.text, chunk, s.i)
+                if text != ""
+                    list.push(parts, JqSText(text))
+                text = ""
+                interpolated = true
+                let open = s.i
+                s.i = s.i + 2
+                let body = parse_exp(var s)
+                if here(s) != 41
+                    fault_at(var s, JqBadInterpolation, open, open + 2, "")
+                    ok = false
+                    done = true
+                else
+                    s.i = s.i + 1
+                    list.push(parts, JqSInterpolate(body))
+                    chunk = s.i
+            else
+                text = text + str.slice(s.text, chunk, s.i)
+                match decode_escape(var s)
+                    None     =>
+                        ok = false
+                        done = true
+                    Some(ch) =>
+                        text = text + ch
+                chunk = s.i
+        elif c == '"'
+            text = text + str.slice(s.text, chunk, s.i)
+            s.i = s.i + 1
+            done = true
+        else
+            s.i = s.i + 1
+    if not ok
+        return JqFIdentity(at)
+    if not interpolated
+        return JqFLiteral(at, JqLString(text))
+    if text != ""
+        list.push(parts, JqSText(text))
+    JqFInterpolate(at, parts)
+
+// ── Paths ────────────────────────────────────────────────────────────
+
+// Hand a path's RFC 9535 text to jsonpath-nv.  Its `parse` type-checks
+// as well as parses, so everything a path can be wrong about is
+// answered here.
+fn delegate(var s: Scan, text: Str, at: Int) -> ?jpquery.JpQuery
+    match jpquery.parse(text)
+        Err(_) =>
+            fault_at(var s, JqBadPath, at, s.i, text)
+            None
+        Ok(q)  => Some(q)
+
+// A quoted name inside `["…"]` or `.["…"]`, copied into the RFC text
+// with its single quotes escaped, or the empty string when no name
+// follows.
+fn scan_name_step(var s: Scan) -> Str
+    let c = here(s)
+    if is_word_first(c)
+        return "['" + take_word(var s) + "']"
+    if c == '"'
+        match scan_text_until(var s, 34)
+            None    =>
+                return ""
+            Some(t) =>
+                return "['" + str.replace(t, "'", "\\'") + "']"
+    ""
+
+// Skip a quoted region for a bracket scanner.
+fn skip_quoted(var s: Scan)
+    let q = here(s)
+    s.i = s.i + 1
+    var done = false
+    while not done
+        let c = here(s)
+        if c < 0
+            done = true
+        elif c == '\\'
+            s.i = s.i + 2
+        elif c == q
+            s.i = s.i + 1
+            done = true
+        else
+            s.i = s.i + 1
+
+// One `[…]` of a path, as RFC text.  `.[]` is `[*]`, which is jq's
+// meaning for it; everything else is handed to the delegate verbatim,
+// so `.["a"]`, `.[1:2]` and `.[?@.age > 30]` all arrive as themselves.
+fn scan_bracket_group(var s: Scan) -> Str
+    let open = s.i
+    s.i = s.i + 1
+    let inner_at = s.i
+    var depth = 1
+    var out = ""
+    var done = false
+    while not done
+        let c = here(s)
+        if c < 0
+            fault_at(var s, JqUnclosedBracket, open, open + 1, "")
+            done = true
+        elif c == '"' or c == '\''
+            skip_quoted(var s)
+        elif c == '['
+            depth = depth + 1
+            s.i = s.i + 1
+        elif c == ']'
+            depth = depth - 1
+            if depth == 0
+                let inside = str.slice(s.text, inner_at, s.i)
+                s.i = s.i + 1
+                if str.trim(inside) == ""
+                    out = "[*]"
+                else
+                    out = "[" + inside + "]"
+                done = true
+            else
+                s.i = s.i + 1
+        else
+            s.i = s.i + 1
+    out
+
+// A `.`-rooted path: one step at a time into a single RFC 9535 query,
+// so `.a | .b` and `.a.b` can end up as one path.
+fn parse_path_at(var s: Scan, at: Int) -> JqFilter
+    if byte(s, 1) == 46
+        // `..` — jq's recursive descent, which is the `recurse`
+        // builtin and not a descendant segment: see the enum above.
+        s.i = s.i + 2
+        return JqFCall(at, JqCBuiltin(JqbRecurse0), [])
+    var text = "$"
+    var steps = 0
+    var done = false
+    while not done
+        let c = here(s)
+        if faulted(s)
+            // cov: skip — every fault set inside this loop pairs with done = true in the same pass, and the delegate runs after it
+            done = true
+        elif c == '.'
+            if byte(s, 1) == 46
+                fault_at(var s, JqUnexpectedByte, s.i, s.i + 2, "")
+                done = true
+            else
+                s.i = s.i + 1
+                let nm = scan_name_step(var s)
+                if nm == ""
+                    if is_digit(here(s))
+                        fault_at(var s, JqBadNumber, s.i - 1, s.i + 1, "")
+                    done = true
+                else
+                    text = text + nm
+                    steps = steps + 1
+        elif c == '['
+            let grp = scan_bracket_group(var s)
+            if grp == ""
+                done = true
+            else
+                text = text + grp
+                steps = steps + 1
+        else
+            done = true
+    if steps == 0
+        return JqFIdentity(at)
+    match delegate(var s, text, at)
+        None    => JqFIdentity(at)
+        Some(q) => JqFPath(at, q)
+
+// A one-step query built in code, for the `{a}` shorthand.
+fn name_path(at: Int, nm: Str) -> JqFilter
+    let q = JpQuery { absolute: true, segments: [JpChildSeg([JpNameSel(nm)])] }
+    JqFPath(at, q)
+
+// ── Patterns ─────────────────────────────────────────────────────────
+
+fn empty_pattern() -> JqPattern
+    JqPVariable("")
+
+// One `$name`, `[p, …]` or `{k: p, …}`.  The names it binds are pushed
+// onto the scanner's scope as it reads them.
+fn parse_pattern(var s: Scan) -> JqPattern
+    skip_space(var s)
+    let c = here(s)
+    let at = s.i
+    if c == '$'
+        s.i = s.i + 1
+        let nm = take_word(var s)
+        if nm == ""
+            fault_at(var s, JqBadPattern, at, s.i, "")
+            return empty_pattern()
+        list.push(s.bound, nm)
+        return JqPVariable(nm)
+    if c == '['
+        s.i = s.i + 1
+        var elems: [JqPattern] = []
+        var done = false
+        while not done
+            skip_space(var s)
+            if here(s) == 93
+                s.i = s.i + 1
+                done = true
+            else
+                list.push(elems, parse_pattern(var s))
+                skip_space(var s)
+                if here(s) == 44
+                    s.i = s.i + 1
+                elif here(s) == 93
+                    s.i = s.i + 1
+                    done = true
+                else
+                    fault_at(var s, JqBadPattern, s.i, s.i + 1, "")
+                    done = true
+        return JqPArray(elems)
+    if c == '{'
+        s.i = s.i + 1
+        var entries: [JqPatternEntry] = []
+        var done = false
+        while not done
+            skip_space(var s)
+            if here(s) == 125
+                s.i = s.i + 1
+                done = true
+            else
+                let e = parse_pattern_entry(var s)
+                list.push(entries, e)
+                skip_space(var s)
+                if here(s) == 44
+                    s.i = s.i + 1
+                elif here(s) == 125
+                    s.i = s.i + 1
+                    done = true
+                else
+                    fault_at(var s, JqBadPattern, s.i, s.i + 1, "")
+                    done = true
+        return JqPObject(entries)
+    fault_at(var s, JqBadPattern, at, at + 1, "")
+    empty_pattern()
+
+// One entry of an object pattern: `$x`, `name: p`, `"name": p` or
+// `(f): p`.
+fn parse_pattern_entry(var s: Scan) -> JqPatternEntry
+    let at = s.i
+    let c = here(s)
+    if c == '$'
+        s.i = s.i + 1
+        let nm = take_word(var s)
+        list.push(s.bound, nm)
+        return JqPatternEntry { key: JqFLiteral(at, JqLString(nm)), pattern: JqPVariable(nm) }
+    if c == '"'
+        let k = parse_string_at(var s, at)
+        skip_space(var s)
+        if here(s) == 58
+            s.i = s.i + 1
+            return JqPatternEntry { key: k, pattern: parse_pattern(var s) }
+        fault_at(var s, JqBadPattern, at, s.i, "")
+        return JqPatternEntry { key: k, pattern: empty_pattern() }
+    if c == '('
+        s.i = s.i + 1
+        let k = parse_exp(var s)
+        skip_space(var s)
+        if here(s) == 41
+            s.i = s.i + 1
+        else
+            fault_at(var s, JqUnclosedBracket, at, at + 1, "")
+        skip_space(var s)
+        if here(s) == 58
+            s.i = s.i + 1
+            return JqPatternEntry { key: k, pattern: parse_pattern(var s) }
+        fault_at(var s, JqBadPattern, at, s.i, "")
+        return JqPatternEntry { key: k, pattern: empty_pattern() }
+    let nm = take_word(var s)
+    if nm == ""
+        fault_at(var s, JqBadPattern, at, at + 1, "")
+        return JqPatternEntry { key: JqFLiteral(at, JqLString("")), pattern: empty_pattern() }
+    skip_space(var s)
+    if here(s) == 58
+        s.i = s.i + 1
+        return JqPatternEntry { key: JqFLiteral(at, JqLString(nm)), pattern: parse_pattern(var s) }
+    // `{$x}`'s cousin `{x}`: the key is the name, the binding is `$x`.
+    list.push(s.bound, nm)
+    JqPatternEntry { key: JqFLiteral(at, JqLString(nm)), pattern: JqPVariable(nm) }
+
+// ── Names the program uses ───────────────────────────────────────────
+
+// `$name`, which is a variable, a `def`'s `$`-parameter (a call to
+// that parameter) or a refusal.
+fn parse_variable_at(var s: Scan, at: Int) -> JqFilter
+    s.i = s.i + 1
+    let nm = take_word(var s)
+    if nm == ""
+        fault_at(var s, JqUnexpectedByte, at, at + 1, "")
+        return JqFIdentity(at)
+    if list.contains(s.dollars, "\$" + nm)
+        return JqFCall(at, JqCDefined("\$" + nm), [])
+    if list.contains(s.bound, nm) or list.contains(s.supplied, nm)
+        return JqFVariable(at, nm)
+    match jqbuiltin.absence_reason("\$" + nm)
+        Some(_) => fault_at(var s, JqRefusedFunction, at, s.i, "\$" + nm)
+        None    => fault_at(var s, JqUnboundVariable, at, s.i, nm)
+    JqFIdentity(at)
+
+// Whether a `def` of this name and arity is in scope.  Innermost wins,
+// and a definition that shadows a builtin name at the same arity wins
+// over it: `def length: 1; length` is 1.
+fn find_def(s: Scan, nm: Str, argc: Int) -> Bool
+    var k = list.len(s.defs)
+    var found = false
+    while k > 0
+        k = k - 1
+        let sig = s.defs[k]
+        if sig.name == nm and sig.arity == argc
+            found = true
+    found
+
+// ── The grammar ──────────────────────────────────────────────────────
+
+// An expression, which is a comma-separated list of pipes, and the
+// place a chain of `def`s attaches: `def f: …; rest` is one node whose
+// `rest` is the whole expression after it.
+fn parse_exp(var s: Scan) -> JqFilter
+    skip_space(var s)
+    if faulted(s) or not enter(var s)
+        return JqFIdentity(0)
+    let r = parse_exp_inside(var s)
+    s.depth = s.depth - 1
+    r
+
+fn parse_exp_inside(var s: Scan) -> JqFilter
+    if peek_word(s) == "def"
+        return parse_define_at(var s, s.i)
+    parse_comma(var s)
+
+fn parse_comma(var s: Scan) -> JqFilter
+    var left = parse_pipe(var s)
+    var looping = true
+    while looping
+        skip_space(var s)
+        if here(s) == 44
+            let at = s.i
+            s.i = s.i + 1
+            if not can_start(s)
+                fault_at(var s, JqDanglingOperator, at, at + 1, "")
+                looping = false
+            else
+                left = JqFComma(position(left), left, parse_pipe(var s))
+        else
+            looping = false
+    left
+
+fn parse_pipe(var s: Scan) -> JqFilter
+    var left = parse_alt(var s)
+    var looping = true
+    while looping
+        skip_space(var s)
+        if here(s) == 124 and byte(s, 1) != 61 and byte(s, 1) != 124
+            let at = s.i
+            s.i = s.i + 1
+            if not can_start(s)
+                fault_at(var s, JqDanglingOperator, at, at + 1, "")
+                looping = false
+            else
+                left = pipe_or_fuse(left, parse_alt(var s))
+        else
+            looping = false
+    left
+
+// `//`, jq's alternative: the left's outputs when they are neither
+// null nor false, and the right's when there are none.
+fn parse_alt(var s: Scan) -> JqFilter
+    var left = parse_or(var s)
+    var looping = true
+    while looping
+        skip_space(var s)
+        if here(s) == 47 and byte(s, 1) == 47
+            let at = s.i
+            s.i = s.i + 2
+            if not can_start(s)
+                fault_at(var s, JqDanglingOperator, at, at + 2, "")
+                looping = false
+            else
+                left = JqFBinary(position(left), JqOpAlternative, left, parse_or(var s))
+        else
+            looping = false
+    left
+
+fn parse_or(var s: Scan) -> JqFilter
+    var left = parse_and(var s)
+    var looping = true
+    while looping
+        skip_space(var s)
+        if peek_word(s) == "or"
+            let at = s.i
+            match_word(var s, "or")
+            if not can_start(s)
+                fault_at(var s, JqDanglingOperator, at, at + 2, "")
+                looping = false
+            else
+                left = JqFBinary(position(left), JqOpOr, left, parse_and(var s))
+        else
+            looping = false
+    left
+
+fn parse_and(var s: Scan) -> JqFilter
+    var left = parse_cmp(var s)
+    var looping = true
+    while looping
+        skip_space(var s)
+        if peek_word(s) == "and"
+            let at = s.i
+            match_word(var s, "and")
+            if not can_start(s)
+                fault_at(var s, JqDanglingOperator, at, at + 3, "")
+                looping = false
+            else
+                left = JqFBinary(position(left), JqOpAnd, left, parse_cmp(var s))
+        else
+            looping = false
+    left
+
+fn compare_op(s: Scan) -> ?JqBinOp
+    if here(s) == 61 and byte(s, 1) == 61
+        return Some(JqOpEqual)
+    if here(s) == 33 and byte(s, 1) == 61
+        return Some(JqOpNotEqual)
+    if here(s) == 60 and byte(s, 1) == 61
+        return Some(JqOpLessEqual)
+    if here(s) == 62 and byte(s, 1) == 61
+        return Some(JqOpGreaterEqual)
+    if here(s) == 60
+        return Some(JqOpLess)
+    if here(s) == 62
+        return Some(JqOpGreater)
+    None
+
+fn compare_width(op: JqBinOp) -> Int
+    match op
+        JqOpLess    => 1
+        JqOpGreater => 1
+        _           => 2
+
+fn parse_cmp(var s: Scan) -> JqFilter
+    var left = parse_add(var s)
+    var looping = true
+    while looping
+        skip_space(var s)
+        match compare_op(s)
+            None     =>
+                looping = false
+            Some(op) =>
+                let at = s.i
+                let w = compare_width(op)
+                s.i = s.i + w
+                if not can_start(s)
+                    fault_at(var s, JqDanglingOperator, at, at + w, "")
+                    looping = false
+                else
+                    left = JqFBinary(position(left), op, left, parse_add(var s))
+    left
+
+fn parse_add(var s: Scan) -> JqFilter
+    var left = parse_mul(var s)
+    var looping = true
+    while looping
+        skip_space(var s)
+        if (here(s) == 43 or here(s) == 45) and byte(s, 1) != 61
+            let at = s.i
+            let op = add_op(here(s))
+            s.i = s.i + 1
+            if not can_start(s)
+                fault_at(var s, JqDanglingOperator, at, at + 1, "")
+                looping = false
+            else
+                left = JqFBinary(position(left), op, left, parse_mul(var s))
+        else
+            looping = false
+    left
+
+fn add_op(c: Int) -> JqBinOp
+    if c == '-'
+        return JqOpSubtract
+    JqOpAdd
+
+fn parse_mul(var s: Scan) -> JqFilter
+    var left = parse_unary(var s)
+    var looping = true
+    while looping
+        skip_space(var s)
+        if (here(s) == 42 or here(s) == 47 or here(s) == 37) and byte(s, 1) != 61 and byte(s, 1) != 47
+            let at = s.i
+            let op = mul_op(here(s))
+            s.i = s.i + 1
+            if not can_start(s)
+                fault_at(var s, JqDanglingOperator, at, at + 1, "")
+                looping = false
+            else
+                left = JqFBinary(position(left), op, left, parse_unary(var s))
+        else
+            looping = false
+    left
+
+fn mul_op(c: Int) -> JqBinOp
+    if c == '/'
+        return JqOpDivide
+    if c == '%'
+        return JqOpModulo
+    JqOpMultiply
+
+fn parse_unary(var s: Scan) -> JqFilter
+    skip_space(var s)
+    if here(s) == 45 and byte(s, 1) != 61
+        let at = s.i
+        s.i = s.i + 1
+        if not enter(var s)
+            return JqFIdentity(0)
+        let inner = parse_unary(var s)
+        s.depth = s.depth - 1
+        return JqFNegate(at, inner)
+    parse_postfix(var s)
+
+// A term, and the `as` binding it may carry: `f as $x | g`, whose body
+// is a whole expression and runs once per output of `f`.
+fn parse_postfix(var s: Scan) -> JqFilter
+    let t = parse_term(var s)
+    skip_space(var s)
+    var node = t
+    if peek_word(s) == "as"
+        let at = s.i
+        match_word(var s, "as")
+        skip_space(var s)
+        if not can_start(s)
+            fault_at(var s, JqDanglingOperator, at, at + 2, "")
+        else
+            let pat = parse_pattern(var s)
+            skip_space(var s)
+            if here(s) != 124
+                fault_at(var s, JqDanglingOperator, at, at + 2, "")
+            else
+                s.i = s.i + 1
+                let body = parse_exp(var s)
+                node = JqFBind(position(t), t, pat, body)
+    node
+
+// A term: an atom and the postfix steps that stick to it.  A step
+// after something that is not a path is a pipe, so `(1).a` and
+// `map(.a)[0]` read the way jq's do.
+fn parse_term(var s: Scan) -> JqFilter
+    if not enter(var s)
+        return JqFIdentity(0)
+    let r = parse_term_inside(var s)
+    s.depth = s.depth - 1
+    r
+
+fn parse_term_inside(var s: Scan) -> JqFilter
+    var t = parse_atom(var s)
+    var looping = true
+    while looping
+        if faulted(s)
+            looping = false
+        else
+            let c = here(s)
+            if c == '.' or c == '['
+                let at = s.i
+                var step = JqFIdentity(at)
+                if c == '.'
+                    step = parse_path_at(var s, at)
+                else
+                    let grp = scan_bracket_group(var s)
+                    if grp == ""
+                        looping = false
+                    else
+                        match delegate(var s, "$" + grp, at)
+                            None    =>
+                                looping = false
+                            Some(q) =>
+                                step = JqFPath(at, q)
+                if looping
+                    t = pipe_or_fuse(t, step)
+            elif c == '?'
+                s.i = s.i + 1
+                t = JqFTry(position(t), t, empty_call(position(t)))
+            else
+                looping = false
+    t
+
+// `f | g`, with a path on both sides folded into one longer path:
+// `.a | .b` and `.a.b` are one tree, which is nq's assertion and the
+// reason `|` needs no precedence table.
+fn pipe_or_fuse(left: JqFilter, right: JqFilter) -> JqFilter
+    if is_empty_filter(right)
+        return left
+    match left
+        JqFPath(at, lq) =>
+            match right
+                JqFPath(_, rq) => JqFPath(at, fuse_queries(lq, rq))
+                _              => JqFPipe(at, left, right)
+        JqFIdentity(_)  =>
+            match right
+                JqFPath(_, _) => right
+                _             => JqFPipe(position(left), left, right)
+        _               => JqFPipe(position(left), left, right)
+
+// Whether a filter is `.` with nothing after it, which a pipe drops.
+fn is_empty_filter(f: JqFilter) -> Bool
+    match f
+        JqFIdentity(_) => true
+        _              => false
+
+fn fuse_queries(a: jpquery.JpQuery, b: jpquery.JpQuery) -> jpquery.JpQuery
+    let segs = list.concat(a.segments, b.segments)
+    JpQuery { absolute: true, segments: segs }
+
+// A call to `empty`, which is `f?`'s handler and the body of `[]`.
+fn empty_call(at: Int) -> JqFilter
+    JqFCall(at, JqCBuiltin(JqbEmpty), [])
+
+fn parse_atom(var s: Scan) -> JqFilter
+    skip_space(var s)
+    if faulted(s)
+        return JqFIdentity(0)
+    let at = s.i
+    let c = here(s)
+    if c < 0
+        fault_at(var s, JqUnexpectedByte, at, at + 1, "")
+        return JqFIdentity(at)
+    if c == '.'
+        return parse_path_at(var s, at)
+    if c == '['
+        return parse_array_at(var s, at)
+    if c == '{'
+        return parse_object_at(var s, at)
+    if c == '"'
+        return parse_string_at(var s, at)
+    if c == '$'
+        return parse_variable_at(var s, at)
+    if c == '('
+        s.i = s.i + 1
+        let inner = parse_exp(var s)
+        skip_space(var s)
+        if here(s) == 41
+            s.i = s.i + 1
+            return inner
+        fault_at(var s, JqUnclosedBracket, at, at + 1, "")
+        return inner
+    if is_digit(c)
+        return parse_number(var s, at)
+    if is_word_first(c)
+        if peek_word(s) == "if"
+            return parse_if_at(var s, at)
+        if peek_word(s) == "try"
+            return parse_try_at(var s, at)
+        if peek_word(s) == "reduce"
+            return parse_reduce_at(var s, at)
+        if peek_word(s) == "foreach"
+            return parse_foreach_at(var s, at)
+        if peek_word(s) == "def"
+            return parse_define_at(var s, at)
+        return parse_call_at(var s, at)
+    fault_at(var s, JqUnexpectedByte, at, at + 1, "")
+    JqFIdentity(at)
+
+// `[f]`, and `[]` as `[empty]`.
+fn parse_array_at(var s: Scan, at: Int) -> JqFilter
+    s.i = s.i + 1
+    skip_space(var s)
+    if here(s) == 93
+        s.i = s.i + 1
+        return JqFArray(at, empty_call(at))
+    let body = parse_exp(var s)
+    skip_space(var s)
+    if here(s) == 93
+        s.i = s.i + 1
+        return JqFArray(at, body)
+    fault_at(var s, JqUnclosedBracket, at, at + 1, "")
+    JqFArray(at, body)
+
+// `{k: v, …}`, with `{a}` for `{a: .a}` and `{$x}` for `{"x": $x}`.
+fn parse_object_at(var s: Scan, at: Int) -> JqFilter
+    s.i = s.i + 1
+    var fields: [JqField] = []
+    var done = false
+    while not done
+        skip_space(var s)
+        if here(s) == 125
+            s.i = s.i + 1
+            done = true
+        else
+            let f = parse_object_field(var s)
+            match f
+                None    =>
+                    done = true
+                Some(x) => list.push(fields, x)
+            if not done
+                skip_space(var s)
+                if here(s) == 44
+                    s.i = s.i + 1
+                elif here(s) == 125
+                    s.i = s.i + 1
+                    done = true
+                else
+                    fault_at(var s, JqUnexpectedByte, s.i, s.i + 1, "")
+                    done = true
+    JqFObject(at, fields)
+
+fn parse_object_field(var s: Scan) -> ?JqField
+    let at = s.i
+    let c = here(s)
+    if c == '$'
+        s.i = s.i + 1
+        let nm = take_word(var s)
+        if nm == ""
+            fault_at(var s, JqBadObjectKey, at, at + 1, "")
+            return None
+        skip_space(var s)
+        if here(s) == 58
+            fault_at(var s, JqBadObjectKey, at, s.i, "")
+            return None
+        return Some(JqField { key: JqFLiteral(at, JqLString(nm)),
+                              value: JqFVariable(at, nm) })
+    if c == '"'
+        let k = parse_string_at(var s, at)
+        skip_space(var s)
+        if here(s) != 58
+            fault_at(var s, JqBadObjectKey, at, s.i, "")
+            return None
+        s.i = s.i + 1
+        return Some(JqField { key: k, value: parse_pipe(var s) })
+    if c == '('
+        s.i = s.i + 1
+        let k = parse_exp(var s)
+        skip_space(var s)
+        if here(s) == 41
+            s.i = s.i + 1
+        else
+            fault_at(var s, JqUnclosedBracket, at, at + 1, "")
+        skip_space(var s)
+        if here(s) != 58
+            fault_at(var s, JqBadObjectKey, at, s.i, "")
+            return None
+        s.i = s.i + 1
+        return Some(JqField { key: k, value: parse_pipe(var s) })
+    if is_word_first(c)
+        let nm = take_word(var s)
+        skip_space(var s)
+        if here(s) == 58
+            s.i = s.i + 1
+            return Some(JqField { key: JqFLiteral(at, JqLString(nm)), value: parse_pipe(var s) })
+        if here(s) == 44 or here(s) == 125
+            return Some(JqField { key: JqFLiteral(at, JqLString(nm)), value: name_path(at, nm) })
+        fault_at(var s, JqBadObjectKey, at, s.i, "")
+        return None
+    fault_at(var s, JqBadObjectKey, at, at + 1, "")
+    None
+
+// `if c then a elif … else b end`.  `else` is optional and means `.`,
+// and an `elif` is an `if` in the alternative.
+fn parse_if_at(var s: Scan, at: Int) -> JqFilter
+    match_word(var s, "if")
+    let cond = parse_exp(var s)
+    skip_space(var s)
+    if not match_word(var s, "then")
+        fault_at(var s, JqUnexpectedByte, s.i, s.i + 1, "")
+        return JqFIf(at, cond, JqFIdentity(s.i), JqFIdentity(s.i))
+    let body = parse_exp(var s)
+    skip_space(var s)
+    if match_word(var s, "elif")
+        let alt = parse_if_at(var s, s.i)
+        return JqFIf(at, cond, body, alt)
+    if match_word(var s, "else")
+        let alt = parse_exp(var s)
+        skip_space(var s)
+        if not match_word(var s, "end")
+            fault_at(var s, JqUnexpectedByte, s.i, s.i + 1, "")
+        return JqFIf(at, cond, body, alt)
+    if not match_word(var s, "end")
+        fault_at(var s, JqUnexpectedByte, s.i, s.i + 1, "")
+    JqFIf(at, cond, body, JqFIdentity(at))
+
+// `try f catch g`, and `try f`, whose handler is `empty`.
+fn parse_try_at(var s: Scan, at: Int) -> JqFilter
+    match_word(var s, "try")
+    let body = parse_exp(var s)
+    skip_space(var s)
+    if peek_word(s) == "catch"
+        match_word(var s, "catch")
+        let h = parse_exp(var s)
+        return JqFTry(at, body, h)
+    JqFTry(at, body, empty_call(at))
+
+// The arguments of a call, which are separated by `;` and hold commas.
+fn parse_arguments(var s: Scan) -> [JqFilter]
+    var args: [JqFilter] = []
+    var done = false
+    while not done
+        skip_space(var s)
+        if here(s) == 41
+            s.i = s.i + 1
+            done = true
+        else
+            list.push(args, parse_exp(var s))
+            skip_space(var s)
+            if here(s) == 59
+                s.i = s.i + 1
+            elif here(s) == 41
+                s.i = s.i + 1
+                done = true
+            else
+                fault_at(var s, JqUnexpectedByte, s.i, s.i + 1, "")
+                done = true
+    args
+
+// `true`, `false` and `null` are jq's literal keywords, three words the
+// lexer owns rather than three builtins: a `def true: …` is refused by
+// jq's own parser, and nothing here lets one through.
+fn is_literal_keyword(nm: Str) -> Bool
+    nm == "true" or nm == "false" or nm == "null"
+
+// The literal one of those three words means.
+fn keyword_literal(nm: Str) -> JqLiteral
+    if nm == "true"
+        return JqLBool(true)
+    if nm == "false"
+        return JqLBool(false)
+    JqLNull
+
+// A call, resolved at parse time: a `def` in scope, a builtin, or one
+// of the three refusals that name what was wrong.
+fn parse_call_at(var s: Scan, at: Int) -> JqFilter
+    let nm = take_word(var s)
+    // cov: skip — the only caller checks is_word_first before the word is read, so take_word never answers empty
+    if nm == ""
+        fault_at(var s, JqUnexpectedByte, at, at + 1, "")
+        return JqFIdentity(at)
+    skip_space(var s)
+    if is_literal_keyword(nm) and here(s) != 40
+        return JqFLiteral(at, keyword_literal(nm))
+    var args: [JqFilter] = []
+    if here(s) == 40
+        s.i = s.i + 1
+        args = parse_arguments(var s)
+    let argc = list.len(args)
+    if find_def(s, nm, argc)
+        return JqFCall(at, JqCDefined(nm), args)
+    match jqbuiltin.resolve(nm, argc)
+        Some(b) =>
+            if not check_path_argument(var s, at, b, args)
+                return JqFIdentity(at)
+            JqFCall(at, JqCBuiltin(b), args)
+        None    =>
+            match jqbuiltin.absence_reason(nm)
+                Some(_) => fault_at(var s, JqRefusedFunction, at, s.i, nm)
+                None    =>
+                    if jqbuiltin.is_known_name(nm)
+                        fault_at(var s, JqWrongArity, at, s.i, nm)
+                    else
+                        fault_at(var s, JqUnknownFunction, at, s.i, nm)
+            JqFIdentity(at)
+
+// `path(f)` takes a path expression and nothing else, and the refusal
+// belongs at parse time.
+fn check_path_argument(var s: Scan, at: Int, b: jqbuiltin.JqBuiltin, args: [JqFilter]) -> Bool
+    if jqbuiltin.name(b) != "path" or list.len(args) != 1
+        return true
+    let inner = args[0]
+    if is_path_expression(inner)
+        return true
+    fault_at(var s, JqBadPath, at, s.i, render_filter(inner))
+    false
+
+// `reduce s as $x (init; update)`.
+fn parse_reduce_at(var s: Scan, at: Int) -> JqFilter
+    match_word(var s, "reduce")
+    let source = parse_term(var s)
+    let pat = parse_as_pattern(var s)
+    skip_space(var s)
+    var node = JqFIdentity(at)
+    if here(s) != 40
+        fault_at(var s, JqUnexpectedByte, s.i, s.i + 1, "")
+    else
+        s.i = s.i + 1
+        let init = parse_exp(var s)
+        skip_space(var s)
+        if here(s) != 59
+            fault_at(var s, JqUnexpectedByte, s.i, s.i + 1, "")
+        else
+            s.i = s.i + 1
+            let update = parse_exp(var s)
+            skip_space(var s)
+            if here(s) != 41
+                fault_at(var s, JqUnclosedBracket, at, at + 1, "")
+            else
+                s.i = s.i + 1
+                node = JqFReduce(at, source, pat, init, update)
+    node
+
+// `foreach s as $x (init; update; extract)`, whose `extract` is `.`
+// when the program leaves it out.
+fn parse_foreach_at(var s: Scan, at: Int) -> JqFilter
+    match_word(var s, "foreach")
+    let source = parse_term(var s)
+    let pat = parse_as_pattern(var s)
+    skip_space(var s)
+    var node = JqFIdentity(at)
+    if here(s) != 40
+        fault_at(var s, JqUnexpectedByte, s.i, s.i + 1, "")
+    else
+        s.i = s.i + 1
+        let init = parse_exp(var s)
+        skip_space(var s)
+        if here(s) != 59
+            fault_at(var s, JqUnexpectedByte, s.i, s.i + 1, "")
+        else
+            s.i = s.i + 1
+            let update = parse_exp(var s)
+            skip_space(var s)
+            var extract = JqFIdentity(at)
+            if here(s) == 59
+                s.i = s.i + 1
+                extract = parse_exp(var s)
+                skip_space(var s)
+            if here(s) != 41
+                fault_at(var s, JqUnclosedBracket, at, at + 1, "")
+            else
+                s.i = s.i + 1
+                node = JqFForeach(at, source, pat, init, update, extract)
+    node
+
+// The `as $x` of a reduce or a foreach, and its `|` when it is the
+// `f as $x | g` form.  A pattern, read where the grammar demands one.
+fn parse_as_pattern(var s: Scan) -> JqPattern
+    skip_space(var s)
+    if not match_word(var s, "as")
+        fault_at(var s, JqBadPattern, s.i, s.i + 1, "")
+        return empty_pattern()
+    parse_pattern(var s)
+
+// `def f(a; $b): body; rest`.
+fn parse_define_at(var s: Scan, at: Int) -> JqFilter
+    match_word(var s, "def")
+    skip_space(var s)
+    let nm = take_word(var s)
+    if nm == ""
+        fault_at(var s, JqUnexpectedByte, at, at + 1, "")
+        return JqFIdentity(at)
+    var params: [Str] = []
+    var dollars: [Str] = []
+    skip_space(var s)
+    if here(s) == 40
+        var done = false
+        s.i = s.i + 1
+        while not done
+            skip_space(var s)
+            if here(s) == 41
+                s.i = s.i + 1
+                done = true
+            else
+                if here(s) == 36
+                    s.i = s.i + 1
+                    let d = take_word(var s)
+                    if d == ""
+                        fault_at(var s, JqUnexpectedByte, s.i, s.i + 1, "")
+                        return JqFIdentity(at)
+                    // `def f($x)` binds the argument to `$x` rather
+                    // than naming a filter to re-run.  The dollar
+                    // stays in the recorded parameter so that what
+                    // `render` prints parses back to the same tree.
+                    list.push(params, "\$" + d)
+                    list.push(dollars, "\$" + d)
+                else
+                    let p = take_word(var s)
+                    if p == ""
+                        fault_at(var s, JqUnexpectedByte, s.i, s.i + 1, "")
+                        return JqFIdentity(at)
+                    list.push(params, p)
+                skip_space(var s)
+                if here(s) == 59
+                    s.i = s.i + 1
+                elif here(s) == 41
+                    s.i = s.i + 1
+                    done = true
+                else
+                    fault_at(var s, JqUnexpectedByte, s.i, s.i + 1, "")
+                    return JqFIdentity(at)
+    skip_space(var s)
+    if here(s) != 58
+        fault_at(var s, JqUnexpectedByte, s.i, s.i + 1, "")
+        return JqFIdentity(at)
+    s.i = s.i + 1
+    let def_mark = list.len(s.defs)
+    list.push(s.defs, JqDefSig { name: nm, arity: list.len(params) })
+    let bound_mark = list.len(s.bound)
+    let dollar_mark = list.len(s.dollars)
+    for p in params
+        if not list.contains(dollars, p)
+            list.push(s.defs, JqDefSig { name: p, arity: 0 })
+    for d in dollars
+        list.push(s.dollars, d)
+    let body = parse_exp(var s)
+    s.defs = list.slice(s.defs, 0, def_mark + 1)
+    s.bound = list.slice(s.bound, 0, bound_mark)
+    s.dollars = list.slice(s.dollars, 0, dollar_mark)
+    skip_space(var s)
+    if here(s) != 59
+        fault_at(var s, JqUnexpectedByte, s.i, s.i + 1, "")
+        s.defs = list.slice(s.defs, 0, def_mark)
+        return JqFIdentity(at)
+    s.i = s.i + 1
+    let rest = parse_exp(var s)
+    s.defs = list.slice(s.defs, 0, def_mark)
+    JqFDefine(at, nm, params, body, rest)
+
+// ── Rendering ────────────────────────────────────────────────────────
+
+// The rendering precedence of a filter: the operator levels of the
+// grammar above, and 1 for the keyword forms, which are lowest.
+fn prec(f: JqFilter) -> Int
+    match f
+        JqFComma(_, _, _)            => 1
+        JqFPipe(_, _, _)             => 2
+        JqFBinary(_, op, _, _)       => op_level(op)
+        JqFNegate(_, _)              => 8
+        JqFIf(_, _, _, _)            => 1
+        JqFTry(_, _, _)              => 1
+        JqFReduce(_, _, _, _, _)     => 1
+        JqFForeach(_, _, _, _, _, _) => 1
+        JqFBind(_, _, _, _)          => 1
+        JqFDefine(_, _, _, _, _)     => 1
+        _                            => 9
+
+fn op_level(op: JqBinOp) -> Int
+    match op
+        JqOpAlternative  => 3
+        JqOpOr           => 4
+        JqOpAnd          => 4
+        JqOpEqual        => 5
+        JqOpNotEqual     => 5
+        JqOpLess         => 5
+        JqOpLessEqual    => 5
+        JqOpGreater      => 5
+        JqOpGreaterEqual => 5
+        JqOpAdd          => 6
+        JqOpSubtract     => 6
+        _                => 7
+
+fn render_prec(f: JqFilter, min: Int) -> Str
+    let body = render_of(f)
+    if prec(f) < min
+        "(" + body + ")"
+    else
+        body
+
+// `[]` for the empty body, `[f]` otherwise.
+fn render_array(b: JqFilter) -> Str
+    if is_empty_call(b)
+        return "[]"
+    "[" + render_prec(b, 0) + "]"
+
+fn render_of(f: JqFilter) -> Str
+    match f
+        JqFIdentity(_)                => "."
+        JqFPath(_, q)                 => render_query(q)
+        JqFPipe(_, a, b)              => render_prec(a, 2) + " | " + render_prec(b, 3)
+        JqFComma(_, a, b)             => render_prec(a, 1) + ", " + render_prec(b, 2)
+        JqFLiteral(_, v)              => render_literal(v)
+        JqFArray(_, b)                => render_array(b)
+        JqFObject(_, fs)              => "{" + fields_text(fs) + "}"
+        JqFBinary(_, op, a, b)        =>
+            let lv = op_level(op)
+            render_prec(a, lv) + " " + op_text(op) + " " + render_prec(b, lv + 1)
+        JqFNegate(_, b)               => "-" + render_prec(b, 8)
+        JqFIf(_, c, t, e)             =>
+            var out = "if " + render_prec(c, 0) + " then " + render_prec(t, 0)
+            out = out + " else " + render_prec(e, 0) + " end"
+            out
+        JqFTry(_, b, h)               =>
+            if is_empty_call(h)
+                "try " + render_prec(b, 0)
+            else
+                "try " + render_prec(b, 0) + " catch " + render_prec(h, 0)
+        JqFReduce(_, s, p, i, u)      =>
+            var out = "reduce " + render_prec(s, 9) + " as " + render_pattern(p)
+            out = out + " (" + render_prec(i, 0) + "; " + render_prec(u, 0) + ")"
+            out
+        JqFForeach(_, s, p, i, u, x)  =>
+            var out = "foreach " + render_prec(s, 9) + " as " + render_pattern(p)
+            out = out + " (" + render_prec(i, 0) + "; " + render_prec(u, 0)
+            out = out + "; " + render_prec(x, 0) + ")"
+            out
+        JqFBind(_, s, p, b)           =>
+            render_prec(s, 9) + " as " + render_pattern(p) + " | " + render_prec(b, 0)
+        JqFVariable(_, nm)            => "\$" + nm
+        JqFCall(_, callee, args)      => call_text(callee, args)
+        JqFDefine(_, nm, ps, b, rest) =>
+            var out = "def " + nm + params_text(ps) + ": " + render_prec(b, 0)
+            out = out + "; " + render_prec(rest, 0)
+            out
+        JqFInterpolate(_, parts)      => "\"" + parts_text(parts) + "\""
+
+fn call_text(callee: JqCallee, args: [JqFilter]) -> Str
+    let nm = callee_name(callee)
+    if list.len(args) == 0
+        return nm
+    nm + "(" + filter_list_text(args) + ")"
+
+fn callee_name(callee: JqCallee) -> Str
+    match callee
+        JqCBuiltin(b) => jqbuiltin.name(b)
+        JqCDefined(n) => n
+
+fn filter_list_text(args: [JqFilter]) -> Str
+    var parts: [Str] = []
+    for a in args
+        list.push(parts, render_prec(a, 0))
+    list.join(parts, "; ")
+
+fn params_text(ps: [Str]) -> Str
+    if list.len(ps) == 0
+        return ""
+    "(" + list.join(ps, "; ") + ")"
+
+fn fields_text(fs: [JqField]) -> Str
+    var parts: [Str] = []
+    for f in fs
+        list.push(parts, render_key(f.key) + ": " + render_prec(f.value, 2))
+    list.join(parts, ", ")
+
+fn render_key(k: JqFilter) -> Str
+    match k
+        JqFLiteral(_, JqLString(t)) =>
+            if is_word_name(t)
+                t
+            else
+                quote_json(t)
+        _                           => "(" + render_prec(k, 0) + ")"
+
+fn parts_text(parts: [JqStrPart]) -> Str
+    var out = ""
+    for p in parts
+        match p
+            JqSText(t)        =>
+                out = out + escape_text(t)
+            JqSInterpolate(b) =>
+                out = out + "\\(" + render_prec(b, 0) + ")"
+    out
+
+fn render_literal(v: JqLiteral) -> Str
+    match v
+        JqLNull        => "null"
+        JqLBool(true)  => "true"
+        JqLBool(false) => "false"
+        JqLNumber(f)   => str.from_float(f)
+        JqLString(t)   => quote_json(t)
+
+fn op_text(op: JqBinOp) -> Str
+    match op
+        JqOpAdd          => "+"
+        JqOpSubtract     => "-"
+        JqOpMultiply     => "*"
+        JqOpDivide       => "/"
+        JqOpModulo       => "%"
+        JqOpEqual        => "=="
+        JqOpNotEqual     => "!="
+        JqOpLess         => "<"
+        JqOpLessEqual    => "<="
+        JqOpGreater      => ">"
+        JqOpGreaterEqual => ">="
+        JqOpAnd          => "and"
+        JqOpOr           => "or"
+        JqOpAlternative  => "//"
+
+fn render_pattern(p: JqPattern) -> Str
+    match p
+        JqPVariable(nm) => "\$" + nm
+        JqPArray(ps)    =>
+            var parts: [Str] = []
+            for e in ps
+                list.push(parts, render_pattern(e))
+            "[" + list.join(parts, ", ") + "]"
+        JqPObject(es)   =>
+            var parts: [Str] = []
+            for e in es
+                list.push(parts, render_key(e.key) + ": " + render_pattern(e.pattern))
+            "{" + list.join(parts, ", ") + "}"
+
+// A whole query as jq path text.  The first step of a jq path always
+// carries the dot, so `$[0]` is `.[0]` and `$['a']['b']` is `.a.b`.
+fn render_query(q: jpquery.JpQuery) -> Str
+    var out = ""
+    for seg in q.segments
+        match seg
+            JpChildSeg(sels)      =>
+                let t = render_child(sels)
+                if out == ""
+                    if str.starts_with(t, ".")
+                        out = t
+                    else
+                        out = "." + t
+                else
+                    out = out + t
+            JpDescendantSeg(sels) =>
+                out = out + ".." + render_group(sels)
+    if out == ""
+        return "."
+    out
+
+// A child segment: `.name` when it is one plain word, `[…]` otherwise.
+fn render_child(sels: [jpquery.JpSelector]) -> Str
+    match lone_word(sels)
+        Some(nm) => "." + nm
+        None     => render_group(sels)
+
+fn lone_word(sels: [jpquery.JpSelector]) -> ?Str
+    if list.len(sels) != 1
+        return None
+    match sels[0]
+        JpNameSel(nm) =>
+            if is_word_name(nm)
+                Some(nm)
+            else
+                None
+        _             => None
+
+// A selector group.  `[*]` is jq's `[]`, and the filter form is
+// rendered by the delegate, which is the only place an I-Regexp
+// expression's own text is written.
+fn render_group(sels: [jpquery.JpSelector]) -> Str
+    if list.len(sels) == 1
+        return render_lone(sels[0])
+    var parts: [Str] = []
+    for s in sels
+        list.push(parts, render_selector(s))
+    "[" + list.join(parts, ",") + "]"
+
+fn render_lone(sel: jpquery.JpSelector) -> Str
+    match sel
+        JpWildcardSel  => "[]"
+        JpFilterSel(e) => "[" + render_filter_sel(e) + "]"
+        _              => "[" + render_selector(sel) + "]"
+
+fn render_selector(sel: jpquery.JpSelector) -> Str
+    match sel
+        JpNameSel(nm)  => "'" + str.replace(nm, "'", "\\'") + "'"
+        JpIndexSel(i)  => str.from_int(i)
+        JpWildcardSel  => "*"
+        JpSliceSel(b)  => render_slice(b)
+        JpFilterSel(e) => render_filter_sel(e)
+
+fn render_slice(b: jpquery.JpSlice) -> Str
+    let st = b.step ?? 1
+    if st == 1
+        return slice_bound(b.start) + ":" + slice_bound(b.end)
+    slice_bound(b.start) + ":" + slice_bound(b.end) + ":" + str.from_int(st)
+
+fn slice_bound(b: ?Int) -> Str
+    match b
+        None    => ""
+        Some(i) => str.from_int(i)
+
+// The text of a `?…` filter selector, without its brackets, rendered
+// by the delegate: build the one-selector query, render it, and strip
+// the `$[` and the `]` it came wrapped in.
+fn render_filter_sel(e: jpquery.JpExpr) -> Str
+    let q = JpQuery { absolute: true, segments: [JpChildSeg([JpFilterSel(e)])] }
+    let full = jpquery.render(q)
+    str.slice(full, 2, str.len(full) - 1)
+
+fn is_empty_call(f: JqFilter) -> Bool
+    match f
+        JqFCall(_, JqCBuiltin(b), args) =>
+            jqbuiltin.name(b) == "empty" and list.len(args) == 0
+        _                               => false
+
+// ── Text ─────────────────────────────────────────────────────────────
+
+fn is_word_name(s: Str) -> Bool
+    if str.len(s) == 0
+        return false
+    if not is_word_first(str.byte_at(s, 0) ?? -1)
+        return false
+    var k = 1
+    var ok = true
+    while k < str.len(s)
+        if not is_word_byte(str.byte_at(s, k) ?? -1)
+            ok = false
+        k = k + 1
+    ok
+
+fn hex_digit(n: Int) -> Str
+    if n < 10
+        return str.from_int(n)
+    str.from_char(97 + n - 10)
+
+fn escape_text(s: Str) -> Str
+    var out = ""
+    var k = 0
+    while k < str.len(s)
+        let c = str.byte_at(s, k) ?? 0
+        if c == '\\'
+            out = out + "\\\\"
+        elif c == '"'
+            out = out + "\\\""
+        elif c == '\n'
+            out = out + "\\n"
+        elif c == '\t'
+            out = out + "\\t"
+        elif c == '\r'
+            out = out + "\\r"
+        elif c < ' '
+            out = out + "\\u00" + hex_digit(c / 16) + hex_digit(c % 16)
+        else
+            out = out + str.slice(s, k, k + 1)
+        k = k + 1
+    out
+
+fn quote_json(s: Str) -> Str
+    "\"" + escape_text(s) + "\""
+
+// ── Walking the tree ─────────────────────────────────────────────────
+
+// The names a pattern binds, for the scope a body runs in.
+fn pattern_names(p: JqPattern) -> [Str]
+    var out: [Str] = []
+    match p
+        JqPVariable(nm) => push_all(var out, [nm])
+        JqPArray(ps)    =>
+            for e in ps
+                push_all(var out, pattern_names(e))
+        JqPObject(es)   =>
+            for e in es
+                push_all(var out, pattern_names(e.pattern))
+    out
+
+fn push_one(var out: [Str], x: Str)
+    list.push(out, x)
+
+fn push_all(var out: [Str], xs: [Str])
+    for x in xs
+        list.push(out, x)
+
+fn with_names(scope: [Str], more: [Str]) -> [Str]
+    let merged = list.concat(scope, more)
+    merged
+
+// The `$names` a filter reads that nothing in it binds, in the order
+// they are first read.
+fn walk_vars(f: JqFilter, scope: [Str], var out: [Str]) -> Int
+    match f
+        JqFIdentity(_)               => 0
+        JqFLiteral(_, _)             => 0
+        JqFPath(_, _)                => 0
+        JqFVariable(_, nm)           =>
+            var n = 0
+            if not (list.contains(scope, nm) or list.contains(out, nm))
+                push_one(var out, nm)
+                n = 1
+            n
+        JqFNegate(_, b)              => walk_vars(b, scope, var out)
+        JqFArray(_, b)               => walk_vars(b, scope, var out)
+        JqFPipe(_, a, b)             => walk_vars(a, scope, var out) + walk_vars(b, scope, var out)
+        JqFComma(_, a, b)            => walk_vars(a, scope, var out) + walk_vars(b, scope, var out)
+        JqFBinary(_, _, a, b)        => walk_vars(a, scope, var out) + walk_vars(b, scope, var out)
+        JqFIf(_, c, t, e)            =>
+            walk_vars(c, scope, var out) + walk_vars(t, scope, var out) + walk_vars(e, scope, var out)
+        JqFTry(_, b, h)              => walk_vars(b, scope, var out) + walk_vars(h, scope, var out)
+        JqFReduce(_, s, p, i, u)     =>
+            let a = walk_vars(s, scope, var out)
+            let b = walk_vars(i, scope, var out)
+            let inner = with_names(scope, pattern_names(p))
+            a + b + walk_vars(u, inner, var out)
+        JqFForeach(_, s, p, i, u, x) =>
+            let a = walk_vars(s, scope, var out)
+            let b = walk_vars(i, scope, var out)
+            let inner = with_names(scope, pattern_names(p))
+            a + b + walk_vars(u, inner, var out) + walk_vars(x, inner, var out)
+        JqFBind(_, s, p, b)          =>
+            let a = walk_vars(s, scope, var out)
+            let inner = with_names(scope, pattern_names(p))
+            a + walk_vars(b, inner, var out)
+        JqFCall(_, _, args)          => walk_args(args, scope, var out)
+        JqFObject(_, fs)             => walk_fields(fs, scope, var out)
+        JqFDefine(_, _, ps, b, rest) =>
+            let inner = with_names(scope, ps)
+            walk_vars(b, inner, var out) + walk_vars(rest, scope, var out)
+        JqFInterpolate(_, parts)     => walk_parts(parts, scope, var out)
+
+fn walk_args(args: [JqFilter], scope: [Str], var out: [Str]) -> Int
+    var n = 0
+    for a in args
+        n = n + walk_vars(a, scope, var out)
+    n
+
+fn walk_fields(fs: [JqField], scope: [Str], var out: [Str]) -> Int
+    var n = 0
+    for f in fs
+        n = n + walk_vars(f.key, scope, var out) + walk_vars(f.value, scope, var out)
+    n
+
+fn walk_parts(parts: [JqStrPart], scope: [Str], var out: [Str]) -> Int
+    var n = 0
+    for p in parts
+        match p
+            JqSText(_)        =>
+                n = n + 0
+            JqSInterpolate(b) =>
+                n = n + walk_vars(b, scope, var out)
+    n
+
+// Every `def` name, in the order the text has them.
+fn walk_defs(f: JqFilter, var out: [Str]) -> Int
+    match f
+        JqFDefine(_, nm, _, b, rest) =>
+            list.push(out, nm)
+            walk_defs(b, var out) + walk_defs(rest, var out)
+        JqFIdentity(_)               => 0
+        JqFLiteral(_, _)             => 0
+        JqFPath(_, _)                => 0
+        JqFVariable(_, _)            => 0
+        JqFNegate(_, b)              => walk_defs(b, var out)
+        JqFArray(_, b)               => walk_defs(b, var out)
+        JqFPipe(_, a, b)             => walk_defs(a, var out) + walk_defs(b, var out)
+        JqFComma(_, a, b)            => walk_defs(a, var out) + walk_defs(b, var out)
+        JqFBinary(_, _, a, b)        => walk_defs(a, var out) + walk_defs(b, var out)
+        JqFIf(_, c, t, e)            => walk_defs(c, var out) + walk_defs(t, var out) + walk_defs(e, var out)
+        JqFTry(_, b, h)              => walk_defs(b, var out) + walk_defs(h, var out)
+        JqFReduce(_, s, _, i, u)     => walk_defs(s, var out) + walk_defs(i, var out) + walk_defs(u, var out)
+        JqFForeach(_, s, _, i, u, x) =>
+            walk_defs(s, var out) + walk_defs(i, var out) + walk_defs(u, var out) + walk_defs(x, var out)
+        JqFBind(_, s, _, b)          => walk_defs(s, var out) + walk_defs(b, var out)
+        JqFCall(_, _, args)          => walk_def_calls(args, var out)
+        JqFObject(_, fs)             => walk_def_fields(fs, var out)
+        JqFInterpolate(_, parts)     => walk_def_parts(parts, var out)
+
+fn walk_def_calls(args: [JqFilter], var out: [Str]) -> Int
+    var n = 0
+    for a in args
+        n = n + walk_defs(a, var out)
+    n
+
+fn walk_def_fields(fs: [JqField], var out: [Str]) -> Int
+    var n = 0
+    for f in fs
+        n = n + walk_defs(f.key, var out) + walk_defs(f.value, var out)
+    n
+
+fn walk_def_parts(parts: [JqStrPart], var out: [Str]) -> Int
+    var n = 0
+    for p in parts
+        match p
+            JqSText(_)        =>
+                n = n + 0
+            JqSInterpolate(b) =>
+                n = n + walk_defs(b, var out)
+    n
+
+// Every builtin the program calls, first use first.
+fn walk_builtins(f: JqFilter, var out: [jqbuiltin.JqBuiltin]) -> Int
+    match f
+        JqFCall(_, JqCBuiltin(b), args) =>
+            var n = 0
+            if not list.contains(out, b)
+                list.push(out, b)
+                n = 1
+            n + walk_builtin_args(args, var out)
+        JqFCall(_, JqCDefined(_), args) => walk_builtin_args(args, var out)
+        JqFIdentity(_)                  => 0
+        JqFLiteral(_, _)                => 0
+        JqFPath(_, _)                   => 0
+        JqFVariable(_, _)               => 0
+        JqFNegate(_, b)                 => walk_builtins(b, var out)
+        JqFArray(_, b)                  => walk_builtins(b, var out)
+        JqFPipe(_, a, b)                => walk_builtins(a, var out) + walk_builtins(b, var out)
+        JqFComma(_, a, b)               => walk_builtins(a, var out) + walk_builtins(b, var out)
+        JqFBinary(_, _, a, b)           => walk_builtins(a, var out) + walk_builtins(b, var out)
+        JqFIf(_, c, t, e)               => walk_builtins(c, var out) + walk_builtins(t, var out) + walk_builtins(e, var out)
+        JqFTry(_, b, h)                 => walk_builtins(b, var out) + walk_builtins(h, var out)
+        JqFReduce(_, s, _, i, u)        =>
+            walk_builtins(s, var out) + walk_builtins(i, var out) + walk_builtins(u, var out)
+        JqFForeach(_, s, _, i, u, x)    =>
+            let a = walk_builtins(s, var out) + walk_builtins(i, var out)
+            let b = walk_builtins(u, var out) + walk_builtins(x, var out)
+            a + b
+        JqFBind(_, s, _, b)             => walk_builtins(s, var out) + walk_builtins(b, var out)
+        JqFObject(_, fs)                => walk_builtin_fields(fs, var out)
+        JqFDefine(_, _, _, b, rest)     => walk_builtins(b, var out) + walk_builtins(rest, var out)
+        JqFInterpolate(_, parts)        => walk_builtin_parts(parts, var out)
+
+fn walk_builtin_args(args: [JqFilter], var out: [jqbuiltin.JqBuiltin]) -> Int
+    var n = 0
+    for a in args
+        n = n + walk_builtins(a, var out)
+    n
+
+fn walk_builtin_fields(fs: [JqField], var out: [jqbuiltin.JqBuiltin]) -> Int
+    var n = 0
+    for f in fs
+        n = n + walk_builtins(f.key, var out) + walk_builtins(f.value, var out)
+    n
+
+fn walk_builtin_parts(parts: [JqStrPart], var out: [jqbuiltin.JqBuiltin]) -> Int
+    var n = 0
+    for p in parts
+        match p
+            JqSText(_)        =>
+                n = n + 0
+            JqSInterpolate(b) =>
+                n = n + walk_builtins(b, var out)
+    n
+
+// The calls a path expression may be built from: the ones that hand
+// back places in the input rather than new values.
+fn builtin_is_path(b: jqbuiltin.JqBuiltin, args: [JqFilter]) -> Bool
+    match b
+        JqbEmpty    => true
+        JqbRecurse0 => true
+        JqbRecurse1 => true
+        JqbPaths0   => true
+        JqbPaths1   => true
+        JqbGetpath1 => true
+        JqbSelect1  => path_argument(args, 0)
+        JqbFirst1   => path_argument(args, 0)
+        JqbLast1    => path_argument(args, 0)
+        JqbLimit2   => path_argument(args, 1)
+        _           => false
+
+fn path_argument(args: [JqFilter], k: Int) -> Bool
+    if k >= list.len(args)
+        return false
+    is_path_expression(args[k])
+
+// ── Depth ────────────────────────────────────────────────────────────
+
+fn max_of(xs: [Int]) -> Int
+    var best = 0
+    for x in xs
+        if x > best
+            best = x
+    best
+
+fn args_depth(args: [JqFilter]) -> Int
+    var xs: [Int] = []
+    for a in args
+        list.push(xs, depth(a))
+    max_of(xs)
+
+fn fields_depth(fs: [JqField]) -> Int
+    var xs: [Int] = []
+    for f in fs
+        list.push(xs, depth(f.key))
+        list.push(xs, depth(f.value))
+    max_of(xs)
+
+fn parts_depth(parts: [JqStrPart]) -> Int
+    var xs: [Int] = []
+    for p in parts
+        match p
+            JqSText(_)        => ()
+            JqSInterpolate(b) => list.push(xs, depth(b))
+    max_of(xs)

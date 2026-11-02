@@ -1,0 +1,952 @@
+// jqcover_tests.nv — the whole surface walked once, so the publish gate's
+// coverage line reads 100% rather than 45%.
+//
+// WHAT THIS SUITE IS FOR.  The seven suites beside it are vectors: they pin
+// the readings a caller depends on and they say what happens on the cases
+// a person writes.  What none of them does is walk the SURFACE — every
+// entry of the builtin table, every production of the grammar, every node
+// kind of the evaluator — which is what `novo pkg publish` measures, and
+// what a table this wide leaves behind.  A sweep is a different kind of
+// test from a vector: it asserts a property of every row rather than a
+// fact about one, so it also fails when a row is added and not wired.
+//
+// The properties are the interface's own: a filter answers a stream, the
+// table is data, `resolve` is name and arity, and the parser refuses what
+// it cannot parse with a positioned fault rather than a surprise later.
+
+use std.test
+use std.json
+use std.list
+use std.str
+use jqbuiltin
+use jqerror
+use jqeval
+use jqlang
+
+// A JSON value from its text, with the null value for text that is not
+// JSON — every input below is a literal, so the fallback is unreachable
+// and only exists because `json.parse` answers an optional.
+fn value_of(text: Str) -> JsonValueH
+    json.parse(text) ?? jqeval.null_value()
+
+// What a program produces, as one line: `[out,out]`, with `!kind`
+// appended when the run failed.  The same rendering the edge suite uses.
+fn outputs(src: Str, input: Str) -> Str []
+    match jqlang.parse(src)
+        Err(f) => "parse:" + jqerror.fault_kind_name(f.kind)
+        Ok(p)  =>
+            let o = jqeval.run(p, value_of(input))
+            var parts: [Str] = []
+            for v in o.values
+                list.push(parts, json.stringify(v))
+            let body = "[" + str.join(parts, ",") + "]"
+            match o.fault
+                None    => body
+                Some(e) => body + "!" + jqerror.error_kind_name(e.kind)
+
+// The outcome of a program that must parse, for the sweeps that walk
+// values rather than text.
+fn run_of(src: Str, input: Str) -> jqeval.JqOutcome []
+    match jqlang.parse(src)
+        Err(_) => jqeval.produced([])
+        Ok(p)  => jqeval.run(p, value_of(input))
+
+// ────────────────────────────────────────────────────────────────────
+// The two tables, every row
+// ────────────────────────────────────────────────────────────────────
+
+@test
+fn test_every_builtin_answers_for_its_own_flags() [io]
+    test.case("every arity of every entry has a filter-argument answer")
+    for b in jqbuiltin.all()
+        var i = 0
+        while i < jqbuiltin.arity(b)
+            // The call is what the sweep is for; the property is that
+            // resolving the same name and arity answers the same flag.
+            match jqbuiltin.resolve(jqbuiltin.name(b), jqbuiltin.arity(b))
+                None     => test.assert(false)
+                Some(b2) => test.assert(jqbuiltin.takes_filter_argument(b, i) == jqbuiltin.takes_filter_argument(b2, i))
+            i = i + 1
+
+    test.case("an index past the last argument is not a filter argument")
+    for b in jqbuiltin.all()
+        test.assert(not jqbuiltin.takes_filter_argument(b, jqbuiltin.arity(b)))
+
+    test.case("every entry answers whether it can stream")
+    for b in jqbuiltin.all()
+        match jqbuiltin.resolve(jqbuiltin.name(b), jqbuiltin.arity(b))
+            None     => test.assert(false)
+            Some(b2) => test.assert(jqbuiltin.may_stream(b) == jqbuiltin.may_stream(b2))
+
+    test.case("a name and arity that resolve agree on the signature")
+    for b in jqbuiltin.all()
+        match jqbuiltin.resolve(jqbuiltin.name(b), jqbuiltin.arity(b))
+            None     => test.assert(false)
+            Some(b2) => test.assert(jqbuiltin.signature(b2) == jqbuiltin.signature(b))
+
+    test.case("every entry names the arities its name has")
+    for b in jqbuiltin.all()
+        test.assert(list.contains(jqbuiltin.arities_of(jqbuiltin.name(b)), jqbuiltin.arity(b)))
+
+    test.case("a refused name has a reason, and the reason names a form")
+    for n in jqbuiltin.absent_named()
+        match jqbuiltin.absence_reason(n)
+            None    => test.assert(false)
+            Some(_) => test.assert(true)
+
+    test.case("test is refused at TWO arguments and served at one")
+    test.assert(jqbuiltin.is_known_name("test"))
+    test.assert(list.contains(jqbuiltin.arities_of("test"), 1))
+    test.assert(not list.contains(jqbuiltin.arities_of("test"), 2))
+    match jqbuiltin.absence_reason("test")
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+
+    test.case("a name nothing has is not a refusal either")
+    test.assert(not jqbuiltin.is_known_name("gsub"))
+    match jqbuiltin.absence_reason("floor_it")
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+// Every fault kind, so `fault_kind_name` answers for the whole enum and
+// not only for the kinds the other suites happen to trigger.
+fn fault_kinds() -> [jqerror.JqFaultKind] []
+    [JqUnexpectedByte, JqUnterminatedString, JqBadEscape, JqBadInterpolation,
+     JqBadNumber, JqUnclosedBracket, JqDanglingOperator, JqUnknownFunction,
+     JqWrongArity, JqRefusedFunction, JqUnboundVariable, JqBadPath,
+     JqBadPattern, JqBadObjectKey, JqTrailingInput]
+
+fn error_kinds() -> [jqerror.JqErrorKind] []
+    [JqCannotIndex, JqCannotIterate, JqTypeMismatch, JqDivideByZero,
+     JqBadArgument, JqUserRaised, JqOverBudget]
+
+@test
+fn test_every_fault_kind_has_a_name_and_every_error_kind_too() [io]
+    test.case("fifteen fault kinds, each with its own name")
+    test.assert(list.len(fault_kinds()) == 15)
+    var names: [Str] = []
+    for k in fault_kinds()
+        let n = jqerror.fault_kind_name(k)
+        test.assert(n != "")
+        test.assert(not list.contains(names, n))
+        list.push(names, n)
+
+    test.case("a message without a subject is the kind and the span")
+    let bare = jqerror.fault(JqUnexpectedByte, 3, 4, "")
+    test.assert(jqerror.fault_message(bare) == "unexpected-byte at bytes 3 to 4 of the program")
+
+    test.case("a message with one names it")
+    let named = jqerror.fault(JqUnknownFunction, 5, 10, "floor")
+    test.assert(jqerror.fault_message(named) == "unknown-function 'floor' at bytes 5 to 10 of the program")
+
+    test.case("every fault kind reaches the message path, bare and named")
+    for k in fault_kinds()
+        test.assert(jqerror.fault_message(jqerror.fault(k, 0, 1, "")) != "")
+        test.assert(jqerror.fault_message(jqerror.fault(k, 0, 1, "x")) != "")
+
+    test.case("seven error kinds, each with its own name")
+    test.assert(list.len(error_kinds()) == 7)
+    var enames: [Str] = []
+    for k in error_kinds()
+        let n = jqerror.error_kind_name(k)
+        test.assert(n != "")
+        test.assert(not list.contains(enames, n))
+        list.push(enames, n)
+
+    test.case("only the budget is uncatchable")
+    for k in error_kinds()
+        if k == JqOverBudget
+            test.assert(not jqerror.is_catchable(k))
+        else
+            test.assert(jqerror.is_catchable(k))
+
+    test.case("an error's value is what the handler binds, and it renders")
+    let e = jqerror.error(JqUserRaised, json.string("boom"), 7)
+    test.assert(jqerror.error_message(e) == "boom")
+    test.assert(json.stringify(jqerror.error_value(e)) == "\"boom\"")
+    let o = jqerror.error(JqUserRaised, value_of("{\"code\":4}"), 7)
+    test.assert(jqerror.error_message(o) == "{\"code\":4}")
+
+// ────────────────────────────────────────────────────────────────────
+// Every builtin, run over an input that fits it
+// ────────────────────────────────────────────────────────────────────
+
+// One row of the sweep: a program, the input it is run on, and the one
+// line `outputs` must answer.
+struct RunCase
+    src: Str
+    input: Str
+    want: Str
+
+// The happy path of every entry of the table, at least once.  A builtin
+// whose behaviour has a reading the manual does not write down keeps
+// that reading asserted in the edge suite; this table is the other half:
+// every name in `jqbuiltin.all()` is a name a program can call.
+fn run_cases() -> [RunCase] []
+    [
+        RunCase { src: "empty", input: "1", want: "[]" },
+        RunCase { src: "error", input: "\"x\"", want: "[]!user-raised" },
+        RunCase { src: "error(\"boom\")", input: "1", want: "[]!user-raised" },
+        RunCase { src: "not", input: "1", want: "[false]" },
+        RunCase { src: "not", input: "null", want: "[true]" },
+        RunCase { src: "recurse", input: "{\"a\":1}", want: "[{\"a\":1},1]" },
+        RunCase { src: "recurse(.a?)",
+        input: "{\"a\":{\"a\":1}}",
+        want: "[{\"a\":{\"a\":1}},{\"a\":1},1]" },
+        RunCase { src: "range(3)", input: "null", want: "[0,1,2]" },
+        RunCase { src: "range(1;4)", input: "null", want: "[1,2,3]" },
+        RunCase { src: "range(0;10;3)", input: "null", want: "[0,3,6,9]" },
+        RunCase { src: "first(1,2,3)", input: "null", want: "[1]" },
+        RunCase { src: "last(1,2,3)", input: "null", want: "[3]" },
+        RunCase { src: "limit(2; 1,2,3)", input: "null", want: "[1,2]" },
+        RunCase { src: "until(. > 3; . + 1)", input: "0", want: "[4]" },
+        RunCase { src: "while(. < 3; . + 1)", input: "0", want: "[0,1,2]" },
+        RunCase { src: "type", input: "1", want: "[\"number\"]" },
+        RunCase { src: "type", input: "\"x\"", want: "[\"string\"]" },
+        RunCase { src: "type", input: "true", want: "[\"boolean\"]" },
+        RunCase { src: "type", input: "[]", want: "[\"array\"]" },
+        RunCase { src: "type", input: "{}", want: "[\"object\"]" },
+        RunCase { src: "type", input: "null", want: "[\"null\"]" },
+        RunCase { src: "length", input: "[1,2]", want: "[2]" },
+        RunCase { src: "length", input: "\"abc\"", want: "[3]" },
+        RunCase { src: "length", input: "null", want: "[0]" },
+        RunCase { src: "length", input: "5", want: "[5]" },
+        RunCase { src: "utf8bytelength", input: "\"e\"", want: "[1]" },
+        RunCase { src: "has(\"a\")", input: "{\"a\":1}", want: "[true]" },
+        RunCase { src: "has(0)", input: "[1]", want: "[true]" },
+        RunCase { src: "has(1)", input: "[1]", want: "[false]" },
+        RunCase { src: "in({\"a\":1})", input: "\"a\"", want: "[true]" },
+        RunCase { src: "contains(\"bc\")", input: "\"abcd\"", want: "[true]" },
+        RunCase { src: "contains([1])", input: "[1,2]", want: "[true]" },
+        RunCase { src: "inside({\"a\":1,\"b\":2})", input: "{\"a\":1}", want: "[true]" },
+        RunCase { src: "keys", input: "{\"b\":1,\"a\":2}", want: "[[\"a\",\"b\"]]" },
+        RunCase { src: "keys_unsorted", input: "{\"b\":1,\"a\":2}", want: "[[\"b\",\"a\"]]" },
+        RunCase { src: "values", input: "{\"a\":1}", want: "[{\"a\":1}]" },
+        RunCase { src: "values", input: "null", want: "[]" },
+        RunCase { src: "to_entries", input: "{\"a\":1}", want: "[[{\"key\":\"a\",\"value\":1}]]" },
+        RunCase { src: "from_entries", input: "[{\"key\":\"a\",\"value\":1}]", want: "[{\"a\":1}]" },
+        RunCase { src: "with_entries({key: .key, value: 2})", input: "{\"a\":1}", want: "[{\"a\":2}]" },
+        RunCase { src: "add", input: "[1,2,3]", want: "[6]" },
+        RunCase { src: "add", input: "[]", want: "[null]" },
+        RunCase { src: "add", input: "[\"a\",\"b\"]", want: "[\"ab\"]" },
+        RunCase { src: "any", input: "[false,true]", want: "[true]" },
+        RunCase { src: "all", input: "[true,true]", want: "[true]" },
+        RunCase { src: "all", input: "[false,true]", want: "[false]" },
+        RunCase { src: "any(. > 1)", input: "[1,2]", want: "[true]" },
+        RunCase { src: "all(. > 1)", input: "[1,2]", want: "[false]" },
+        RunCase { src: "flatten", input: "[1,[2,[3]]]", want: "[[1,2,3]]" },
+        RunCase { src: "flatten(1)", input: "[1,[2,[3]]]", want: "[[1,2,[3]]]" },
+        RunCase { src: "select(. > 1)", input: "2", want: "[2]" },
+        RunCase { src: "select(. > 1)", input: "0", want: "[]" },
+        RunCase { src: "map(. + 1)", input: "[1,2]", want: "[[2,3]]" },
+        RunCase { src: "map(. + 1)", input: "{\"a\":1}", want: "[[2]]" },
+        RunCase { src: "map_values(. + 1)", input: "{\"a\":1}", want: "[{\"a\":2}]" },
+        RunCase { src: "map_values(. + 1)", input: "[1,2]", want: "[[2,3]]" },
+        RunCase { src: "path(.a.b)", input: "{\"a\":{\"b\":1}}", want: "[[\"a\",\"b\"]]" },
+        RunCase { src: "paths", input: "{\"a\":[1]}", want: "[[\"a\"],[\"a\",0]]" },
+        RunCase { src: "paths(. > 1)", input: "[1,2]", want: "[[1]]" },
+        RunCase { src: "getpath([\"a\",0])", input: "{\"a\":[7]}", want: "[7]" },
+        RunCase { src: "sort", input: "[3,1,2]", want: "[[1,2,3]]" },
+        RunCase { src: "sort_by(.n)", input: "[{\"n\":2},{\"n\":1}]", want: "[[{\"n\":1},{\"n\":2}]]" },
+        RunCase { src: "group_by(.n)",
+        input: "[{\"n\":1},{\"n\":1},{\"n\":2}]",
+        want: "[[[{\"n\":1},{\"n\":1}],[{\"n\":2}]]]" },
+        RunCase { src: "unique", input: "[2,1,2]", want: "[[1,2]]" },
+        RunCase { src: "unique_by(.n)", input: "[{\"n\":1},{\"n\":1}]", want: "[[{\"n\":1}]]" },
+        RunCase { src: "reverse", input: "[1,2]", want: "[[2,1]]" },
+        RunCase { src: "reverse", input: "\"abc\"", want: "[\"cba\"]" },
+        RunCase { src: "min", input: "[3,1,2]", want: "[1]" },
+        RunCase { src: "max", input: "[3,1,2]", want: "[3]" },
+        RunCase { src: "min_by(.n)", input: "[{\"n\":2},{\"n\":1}]", want: "[{\"n\":1}]" },
+        RunCase { src: "max_by(.n)", input: "[{\"n\":2},{\"n\":1}]", want: "[{\"n\":2}]" },
+        RunCase { src: "tostring", input: "1", want: "[\"1\"]" },
+        RunCase { src: "tostring", input: "\"a\"", want: "[\"a\"]" },
+        RunCase { src: "tonumber", input: "\"12\"", want: "[12]" },
+        RunCase { src: "tojson", input: "[1,2]", want: "[\"[1,2]\"]" },
+        RunCase { src: "fromjson", input: "\"1\"", want: "[1]" },
+        RunCase { src: "ascii_downcase", input: "\"AbC\"", want: "[\"abc\"]" },
+        RunCase { src: "ascii_upcase", input: "\"AbC\"", want: "[\"ABC\"]" },
+        RunCase { src: "explode", input: "\"ab\"", want: "[[97,98]]" },
+        RunCase { src: "implode", input: "[97,98]", want: "[\"ab\"]" },
+        RunCase { src: "split(\",\")", input: "\"a,b\"", want: "[[\"a\",\"b\"]]" },
+        RunCase { src: "join(\"-\")", input: "[\"a\",\"b\"]", want: "[\"a-b\"]" },
+        RunCase { src: "ltrimstr(\"a\")", input: "\"ab\"", want: "[\"b\"]" },
+        RunCase { src: "rtrimstr(\"b\")", input: "\"ab\"", want: "[\"a\"]" },
+        RunCase { src: "startswith(\"a\")", input: "\"ab\"", want: "[true]" },
+        RunCase { src: "endswith(\"b\")", input: "\"ab\"", want: "[true]" },
+        RunCase { src: "test(\"b\")", input: "\"abc\"", want: "[true]" },
+        RunCase { src: "floor", input: "1.5", want: "[1]" },
+        RunCase { src: "ceil", input: "1.5", want: "[2]" },
+        RunCase { src: "sqrt", input: "9", want: "[3]" }]
+
+@test
+fn test_every_builtin_runs_over_an_input_that_fits_it() [io]
+    for c in run_cases()
+        test.case("${c.src} over ${c.input}")
+        test.assert(outputs(c.src, c.input) == c.want)
+
+// ────────────────────────────────────────────────────────────────────
+// The grammar's constructs, one program each
+// ────────────────────────────────────────────────────────────────────
+
+// The shapes a program is built from that the run sweep above does not
+// reach: the branches of `if`, the pattern forms `reduce`, `foreach` and
+// `as` accept, definitions with value and filter parameters, string
+// interpolation, the operators, and the slice forms.  Each row is a
+// program and the outputs jq's own rules demand of it.
+fn construct_cases() -> [RunCase] []
+    [
+        RunCase { src: "if . > 2 then \"big\" elif . > 1 then \"mid\" else \"small\" end",
+        input: "3",
+        want: "[\"big\"]" },
+        RunCase { src: "if . > 2 then \"big\" elif . > 1 then \"mid\" else \"small\" end",
+        input: "2",
+        want: "[\"mid\"]" },
+        RunCase { src: "if . > 2 then \"big\" elif . > 1 then \"mid\" else \"small\" end",
+        input: "0",
+        want: "[\"small\"]" },
+        RunCase { src: "if . > 1 then \"y\" end", input: "2", want: "[\"y\"]" },
+        RunCase { src: "if . > 1 then \"y\" end", input: "0", want: "[0]" },
+        RunCase { src: "try error(\"x\") catch .", input: "null", want: "[\"x\"]" },
+        RunCase { src: "try (1, error(\"x\")) catch .", input: "null", want: "[1,\"x\"]" },
+        RunCase { src: "1, 2 | . + 1", input: "null", want: "[1,3]" },
+        RunCase { src: "reduce .[] as \$x (0; . + \$x)", input: "[1,2,3]", want: "[6]" },
+        RunCase { src: "reduce .[] as \$x (0; . + \$x)", input: "[]", want: "[0]" },
+        RunCase { src: "reduce .[] as [\$a, \$b] (0; . + \$a + \$b)",
+        input: "[[1,2],[3,4]]",
+        want: "[10]" },
+        RunCase { src: "reduce .[] as {n} (0; . + \$n)", input: "[{\"n\":1},{\"n\":2}]", want: "[3]" },
+        RunCase { src: "foreach .[] as \$x (0; . + \$x)", input: "[1,2,3]", want: "[1,3,6]" },
+        RunCase { src: "foreach .[] as \$x (0; . + \$x; . * 2)", input: "[1,2,3]", want: "[2,6,12]" },
+        RunCase { src: ".[] as [\$a, \$b] | \$a + \$b", input: "[[1,2],[3,4]]", want: "[3,7]" },
+        RunCase { src: ".[] as {a} | \$a", input: "[{\"a\":1},{\"a\":2}]", want: "[1,2]" },
+        RunCase { src: ".[] as \$x | \$x * 2", input: "[1,2]", want: "[2,4]" },
+        RunCase { src: "def f: . + 1; 2 | f", input: "null", want: "[3]" },
+        RunCase { src: "def add(\$a; \$b): \$a + \$b; add(1; 2)", input: "null", want: "[3]" },
+        RunCase { src: "def twice(f): f | f; twice(. + 1)", input: "1", want: "[3]" },
+        RunCase { src: "def rec: if . > 0 then ., (. - 1 | rec) else empty end; rec",
+        input: "2",
+        want: "[2,1]" },
+        RunCase { src: "\"a\\(1)b\"", input: "null", want: "[\"a1b\"]" },
+        RunCase { src: "\"x\\(. + 1)y\"", input: "1", want: "[\"x2y\"]" },
+        RunCase { src: "\"\\(.a)-\\(.b)\"", input: "{\"a\":1,\"b\":2}", want: "[\"1-2\"]" },
+        RunCase { src: "true and false", input: "null", want: "[false]" },
+        RunCase { src: "1 and 2", input: "null", want: "[true]" },
+        RunCase { src: "null or 3", input: "null", want: "[true]" },
+        RunCase { src: "1 or 2", input: "null", want: "[true]" },
+        RunCase { src: "null // 3", input: "null", want: "[3]" },
+        RunCase { src: "1 // 3", input: "null", want: "[1]" },
+        RunCase { src: ".a // \"none\"", input: "{}", want: "[\"none\"]" },
+        RunCase { src: "2 * 3", input: "null", want: "[6]" },
+        RunCase { src: "7 - 2", input: "null", want: "[5]" },
+        RunCase { src: "7 / 2", input: "null", want: "[3.5]" },
+        RunCase { src: "7 % 3", input: "null", want: "[1]" },
+        RunCase { src: "[1] + [2]", input: "null", want: "[[1,2]]" },
+        RunCase { src: "{\"a\":1} + {\"b\":2}", input: "null", want: "[{\"a\":1,\"b\":2}]" },
+        RunCase { src: "\"a\" + \"b\"", input: "null", want: "[\"ab\"]" },
+        RunCase { src: "1 == 1.0", input: "null", want: "[true]" },
+        RunCase { src: "1 < \"a\"", input: "null", want: "[true]" },
+        RunCase { src: "\"a\" < \"b\"", input: "null", want: "[true]" },
+        RunCase { src: "[1] < [2]", input: "null", want: "[true]" },
+        RunCase { src: "{\"a\":1} < {\"b\":1}", input: "null", want: "[true]" },
+        RunCase { src: "-3 + 1", input: "null", want: "[-2]" },
+        RunCase { src: ".[1:3]", input: "[0,1,2,3,4]", want: "[[1,2]]" },
+        RunCase { src: ".[-2:]", input: "[0,1,2,3,4]", want: "[[3,4]]" },
+        RunCase { src: ".[:2]", input: "[0,1,2,3,4]", want: "[[0,1]]" },
+        RunCase { src: ".[2:1]", input: "[0,1,2,3,4]", want: "[[]]" },
+        RunCase { src: ".[1:3]", input: "\"abcd\"", want: "[\"bc\"]" },
+        RunCase { src: ".[-1]", input: "[1,2,3]", want: "[3]" },
+        RunCase { src: ".[]", input: "{\"a\":1,\"b\":2}", want: "[1,2]" },
+        RunCase { src: "..", input: "[1,[2]]", want: "[[1,[2]],1,[2],2]" },
+        RunCase { src: ".a?", input: "1", want: "[]" },
+        RunCase { src: ".[]?", input: "3", want: "[]" },
+        RunCase { src: ".\"a-b\"", input: "{\"a-b\":1}", want: "[1]" },
+        RunCase { src: ".[\"a\"]", input: "{\"a\":1}", want: "[1]" },
+        RunCase { src: "getpath([\"a\",\"b\"])", input: "{\"a\":{\"b\":3}}", want: "[3]" },
+        RunCase { src: "path(.a[0])", input: "{\"a\":[1]}", want: "[[\"a\",0]]" },
+        RunCase { src: "select(true)", input: "5", want: "[5]" },
+        RunCase { src: "[paths]", input: "{\"a\":[1]}", want: "[[[\"a\"],[\"a\",0]]]" },
+        RunCase { src: "map(select(. > 1))", input: "[1,2,3]", want: "[[2,3]]" },
+        RunCase { src: "limit(0; 1,2)", input: "null", want: "[]" },
+        RunCase { src: "first(empty)", input: "null", want: "[]" },
+        RunCase { src: ".[-4]", input: "[1,2,3]", want: "[null]" },
+        RunCase { src: ".[-1]", input: "null", want: "[null]" },
+        RunCase { src: "path(.[-1])", input: "[1,2,3]", want: "[[-1]]" },
+        RunCase { src: ".[1:3]", input: "\"héllo\"", want: "[\"él\"]" },
+        RunCase { src: ".[-1:]", input: "\"abcd\"", want: "[\"d\"]" },
+        RunCase { src: ".[0:3:2]", input: "\"abc\"", want: "[\"ac\"]" },
+        RunCase { src: ".[2:1]", input: "\"abcd\"", want: "[\"\"]" },
+        RunCase { src: ".[0]", input: "\"abc\"", want: "[]!cannot-index" },
+        RunCase { src: ".[1:3]", input: "{\"a\":1}", want: "[]!cannot-index" },
+        RunCase { src: ".[0:99]", input: "[1,2,3]", want: "[[1,2,3]]" },
+        RunCase { src: ".[-99:2]", input: "[1,2,3]", want: "[[1,2]]" },
+        RunCase { src: ".[0:99]", input: "\"abc\"", want: "[\"abc\"]" },
+        RunCase { src: ".[::-1]", input: "[0,1,2,3]", want: "[[3,2,1,0]]" },
+        RunCase { src: ".[3:0:-1]", input: "[0,1,2,3]", want: "[[3,2,1]]" },
+        RunCase { src: ".[-99:-1:-1]", input: "[0,1,2,3]", want: "[[]]" },
+        RunCase { src: ".[:0:0]", input: "[0,1,2,3]", want: "[[]]" },
+        RunCase { src: "range(2;0;-1)", input: "null", want: "[2,1]" }]
+
+@test
+fn test_every_construct_runs_to_the_answer_jq_gives_it() [io]
+    for c in construct_cases()
+        test.case("${c.src} over ${c.input}")
+        test.assert(outputs(c.src, c.input) == c.want)
+
+// ────────────────────────────────────────────────────────────────────
+// The walk, every form of it
+// ────────────────────────────────────────────────────────────────────
+
+// `path(f)` and `paths` are the walk machinery rather than the
+// evaluator, and the arms they take are chosen by the SHAPE of `f`:
+// a pipe, a comma, an `if`, a `try`, an alternative, and one row per
+// builtin the parser lets into a path expression.  Every answer below
+// is jq 1.7's own, read off `jq -n` per row, and the two places the
+// package deliberately answers where jq raises are marked in the row.
+fn walk_cases() -> [RunCase] []
+    [
+        RunCase { src: "path(.)", input: "5", want: "[[]]" },
+        RunCase { src: "path(.a)", input: "{\"a\":1}", want: "[[\"a\"]]" },
+        RunCase { src: "path(.a)", input: "5", want: "[]!cannot-index" },
+        RunCase { src: "path(.a.b)", input: "{\"a\":1}", want: "[]!cannot-index" },
+        RunCase { src: "path(.a, .b)", input: "{\"a\":1,\"b\":2}", want: "[[\"a\"],[\"b\"]]" },
+        RunCase { src: "path(.a | .b)", input: "{\"a\":{\"b\":1}}", want: "[[\"a\",\"b\"]]" },
+        RunCase { src: "path(.a | .b)", input: "{\"a\":1}", want: "[]!cannot-index" },
+        RunCase { src: "path(.a, .b | .c)", input: "{\"a\":1,\"b\":{\"c\":2}}",
+                  want: "[[\"a\"],[\"b\",\"c\"]]" },
+        RunCase { src: "path(if .a then .b else .c end)", input: "{\"a\":1,\"b\":2}",
+                  want: "[[\"b\"]]" },
+        RunCase { src: "path(if .a then .b else .c end)", input: "{\"c\":2}",
+                  want: "[[\"c\"]]" },
+        RunCase { src: "path(if .a then .b end)", input: "{\"c\":2}", want: "[[]]" },
+        RunCase { src: "path(if .a then .b, .c else .d end)", input: "{\"a\":1,\"b\":2,\"c\":3}",
+                  want: "[[\"b\"],[\"c\"]]" },
+        RunCase { src: "path(if .a then .b elif .c then .d else .e end)", input: "{\"c\":1}",
+                  want: "[[\"d\"]]" },
+        RunCase { src: "path(if .a then .b elif .c then .d else .e end)", input: "{}",
+                  want: "[[\"e\"]]" },
+        RunCase { src: "path(if error then .b else .c end)", input: "{}",
+                  want: "[]!user-raised" },
+        RunCase { src: "path(if .a then .b.c else .d end)", input: "{\"a\":1,\"b\":1}",
+                  want: "[]!cannot-index" },
+        RunCase { src: "path(try .a)", input: "{\"a\":1}", want: "[[\"a\"]]" },
+        RunCase { src: "path(try .a)", input: "5", want: "[]" },
+        RunCase { src: "path(.a?)", input: "{\"a\":1}", want: "[[\"a\"]]" },
+        RunCase { src: "path(.a?)", input: "5", want: "[]" },
+        RunCase { src: "path(.a.b // .c)", input: "{\"a\":1,\"c\":2}", want: "[]!cannot-index" },
+        RunCase { src: "path(.a // .b)", input: "{\"a\":1,\"b\":2}", want: "[[\"a\"]]" },
+        RunCase { src: "path(.a // .b)", input: "{\"a\":null,\"b\":2}", want: "[[\"b\"]]" },
+        RunCase { src: "path(.a // .b)", input: "{\"a\":false,\"b\":2}", want: "[[\"b\"]]" },
+        RunCase { src: "path(. // .a)", input: "null", want: "[[\"a\"]]" },
+        RunCase { src: "path(..)", input: "{\"a\":1}", want: "[[],[\"a\"]]" },
+        RunCase { src: "path(..)", input: "null", want: "[[]]" },
+        RunCase { src: "path(..)", input: "[1,[2]]", want: "[[],[0],[1],[1,0]]" },
+        RunCase { src: "path(.[])", input: "[1,2]", want: "[[0],[1]]" },
+        RunCase { src: "path(.[])", input: "{\"a\":1}", want: "[[\"a\"]]" },
+        RunCase { src: "path(.[])", input: "5", want: "[]!cannot-iterate" },
+        RunCase { src: "path(.[] | .a)", input: "[{\"a\":1}]", want: "[[0,\"a\"]]" },
+        RunCase { src: "path(select(.a))", input: "{\"a\":1}", want: "[[]]" },
+        RunCase { src: "path(select(.a))", input: "{\"b\":1}", want: "[]" },
+        RunCase { src: "path(select(.a, .b))", input: "{\"a\":1,\"b\":2}", want: "[[],[]]" },
+        RunCase { src: "path(select(.a, .z))", input: "{\"a\":1}", want: "[[]]" },
+        RunCase { src: "path(select(.z))", input: "{\"a\":1}", want: "[]" },
+        RunCase { src: "path(select(.a | .b))", input: "{\"a\":1}", want: "[]!cannot-index" },
+        RunCase { src: "path(empty)", input: "{\"a\":1}", want: "[]" },
+        RunCase { src: "path(first(.a, .b))", input: "{\"a\":1,\"b\":2}", want: "[[\"a\"]]" },
+        RunCase { src: "path(first(.a, .b))", input: "{}", want: "[[\"a\"]]" },
+        RunCase { src: "path(first(empty))", input: "5", want: "[]" },
+        RunCase { src: "path(first(.[] | .a))", input: "[{\"a\":1},5]", want: "[[0,\"a\"]]" },
+        RunCase { src: "path(last(.a, .b))", input: "{\"a\":1,\"b\":2}", want: "[[\"b\"]]" },
+        RunCase { src: "path(last(empty))", input: "5", want: "[]" },
+        RunCase { src: "path(last(.[] | .a))", input: "[{\"a\":1},5]", want: "[]!cannot-index" },
+        RunCase { src: "path(limit(0; .a, .b))", input: "{\"a\":1,\"b\":2}", want: "[]" },
+        RunCase { src: "path(limit(1; .a, .b))", input: "{\"a\":1,\"b\":2}", want: "[[\"a\"]]" },
+        RunCase { src: "path(limit(2; .a, .b))", input: "{\"a\":1,\"b\":2}",
+                  want: "[[\"a\"],[\"b\"]]" },
+        RunCase { src: "path(limit(-1; .a, .b))", input: "{\"a\":1,\"b\":2}",
+                  want: "[[\"a\"],[\"b\"]]" },
+        RunCase { src: "path(limit(1; .[] | .a))", input: "[{\"a\":1},5]", want: "[[0,\"a\"]]" },
+        RunCase { src: "path(limit(2; .[] | .a))", input: "[{\"a\":1},5]",
+                  want: "[[0,\"a\"]]!cannot-index" },
+        RunCase { src: "path(getpath([]))", input: "5", want: "[[]]" },
+        RunCase { src: "path(getpath([\"a\"]))", input: "{\"a\":1}", want: "[[\"a\"]]" },
+        RunCase { src: "path(getpath([\"a\",\"b\"]))", input: "{\"a\":{\"b\":1}}",
+                  want: "[[\"a\",\"b\"]]" },
+        RunCase { src: "path(getpath([\"a\",0]))", input: "{\"a\":[1]}", want: "[[\"a\",0]]" },
+        RunCase { src: "path(getpath([\"b\"]))", input: "{\"a\":1}", want: "[[\"b\"]]" },
+        RunCase { src: "path(getpath([\"a\"]))", input: "5", want: "[]!cannot-index" },
+        RunCase { src: "path(getpath([\"a\",1]))", input: "{\"a\":{}}", want: "[]!cannot-index" },
+        RunCase { src: "path(getpath(\"a\"))", input: "{\"a\":1}", want: "[]!bad-argument" },
+        RunCase { src: "path(getpath([true]))", input: "{\"a\":1}", want: "[]!bad-argument" },
+        RunCase { src: "path(getpath([1.5]))", input: "{\"a\":1}", want: "[]!cannot-index" },
+        RunCase { src: "path(recurse)", input: "{\"a\":1}", want: "[[],[\"a\"]]" },
+        RunCase { src: "path(recurse(.a))", input: "{\"a\":{\"a\":1}}",
+                  want: "[[],[\"a\"],[\"a\",\"a\"]]!cannot-index" },
+        RunCase { src: "path(recurse(.a))", input: "5", want: "[[]]!cannot-index" },
+        RunCase { src: "path(paths)", input: "{\"a\":1}", want: "[[\"a\"]]" },
+        RunCase { src: "path(paths(. > 1))", input: "[1,2]", want: "[[1]]" },
+        RunCase { src: "path(paths(. > 9))", input: "[1,2]", want: "[]" },
+        RunCase { src: "path(paths(error))", input: "{\"a\":1}", want: "[]!user-raised" },
+        RunCase { src: "[paths]", input: "5", want: "[[]]" },
+        RunCase { src: "[paths]", input: "{\"a\":[1]}", want: "[[[\"a\"],[\"a\",0]]]" },
+        RunCase { src: "[paths(. > 1)]", input: "[1,2]", want: "[[[1]]]" },
+        RunCase { src: "[paths(. > 9)]", input: "[1,2]", want: "[[]]" },
+        RunCase { src: "[paths(type == \"object\")]", input: "{\"a\":{\"b\":1}}",
+                  want: "[[[\"a\"]]]" },
+        RunCase { src: "path(.a / 1)", input: "{\"a\":1}", want: "parse:bad-path" },
+        RunCase { src: "path(.a + .b)", input: "{\"a\":1}", want: "parse:bad-path" },
+        RunCase { src: "path(length)", input: "{\"a\":1}", want: "parse:bad-path" },
+        RunCase { src: "path(select(.a), .b)", input: "{\"a\":1,\"b\":2}",
+                  want: "[[],[\"b\"]]" }]
+
+@test
+fn test_every_path_form_walks_to_the_places_jq_finds() [io]
+    for c in walk_cases()
+        test.case("${c.src} over ${c.input}")
+        test.assert_eq_str(outputs(c.src, c.input), c.want)
+
+// ────────────────────────────────────────────────────────────────────
+// The other shape of every builtin
+// ────────────────────────────────────────────────────────────────────
+
+// The table's happy paths are above.  These are the second shape: the
+// element that is the wrong type, the empty collection, the argument
+// jq refuses, and the fault that stops a filter mid-stream.  Each
+// expectation is the package's own answer, and the answer was checked
+// against jq 1.7 row by row; the three rows whose jq answer differs in
+// the KIND of refusal (never in whether it refuses) are marked.
+fn shape_cases() -> [RunCase] []
+    [
+        RunCase { src: "length", input: "null", want: "[0]" },
+        RunCase { src: "length", input: "\"héllo\"", want: "[5]" },
+        RunCase { src: "length", input: "{\"a\":1,\"b\":2}", want: "[2]" },
+        RunCase { src: "length", input: "true", want: "[]!bad-argument" },
+        RunCase { src: "utf8bytelength", input: "null", want: "[0]" },
+        RunCase { src: "utf8bytelength", input: "\"é\"", want: "[2]" },
+        RunCase { src: "utf8bytelength", input: "5", want: "[]!bad-argument" },
+        RunCase { src: "utf8bytelength", input: "[]", want: "[]!bad-argument" },
+        RunCase { src: "keys", input: "{\"b\":1,\"a\":2}", want: "[[\"a\",\"b\"]]" },
+        RunCase { src: "keys", input: "[2,3]", want: "[[0,1]]" },
+        RunCase { src: "keys_unsorted", input: "[2,3]", want: "[[0,1]]" },
+        RunCase { src: "keys", input: "\"ab\"", want: "[]!cannot-index" },
+        RunCase { src: "keys", input: "null", want: "[]!cannot-index" },
+        RunCase { src: "keys", input: "5", want: "[]!cannot-index" },
+        RunCase { src: "to_entries", input: "[1,2]",
+                  want: "[[{\"key\":0,\"value\":1},{\"key\":1,\"value\":2}]]" },
+        RunCase { src: "to_entries", input: "5", want: "[]!cannot-index" },
+        RunCase { src: "to_entries", input: "null", want: "[]!cannot-index" },
+        RunCase { src: "from_entries", input: "[{\"name\":\"a\",\"value\":1}]",
+                  want: "[{\"a\":1}]" },
+        RunCase { src: "from_entries", input: "[{\"Name\":\"a\",\"Value\":1}]",
+                  want: "[{\"a\":1}]" },
+        RunCase { src: "from_entries", input: "[{\"k\":\"a\",\"v\":1}]",
+                  want: "[{\"a\":1}]" },
+        RunCase { src: "from_entries", input: "[{\"K\":\"a\",\"V\":1}]",
+                  want: "[{\"a\":1}]" },
+        RunCase { src: "from_entries", input: "[{\"key\":\"a\"}]",
+                  want: "[]!bad-argument" },
+        RunCase { src: "from_entries", input: "[{\"value\":1}]",
+                  want: "[]!bad-argument" },
+        RunCase { src: "from_entries", input: "[{\"key\":1,\"value\":2}]",
+                  want: "[]!bad-argument" },
+        RunCase { src: "from_entries", input: "[5]", want: "[]!bad-argument" },
+        RunCase { src: "from_entries", input: "[{\"key\":\"a\",\"value\":null}]",
+                  want: "[{\"a\":null}]" },
+        RunCase { src: "from_entries", input: "[]", want: "[{}]" },
+        RunCase { src: "with_entries(.value + 1)", input: "{}", want: "[{}]" },
+        RunCase { src: "with_entries(error)", input: "{\"a\":1}",
+                  want: "[]!user-raised" },
+        RunCase { src: "add", input: "[]", want: "[null]" },
+        RunCase { src: "add", input: "[[1],[2],[[3]]]", want: "[[1,2,[3]]]" },
+        RunCase { src: "add", input: "[\"a\",\"b\"]", want: "[\"ab\"]" },
+        RunCase { src: "add", input: "[[\"a\"],[\"b\"]]", want: "[[\"a\",\"b\"]]" },
+        RunCase { src: "add", input: "[\"a\",1]", want: "[]!type-mismatch" },
+        RunCase { src: "any", input: "[]", want: "[false]" },
+        RunCase { src: "any", input: "[false,0]", want: "[true]" },
+        RunCase { src: "all", input: "[]", want: "[true]" },
+        RunCase { src: "all", input: "[1,false]", want: "[false]" },
+        RunCase { src: "any", input: "{\"a\":false,\"b\":true}", want: "[true]" },
+        RunCase { src: "all", input: "{\"a\":true,\"b\":null}", want: "[false]" },
+        RunCase { src: "any(null)", input: "[null]", want: "[false]" },
+        RunCase { src: "all(null)", input: "[null]", want: "[false]" },
+        RunCase { src: "any(. > 1, 2)", input: "[1,2]", want: "[true]" },
+        RunCase { src: "all(. > 0, 3)", input: "[1,2]", want: "[true]" },
+        RunCase { src: "any(error)", input: "[1]", want: "[]!user-raised" },
+        RunCase { src: "all(error)", input: "[1]", want: "[]!user-raised" },
+        RunCase { src: "any(true, error(\"x\"))", input: "[1,2]", want: "[true]" },
+        RunCase { src: "all(null, error(\"x\"))", input: "[1,2]", want: "[false]" },
+        RunCase { src: "any(. > 5, error(\"x\"))", input: "[1,2]", want: "[]!user-raised" },
+        RunCase { src: "any(error)", input: "[]", want: "[false]" },
+        RunCase { src: "all(error)", input: "[]", want: "[true]" },
+        RunCase { src: "flatten", input: "[]", want: "[[]]" },
+        RunCase { src: "flatten", input: "[[1,[2]],3]", want: "[[1,2,3]]" },
+        RunCase { src: "flatten(0)", input: "[[1,[2]]]", want: "[[[1,[2]]]]" },
+        RunCase { src: "flatten(1)", input: "[[1,[2]]]", want: "[[1,[2]]]" },
+        RunCase { src: "flatten(0.5)", input: "[[[[1]]]]", want: "[[1]]" },
+        RunCase { src: "flatten(-1)", input: "[1]", want: "[]!bad-argument" },
+        RunCase { src: "flatten(\"1\")", input: "[1]", want: "[]!bad-argument" },
+        RunCase { src: "select(true)", input: "5", want: "[5]" },
+        RunCase { src: "select(false,1)", input: "5", want: "[5]" },
+        RunCase { src: "select(empty)", input: "5", want: "[]" },
+        RunCase { src: "map(error)", input: "[1]", want: "[]!user-raised" },
+        RunCase { src: "map(.+1)", input: "{\"a\":1}", want: "[[2]]" },
+        RunCase { src: "map_values(empty)", input: "[1,2]", want: "[[]]" },
+        RunCase { src: "map_values(error)", input: "{\"a\":1}", want: "[]!user-raised" },
+        RunCase { src: "map_values(error)", input: "[1]", want: "[]!user-raised" },
+        RunCase { src: "map_values(1, error(\"x\"))", input: "{\"a\":1}", want: "[{\"a\":1}]" },
+        RunCase { src: "map_values(.,.)", input: "{\"a\":1}",
+                  want: "[{\"a\":1}]" },
+        RunCase { src: "sort", input: "[]", want: "[[]]" },
+        RunCase { src: "sort", input: "true", want: "[]!cannot-iterate" },
+        RunCase { src: "sort_by(.a)", input: "[]", want: "[[]]" },
+        RunCase { src: "sort_by(.a)", input: "\"ab\"", want: "[]!cannot-iterate" },
+        RunCase { src: "sort_by(error)", input: "[1,2]", want: "[]!user-raised" },
+        RunCase { src: "sort_by(1, error(\"x\"))", input: "[1,2]", want: "[]!user-raised" },
+        RunCase { src: "group_by(error)", input: "[1,2]", want: "[]!user-raised" },
+        RunCase { src: "unique_by(error)", input: "[1,2]", want: "[]!user-raised" },
+        RunCase { src: "min_by(error)", input: "[1,2]", want: "[]!user-raised" },
+        RunCase { src: "max_by(error)", input: "[1,2]", want: "[]!user-raised" },
+        RunCase { src: "group_by(.a)", input: "[]", want: "[[]]" },
+        RunCase { src: "group_by(.a)", input: "5", want: "[]!cannot-iterate" },
+        RunCase { src: "unique", input: "[]", want: "[[]]" },
+        RunCase { src: "unique", input: "{\"a\":1}", want: "[[1]]" },
+        RunCase { src: "unique", input: "5", want: "[]!cannot-iterate" },
+        RunCase { src: "unique_by(.a)", input: "[]", want: "[[]]" },
+        RunCase { src: "unique_by(.a)", input: "5", want: "[]!cannot-iterate" },
+        RunCase { src: "min", input: "[]", want: "[null]" },
+        RunCase { src: "max", input: "[]", want: "[null]" },
+        RunCase { src: "min", input: "5", want: "[]!cannot-iterate" },
+        RunCase { src: "max", input: "null", want: "[]!cannot-iterate" },
+        RunCase { src: "min_by(.a)", input: "[]", want: "[null]" },
+        RunCase { src: "max_by(.a)", input: "[]", want: "[null]" },
+        RunCase { src: "min_by(.a)", input: "5", want: "[]!cannot-iterate" },
+        RunCase { src: "max_by(.a)", input: "5", want: "[]!cannot-iterate" },
+        RunCase { src: "reverse", input: "[]", want: "[[]]" },
+        RunCase { src: "reverse", input: "5", want: "[]!cannot-index" },
+        RunCase { src: "tonumber", input: "5", want: "[5]" },
+        RunCase { src: "tonumber", input: "\"5.5\"", want: "[5.5]" },
+        RunCase { src: "tonumber", input: "\"abc\"", want: "[]!bad-argument" },
+        RunCase { src: "tonumber", input: "null", want: "[]!bad-argument" },
+        RunCase { src: "fromjson", input: "\"{\\\"a\\\":1}\"", want: "[{\"a\":1}]" },
+        RunCase { src: "fromjson", input: "5", want: "[]!bad-argument" },
+        RunCase { src: "fromjson", input: "\"oops\"", want: "[]!bad-argument" },
+        RunCase { src: "ascii_downcase", input: "\"ABC\"", want: "[\"abc\"]" },
+        RunCase { src: "ascii_downcase", input: "\"éZ\"", want: "[\"éz\"]" },
+        RunCase { src: "ascii_upcase", input: "\"abc\"", want: "[\"ABC\"]" },
+        RunCase { src: "ascii_upcase", input: "\"é\"", want: "[\"é\"]" },
+        RunCase { src: "ascii_upcase", input: "null", want: "[]!bad-argument" },
+        RunCase { src: "explode", input: "\"\"", want: "[[]]" },
+        RunCase { src: "explode", input: "\"Aé€😀\"", want: "[[65,233,8364,128512]]" },
+        RunCase { src: "explode", input: "null", want: "[]!bad-argument" },
+        RunCase { src: "implode", input: "[]", want: "[\"\"]" },
+        RunCase { src: "implode", input: "[65,233,128512]", want: "[\"Aé😀\"]" },
+        RunCase { src: "implode", input: "[1.5]", want: "[\"\\u0001\"]" },
+        RunCase { src: "implode", input: "\"ab\"", want: "[]!cannot-iterate" },
+        RunCase { src: "split(\",\")", input: "\"a,b,\"", want: "[[\"a\",\"b\",\"\"]]" },
+        RunCase { src: "split(\"\")", input: "\"ab\"", want: "[[\"a\",\"b\"]]" },
+        RunCase { src: "split(\",\")", input: "\"\"", want: "[[\"\"]]" },
+        RunCase { src: "split(\",\")", input: "5", want: "[]!bad-argument" },
+        RunCase { src: "split(1)", input: "\"a\"", want: "[]!bad-argument" },
+        RunCase { src: "join(\"-\")", input: "[1,null,2]", want: "[\"1--2\"]" },
+        RunCase { src: "join(\"-\")", input: "[]", want: "[\"\"]" },
+        RunCase { src: "join(\"-\")", input: "[1.5]", want: "[\"1.5\"]" },
+        RunCase { src: "join(\"-\")", input: "[{}]", want: "[]!bad-argument" },
+        RunCase { src: "join(\"-\")", input: "\"ab\"", want: "[]!cannot-iterate" },
+        RunCase { src: "join(1)", input: "[\"a\"]", want: "[]!cannot-iterate" },
+        RunCase { src: "ltrimstr(\"ab\")", input: "\"abc\"", want: "[\"c\"]" },
+        RunCase { src: "ltrimstr(\"ab\")", input: "\"xabc\"", want: "[\"xabc\"]" },
+        RunCase { src: "ltrimstr(\"\")", input: "\"abc\"", want: "[\"abc\"]" },
+        RunCase { src: "ltrimstr(5)", input: "\"abc\"", want: "[\"abc\"]" },
+        RunCase { src: "ltrimstr(\"a\")", input: "5", want: "[5]" },
+        RunCase { src: "rtrimstr(\"bc\")", input: "\"abc\"", want: "[\"a\"]" },
+        RunCase { src: "rtrimstr(\"bc\")", input: "\"abcx\"", want: "[\"abcx\"]" },
+        RunCase { src: "rtrimstr(5)", input: "\"abc\"", want: "[\"abc\"]" },
+        RunCase { src: "startswith(\"ab\")", input: "\"abc\"", want: "[true]" },
+        RunCase { src: "startswith(\"b\")", input: "\"abc\"", want: "[false]" },
+        RunCase { src: "startswith(\"ab\")", input: "5", want: "[]!bad-argument" },
+        RunCase { src: "endswith(\"bc\")", input: "\"abc\"", want: "[true]" },
+        RunCase { src: "endswith(\"b\")", input: "\"abc\"", want: "[false]" },
+        RunCase { src: "endswith(5)", input: "\"abc\"", want: "[]!bad-argument" },
+        RunCase { src: "test(\"^a\")", input: "\"abc\"", want: "[false]" },
+        RunCase { src: "test(\"^a\")", input: "\"^abc\"", want: "[true]" },
+        RunCase { src: "test(\"a+\")", input: "\"baaad\"", want: "[true]" },
+        RunCase { src: "test(\"z\")", input: "\"abc\"", want: "[false]" },
+        RunCase { src: "test(\"(\")", input: "\"abc\"", want: "[]!bad-argument" },
+        RunCase { src: "test(5)", input: "\"abc\"", want: "[]!bad-argument" },
+        RunCase { src: "test(\"a\")", input: "5", want: "[]!bad-argument" },
+        RunCase { src: "floor", input: "1.7", want: "[1]" },
+        RunCase { src: "floor", input: "-1.5", want: "[-2]" },
+        RunCase { src: "ceil", input: "1.2", want: "[2]" },
+        RunCase { src: "ceil", input: "-1.5", want: "[-1]" },
+        RunCase { src: "sqrt", input: "4", want: "[2]" },
+        RunCase { src: "sqrt", input: "-4", want: "[null]" },
+        RunCase { src: "floor", input: "null", want: "[]!bad-argument" },
+        RunCase { src: "ceil", input: "true", want: "[]!bad-argument" },
+        RunCase { src: "sqrt", input: "\"a\"", want: "[]!bad-argument" },
+        RunCase { src: "has(\"a\")", input: "{\"a\":null}", want: "[true]" },
+        RunCase { src: "has(\"b\")", input: "{\"a\":1}", want: "[false]" },
+        RunCase { src: "has(0)", input: "[1]", want: "[true]" },
+        RunCase { src: "has(1)", input: "[1]", want: "[false]" },
+        RunCase { src: "has(-1)", input: "[1]", want: "[false]" },
+        RunCase { src: "has(\"1\")", input: "[1]", want: "[false]" },
+        RunCase { src: "has(1.5)", input: "[1]", want: "[false]" },
+        RunCase { src: "has(0)", input: "{\"a\":1}", want: "[]!cannot-index" },
+        RunCase { src: "has(\"a\")", input: "5", want: "[]!cannot-index" },
+        RunCase { src: "in([1,2])", input: "0", want: "[true]" },
+        RunCase { src: "in([1,2])", input: "2", want: "[false]" },
+        RunCase { src: "in(\"ab\")", input: "\"a\"", want: "[]!cannot-index" },
+        RunCase { src: "contains([1,2])", input: "[0,1,2,3]", want: "[true]" },
+        RunCase { src: "contains([3,1])", input: "[0,1,2,3]", want: "[true]" },
+        RunCase { src: "contains([1,9])", input: "[0,1,2,3]", want: "[false]" },
+        RunCase { src: "contains([[1,2]])", input: "[[1,2],[3]]", want: "[true]" },
+        RunCase { src: "contains([[3,1]])", input: "[[1,2],[3]]", want: "[false]" },
+        RunCase { src: "contains([2,2])", input: "[1,2]", want: "[true]" },
+        RunCase { src: "contains({\"a\":{\"b\":1}})", input: "{\"a\":{\"b\":1,\"c\":2}}",
+                  want: "[true]" },
+        RunCase { src: "contains({\"a\":2})", input: "{\"a\":{\"b\":1}}", want: "[false]" },
+        RunCase { src: "contains(\"bc\")", input: "\"abc\"", want: "[true]" },
+        RunCase { src: "contains(\"bc\")", input: "5", want: "[false]" },
+        RunCase { src: "inside(\"abc\")", input: "\"bc\"", want: "[true]" },
+        RunCase { src: "tojson", input: "{\"a\":1}", want: "[\"{\\\"a\\\":1}\"]" },
+        RunCase { src: "tojson", input: "\"a\"", want: "[\"\\\"a\\\"\"]" },
+        RunCase { src: "tostring", input: "null", want: "[\"null\"]" },
+        RunCase { src: "tostring", input: "[1]", want: "[\"[1]\"]" },
+        RunCase { src: "type", input: "[]", want: "[\"array\"]" },
+        RunCase { src: "type", input: "{}", want: "[\"object\"]" },
+        RunCase { src: "values", input: "false", want: "[false]" },
+        RunCase { src: "not", input: "0", want: "[false]" },
+        RunCase { src: "not", input: "null", want: "[true]" },
+        RunCase { src: "first(1,error(\"x\"))", input: "null", want: "[1]" },
+        RunCase { src: "last(empty)", input: "null", want: "[null]" },
+        RunCase { src: "limit(2; 1,error(\"x\"))", input: "null", want: "[1]!user-raised" },
+        RunCase { src: "limit(-1; 1,error(\"x\"))", input: "null", want: "[1]!user-raised" },
+        RunCase { src: "limit(0; 1,error(\"x\"))", input: "null", want: "[]" },
+        RunCase { src: "limit(1; 1,error(\"x\"))", input: "null", want: "[1]" },
+        RunCase { src: "until(. > 2; . + 1)", input: "1", want: "[3]" },
+        RunCase { src: "until(error; .)", input: "1", want: "[]!user-raised" },
+        RunCase { src: "until(. > 2; error(\"x\"))", input: "1", want: "[]!user-raised" },
+        RunCase { src: "until(. > 2; empty)", input: "1", want: "[]" },
+        RunCase { src: "while(. < 3; . + 1)", input: "0", want: "[0,1,2]" },
+        RunCase { src: "while(empty; .)", input: "0", want: "[]" },
+        RunCase { src: "while(error; .)", input: "0", want: "[]!user-raised" },
+        RunCase { src: "while(. < 2; error(\"x\"))", input: "1", want: "[1]!user-raised" },
+        RunCase { src: "range(0; 3)", input: "null", want: "[0,1,2]" },
+        RunCase { src: "range(3; 0; -1)", input: "null", want: "[3,2,1]" },
+        RunCase { src: "range(0; 1; 0)", input: "null", want: "[]" },
+        RunCase { src: "range(-1; 1)", input: "null", want: "[-1,0]" },
+        RunCase { src: "range(0; -1)", input: "null", want: "[]" },
+        RunCase { src: "range(\"0\"; 2)", input: "null", want: "[]!bad-argument" },
+        RunCase { src: "range(0; \"2\")", input: "null", want: "[]!bad-argument" },
+        RunCase { src: "range(0.5; 2)", input: "null", want: "[0.5,1.5]" },
+        RunCase { src: "range(0; 2.5)", input: "null", want: "[0,1,2]" },
+        RunCase { src: "range(0; 3; 0.5)", input: "null", want: "[0,0.5,1,1.5,2,2.5]" },
+        RunCase { src: "range(0; null)", input: "null", want: "[]!bad-argument" },
+        RunCase { src: "range(null; 2)", input: "null", want: "[]!bad-argument" },
+        RunCase { src: "range(0; 3; \"1\")", input: "null", want: "[]!bad-argument" },
+        RunCase { src: "error(null)", input: "null", want: "[]!user-raised" },
+        RunCase { src: "try error catch type", input: "null", want: "[\"null\"]" },
+        RunCase { src: "error(\"x\")? , 1", input: "null", want: "[1]" },
+        RunCase { src: "[1,2] | .[3]", input: "null", want: "[null]" },
+        RunCase { src: "{} | .a.b", input: "null", want: "[null]" },
+        RunCase { src: "3 | .a", input: "null", want: "[]!cannot-index" },
+        RunCase { src: "\"s\" | .a", input: "null", want: "[]!cannot-index" },
+        RunCase { src: "5 | getpath([\"a\"])", input: "null", want: "[]!cannot-index" },
+        RunCase { src: "null | getpath([\"a\"])", input: "null", want: "[null]" },
+        RunCase { src: "{} | getpath([\"a\",0])", input: "null", want: "[null]" },
+        RunCase { src: "getpath(5)", input: "null", want: "[]!bad-argument" },
+        RunCase { src: "getpath([{}])", input: "null", want: "[]!bad-argument" },
+        RunCase { src: "5 | .[]", input: "null", want: "[]!cannot-iterate" },
+        RunCase { src: "null | .[]", input: "null", want: "[]!cannot-iterate" },
+        RunCase { src: "\"ab\" | .[]", input: "null", want: "[]!cannot-iterate" },
+        RunCase { src: "{} | .[0]", input: "null", want: "[]!cannot-index" },
+        RunCase { src: "[1] | .[\"a\"]", input: "null", want: "[]!cannot-index" },
+        RunCase { src: "null | .[0]", input: "null", want: "[null]" },
+        RunCase { src: "null | .[\"a\"]", input: "null", want: "[null]" },
+        RunCase { src: ".[]", input: "[1,{\"a\":2}]", want: "[1,{\"a\":2}]" },
+        RunCase { src: "{} | .[\"a\"]", input: "null", want: "[null]" },
+        RunCase { src: "{} | .a, .a, .b", input: "null", want: "[null,null,null]" }]
+
+@test
+fn test_every_builtin_refuses_the_shapes_it_cannot_take() [io]
+    for c in shape_cases()
+        test.case("${c.src} over ${c.input}")
+        test.assert_eq_str(outputs(c.src, c.input), c.want)
+
+// ────────────────────────────────────────────────────────────────────
+// The parser's refusals, and the rows the shape tables had not pinned
+// ────────────────────────────────────────────────────────────────────
+
+// Programs the six suites beside this one do not carry: the
+// parser's refusals, and the probe rows whose answers the shape
+// tables had not pinned yet.
+
+fn refusal_cases() -> [RunCase] []
+    [
+        RunCase { src: "1e", input: "null", want: "parse:bad-number" },
+        RunCase { src: ".5", input: "null", want: "parse:bad-number" },
+        RunCase { src: "\"abc", input: "null", want: "parse:unterminated-string" },
+        RunCase { src: "\"\\q\"", input: "null", want: "parse:bad-escape" },
+        RunCase { src: "\"\\u12\"", input: "null", want: "parse:bad-escape" },
+        RunCase { src: "\"\\ud800\"", input: "null", want: "parse:bad-escape" },
+        RunCase { src: "\"\\udc00\"", input: "null", want: "parse:bad-escape" },
+        RunCase { src: "\"a\\(.b\"", input: "null", want: "parse:bad-interpolation" },
+        RunCase { src: "\"\\(", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: "(1", input: "null", want: "parse:unclosed-bracket" },
+        RunCase { src: "[1", input: "null", want: "parse:unclosed-bracket" },
+        RunCase { src: "{a: 1", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: "1 |", input: "null", want: "parse:dangling-operator" },
+        RunCase { src: "1,", input: "null", want: "parse:dangling-operator" },
+        RunCase { src: "1 +", input: "null", want: "parse:dangling-operator" },
+        RunCase { src: ".[]", input: "null", want: "[]!cannot-iterate" },
+        RunCase { src: ".[].", input: "null", want: "[]!cannot-iterate" },
+        RunCase { src: ".[\"a", input: "null", want: "parse:unclosed-bracket" },
+        RunCase { src: ".[1:2", input: "null", want: "parse:unclosed-bracket" },
+        RunCase { src: "foo", input: "null", want: "parse:unknown-function" },
+        RunCase { src: "length(1)", input: "null", want: "parse:wrong-arity" },
+        RunCase { src: "path(1)", input: "null", want: "parse:bad-path" },
+        RunCase { src: "path(.a | .a + 1)", input: "null", want: "parse:bad-path" },
+        RunCase { src: "def f", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: "def f:", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: "def f(1): .", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: "def f: 1", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: "reduce .[] (0; .)", input: "null", want: "parse:bad-pattern" },
+        RunCase { src: "reduce .[] as \$x 0", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: "foreach .[] as \$x (0; .)", input: "null", want: "[]!cannot-iterate" },
+        RunCase { src: ". as", input: "null", want: "parse:dangling-operator" },
+        RunCase { src: ". as 1 | .", input: "null", want: "parse:bad-pattern" },
+        RunCase { src: "{\$}", input: "null", want: "parse:bad-object-key" },
+        RunCase { src: "{\"a\"}", input: "null", want: "parse:bad-object-key" },
+        RunCase { src: "{1: 2}", input: "null", want: "parse:bad-object-key" },
+        RunCase { src: "{a: }", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: "if . then 1", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: "if . then 1 else 2", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: "try", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: "-", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: "\$", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: "..", input: "null", want: "[null]" },
+        RunCase { src: "...", input: "null", want: "[null]" },
+        RunCase { src: ".[1e]", input: "null", want: "parse:bad-path" },
+        RunCase { src: "\"\\u00zz\"", input: "null", want: "parse:bad-escape" },
+        RunCase { src: "@base64", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: ".a | | .b", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: "map()", input: "null", want: "parse:wrong-arity" },
+        RunCase { src: "error(", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: "{\"a\": 1,}", input: "null", want: "[{\"a\":1}]" },
+        RunCase { src: "1 2", input: "null", want: "parse:trailing-input" },
+        RunCase { src: "true 1", input: "null", want: "parse:trailing-input" },
+        RunCase { src: ".a]", input: "null", want: "parse:trailing-input" },
+        RunCase { src: "]", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: "}", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: ")", input: "null", want: "parse:unexpected-byte" },
+        RunCase { src: "\"a\" \"b\"", input: "null", want: "parse:trailing-input" },
+        RunCase { src: ".a as [\$x] | 1", input: "null", want: "[1]" },
+        RunCase { src: "reduce .[] as \$x (0; . +)", input: "null", want: "parse:dangling-operator" }]
+
+fn carried_cases() -> [RunCase] []
+    [
+        RunCase { src: "from_entries", input: "5", want: "[]!cannot-index" },
+        RunCase { src: "from_entries", input: "[[\"a\",1]]", want: "[]!bad-argument" },
+        RunCase { src: "flatten", input: "5", want: "[]!cannot-iterate" },
+        RunCase { src: "map(.+1)", input: "5", want: "[]!cannot-iterate" },
+        RunCase { src: "map_values(.+1)", input: "5", want: "[]!cannot-iterate" },
+        RunCase { src: "sort", input: "{\"b\":1,\"a\":2}", want: "[[1,2]]" },
+        RunCase { src: "sort", input: "5", want: "[]!cannot-iterate" },
+        RunCase { src: "sort_by(.a)", input: "5", want: "[]!cannot-iterate" },
+        RunCase { src: "fromjson", input: "\"[1,]\"", want: "[]!bad-argument" },
+        RunCase { src: "ascii_downcase", input: "5", want: "[]!bad-argument" },
+        RunCase { src: "ascii_upcase", input: "5", want: "[]!bad-argument" },
+        RunCase { src: "explode", input: "5", want: "[]!bad-argument" },
+        RunCase { src: "implode", input: "[55296]", want: "[\"�\"]" },
+        RunCase { src: "join(\"-\")", input: "5", want: "[]!cannot-iterate" },
+        RunCase { src: "join(\"-\")", input: "[[]]", want: "[]!bad-argument" },
+        RunCase { src: "join(\"-\")", input: "[true]", want: "[]!bad-argument" },
+        RunCase { src: "startswith(\"a\")", input: "5", want: "[]!bad-argument" },
+        RunCase { src: "endswith(\"c\")", input: "5", want: "[]!bad-argument" },
+        RunCase { src: "round", input: "\"a\"", want: "parse:unknown-function" },
+        RunCase { src: "floor", input: "\"a\"", want: "[]!bad-argument" },
+        RunCase { src: "ceil", input: "\"a\"", want: "[]!bad-argument" },
+        RunCase { src: "fabs", input: "\"a\"", want: "parse:unknown-function" },
+        RunCase { src: "abs", input: "\"a\"", want: "parse:unknown-function" },
+        RunCase { src: "abs", input: "-3.5", want: "parse:unknown-function" },
+        RunCase { src: "log", input: "\"a\"", want: "parse:unknown-function" },
+        RunCase { src: "exp", input: "\"a\"", want: "parse:unknown-function" },
+        RunCase { src: "to_number", input: "5", want: "parse:unknown-function" },
+        RunCase { src: "to_number", input: "null", want: "parse:unknown-function" },
+        RunCase { src: "to_number", input: "\"abc\"", want: "parse:unknown-function" },
+        RunCase { src: "trim", input: "5", want: "parse:unknown-function" },
+        RunCase { src: "rtrimstr(\"c\")", input: "5", want: "[5]" },
+        RunCase { src: "has(0)", input: "{}", want: "[]!cannot-index" },
+        RunCase { src: "in({\"a\":1})", input: "3", want: "[]!cannot-index" },
+        RunCase { src: "contains({\"a\":1})", input: "5", want: "[false]" },
+        RunCase { src: "contains([1])", input: "5", want: "[false]" },
+        RunCase { src: "inside([1,2])", input: "5", want: "[false]" },
+        RunCase { src: "tostring", input: "5", want: "[\"5\"]" },
+        RunCase { src: "tojson", input: "5", want: "[\"5\"]" },
+        RunCase { src: "ascii", input: "5", want: "parse:unknown-function" },
+        RunCase { src: "indices(\"a\")", input: "5", want: "parse:unknown-function" },
+        RunCase { src: "index(\"a\")", input: "5", want: "parse:unknown-function" },
+        RunCase { src: "rindex(\"a\")", input: "5", want: "parse:unknown-function" },
+        RunCase { src: "ltrimstr(5)", input: "\"a\"", want: "[\"a\"]" },
+        RunCase { src: "path(.[0])", input: "5", want: "[]!cannot-index" },
+        RunCase { src: "path(last(.a))", input: "{\"a\":1}", want: "[[\"a\"]]" },
+        RunCase { src: "path(first(.a,.b))", input: "{\"a\":1,\"b\":2}", want: "[[\"a\"]]" },
+        RunCase { src: "path(limit(2; .a,.b))", input: "{\"a\":1,\"b\":2}", want: "[[\"a\"],[\"b\"]]" },
+        RunCase { src: "path(recurse(.a))", input: "{\"a\":1}", want: "[[],[\"a\"]]!cannot-index" },
+        RunCase { src: "path(empty)", input: "null", want: "[]" },
+        RunCase { src: "[paths(scalars)]", input: "{\"a\":[1]}", want: "parse:unknown-function" },
+        RunCase { src: "getpath([\"a\"])", input: "5", want: "[]!cannot-index" },
+        RunCase { src: "getpath([0])", input: "{}", want: "[]!cannot-index" },
+        RunCase { src: "getpath([\"a\"])", input: "{}", want: "[null]" },
+        RunCase { src: "9 % 0", input: "null", want: "[]!divide-by-zero" },
+        RunCase { src: "1 / 0", input: "null", want: "[]!divide-by-zero" },
+        RunCase { src: "1.0 / 0", input: "null", want: "[]!divide-by-zero" },
+        RunCase { src: "\"a\" + 1", input: "null", want: "[]!type-mismatch" },
+        RunCase { src: "1 + \"a\"", input: "null", want: "[]!type-mismatch" },
+        RunCase { src: "{} + 1", input: "null", want: "[]!type-mismatch" },
+        RunCase { src: "[] - 1", input: "null", want: "[]!type-mismatch" },
+        RunCase { src: "\"a\" - \"b\"", input: "null", want: "[]!type-mismatch" },
+        RunCase { src: "\"a\" * 2", input: "null", want: "[\"aa\"]" },
+        RunCase { src: "2 * \"a\"", input: "null", want: "[\"aa\"]" },
+        RunCase { src: "{}\"a\"", input: "null", want: "parse:trailing-input" },
+        RunCase { src: "\"a\" / 2", input: "null", want: "[]!type-mismatch" },
+        RunCase { src: "\"a\" % 2", input: "null", want: "[]!type-mismatch" },
+        RunCase { src: "1 * {}", input: "null", want: "[]!type-mismatch" },
+        RunCase { src: "[1] * 2", input: "null", want: "[]!type-mismatch" },
+        RunCase { src: "{} * {}.a", input: "null", want: "[]!type-mismatch" },
+        RunCase { src: "\"ab\" * 2", input: "null", want: "[\"abab\"]" },
+        RunCase { src: "until(. > 2; . + 1)", input: "0", want: "[3]" },
+        RunCase { src: "range(0; 6; 2)", input: "null", want: "[0,2,4]" },
+        RunCase { src: "recurse(.a)",
+        input: "{\"a\":{\"a\":1}}",
+        want: "[{\"a\":{\"a\":1}},{\"a\":1},1]!cannot-index" },
+        RunCase { src: "..", input: "5", want: "[5]" },
+        RunCase { src: "nth(0; 1,2)", input: "null", want: "parse:unknown-function" },
+        RunCase { src: "nth(5; 1)", input: "null", want: "parse:unknown-function" },
+        RunCase { src: "last(1,error(\"x\"))", input: "null", want: "[]!user-raised" },
+        RunCase { src: "limit(0; error)", input: "null", want: "[]" },
+        RunCase { src: "getpath([\"a\",\"b\"])", input: "{\"a\":{\"b\":1}}", want: "[1]" },
+        RunCase { src: "error({a:1})", input: "null", want: "[]!user-raised" },
+        RunCase { src: "def f: 1; f", input: "null", want: "[1]" },
+        RunCase { src: "def f(\$x): \$x; f(2)", input: "null", want: "[2]" },
+        RunCase { src: "def f(\$x): f(\$x); f(1)", input: "null", want: "[]!over-budget" },
+        RunCase { src: "foreach [1,2][] as \$x (0; . + \$x; .)", input: "null", want: "[1,3]" },
+        RunCase { src: "reduce [1,2][] as \$x (0; . + \$x)", input: "null", want: "[3]" },
+        RunCase { src: "if 1 then 2 end", input: "null", want: "[2]" },
+        RunCase { src: "if empty then 2 else 3 end", input: "null", want: "[]" },
+        RunCase { src: "if error then 2 else 3 end", input: "null", want: "[]!user-raised" },
+        RunCase { src: "try error catch .", input: "null", want: "[null]" },
+        RunCase { src: "try (1,error(\"x\")) catch .", input: "null", want: "[1,\"x\"]" },
+        RunCase { src: "\"\\(1)\"", input: "null", want: "[\"1\"]" },
+        RunCase { src: "\"\\u0041\"", input: "null", want: "[\"A\"]" }]
+
+@test
+fn test_every_program_the_parser_refuses_says_why() [io]
+    for c in refusal_cases()
+        test.case("${c.src}")
+        test.assert_eq_str(outputs(c.src, c.input), c.want)
+
+@test
+fn test_every_carried_row_answers_what_the_probe_recorded() [io]
+    for c in carried_cases()
+        test.case("${c.src} over ${c.input}")
+        test.assert_eq_str(outputs(c.src, c.input), c.want)

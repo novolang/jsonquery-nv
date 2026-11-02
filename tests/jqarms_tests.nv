@@ -1,0 +1,1458 @@
+// jqarms_tests.nv — the arms the seven suites beside it do not reach, walked
+// one row each, so the evaluator's error paths and the parser's scan are
+// measured rather than assumed.
+//
+// WHAT THIS SUITE IS FOR.  `jqcover_tests.nv` walks the surface a program
+// can spell; what it leaves behind is the other half of every rule: the
+// fault a whole-array builtin carries out, the arm `if` takes when the
+// condition raises, the number a budget stops at, the escape the scanner
+// reads backwards, and the text a renderer writes for a node nothing else
+// renders.  Every row here was measured against the package before it was
+// written down, and each one names the truth it pins: no match, a match
+// that is `null`, or an error.
+
+use std.test
+use std.json
+use std.list
+use std.str
+use jpquery
+use jqbuiltin
+use jqerror
+use jqeval
+use jqeval.{ JqLimits }
+use jqfmt
+use jqlang
+
+// A JSON value from its text, with the null value for text that is not
+// JSON — every input below is a literal, so the fallback is unreachable.
+fn value_of(text: Str) -> JsonValueH
+    json.parse(text) ?? jqeval.null_value()
+
+// What a program produces, as one line: `[out,out]`, with `!kind`
+// appended when the run failed.  The rendering the two suites beside
+// this one share.
+fn outputs(src: Str, input: Str) -> Str []
+    match jqlang.parse(src)
+        Err(f) => "parse:" + jqerror.fault_kind_name(f.kind)
+        Ok(p)  =>
+            let o = jqeval.run(p, value_of(input))
+            var parts: [Str] = []
+            for v in o.values
+                list.push(parts, json.stringify(v))
+            let body = "[" + str.join(parts, ",") + "]"
+            match o.fault
+                None    => body
+                Some(e) => body + "!" + jqerror.error_kind_name(e.kind)
+
+// The same program under a budget the caller chose, so the three
+// ceilings `JqLimits` carries are each measured.
+fn limited(src: Str, input: Str, outs: Int, steps: Int, depth: Int) -> Str []
+    match jqlang.parse(src)
+        Err(f) => "parse:" + jqerror.fault_kind_name(f.kind)
+        Ok(p)  =>
+            let lim = JqLimits { max_outputs: outs, max_steps: steps, max_depth: depth }
+            let o = jqeval.run_with(p, value_of(input), jqeval.env_with(lim))
+            var parts: [Str] = []
+            for v in o.values
+                list.push(parts, json.stringify(v))
+            let body = "[" + str.join(parts, ",") + "]"
+            match o.fault
+                None    => body
+                Some(e) => body + "!" + jqerror.error_kind_name(e.kind)
+
+// Everything a parsed program answers about itself, one line: the
+// render, the free variables, the defined names, the builtins called,
+// the depth, the offset the root starts at, and whether the filter is a
+// path expression.  One row per construct, so a renderer arm nothing
+// else renders is asserted rather than merely executed.
+fn tour(src: Str) -> Str []
+    match jqlang.parse(src)
+        Err(f) => "parse:" + jqerror.fault_kind_name(f.kind)
+        Ok(p)  =>
+            var calls: [Str] = []
+            for b in jqlang.called_builtins(p)
+                list.push(calls, jqbuiltin.name(b) + "/" + str.from_int(jqbuiltin.arity(b)))
+            var flag = "no"
+            if jqlang.is_path_expression(p.root)
+                flag = "yes"
+            "render=${jqlang.render(p)} | vars=${str.join(jqlang.free_variables(p), ",")} | defs=${str.join(jqlang.defined_names(p), ",")} | calls=${str.join(calls, ",")} | depth=${str.from_int(jqlang.depth(p.root))} | at=${str.from_int(jqlang.position(p.root))} | path=${flag}"
+
+// The shape's own name, so a row says which of the six a value is.
+fn shape_name(v: JsonValueH) -> Str []
+    match jqfmt.shape(v)
+        JqShapeRows   => "rows"
+        JqShapeRow    => "row"
+        JqShapeColumn => "column"
+        JqShapeScalar => "scalar"
+        JqShapeEmpty  => "empty"
+        JqShapeRagged => "ragged"
+
+// What all four table entry points answer for one value, in one line.
+fn fmt(text: Str) -> Str []
+    let v = value_of(text)
+    var g = "-"
+    match jqfmt.grid(v)
+        None       =>
+            g = "-"
+        Some(rows) =>
+            g = "g${str.from_int(list.len(rows))}"
+    var p = "-"
+    match jqfmt.table_problem(v)
+        None    =>
+            p = "-"
+        Some(m) =>
+            p = "p:${m}"
+    var t = "-"
+    match jqfmt.tabular(v)
+        None    =>
+            t = "-"
+        Some(m) =>
+            t = "t:${m}"
+    var c = "-"
+    match jqfmt.csv_out(v)
+        None    =>
+            c = "-"
+        Some(m) =>
+            c = "c:${m}"
+    "shape=${shape_name(v)} ${g} ${p} ${t} ${c}"
+
+// Both path calls over one RFC 9535 query and one input: what jq's four
+// rules answer, fault included, and what the delegate answers unchanged.
+fn sel(qtext: Str, input: Str) -> Str []
+    match jpquery.parse(qtext)
+        Err(_) => "bad-query"
+        Ok(q)  =>
+            let o = jqeval.select_path(q, value_of(input))
+            var parts: [Str] = []
+            for v in o.values
+                list.push(parts, json.stringify(v))
+            let body = "[" + str.join(parts, ",") + "]"
+            var jq = body
+            match o.fault
+                None    =>
+                    jq = body
+                Some(e) =>
+                    jq = body + "!" + jqerror.error_kind_name(e.kind)
+            var rfc: [Str] = []
+            for v in jqeval.select_path_rfc(q, value_of(input))
+                list.push(rfc, json.stringify(v))
+            "jq=${jq} rfc=[${str.join(rfc, ",")}]"
+
+// One outcome as `outputs` renders one, for the rows that build their
+// program out of the public enums instead of parsing text.
+fn outputs_of(f: jqlang.JqFilter, input: Str, ev: jqeval.JqEnv) -> Str []
+    let o = jqeval.apply(f, value_of(input), ev)
+    var parts: [Str] = []
+    for v in o.values
+        list.push(parts, json.stringify(v))
+    let body = "[" + str.join(parts, ",") + "]"
+    match o.fault
+        None    => body
+        Some(e) => body + "!" + jqerror.error_kind_name(e.kind)
+
+// ────────────────────────────────────────────────────────────────────
+// The evaluator's arms, one row each
+// ────────────────────────────────────────────────────────────────────
+
+// One row of the arm sweep: a program, the input it is run on, and the
+// one line `outputs` must answer.
+struct RunCase
+    src: Str
+    input: Str
+    want: Str
+
+// The arms a run takes when a value is the wrong type, when a filter
+// raises where a rule says the fault travels, when a stream ends, and
+// when the container is the wrong one.  Each row is the truth it pins:
+// `[]` is no output, `!kind` is an error, and a value is a match.
+fn arm_cases() -> [RunCase] []
+    [
+        RunCase { src: "error(\"x\") and 1", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "true and error(\"x\")", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "false and 1", input: "null",
+                  want: "[false]" },
+        RunCase { src: "error(\"x\") or 1", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "false or error(\"x\")", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "true or 1", input: "null",
+                  want: "[true]" },
+        RunCase { src: "error(\"x\") + 1", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "1 + error(\"x\")", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "null + 1", input: "null",
+                  want: "[1]" },
+        RunCase { src: "1 + null", input: "null",
+                  want: "[1]" },
+        RunCase { src: "[1,2,3] - [2]", input: "null",
+                  want: "[[1,3]]" },
+        RunCase { src: "{\"a\":1} * {\"b\":2}", input: "null",
+                  want: "[{\"a\":1,\"b\":2}]" },
+        RunCase { src: "{\"a\":{\"b\":1}} * {\"a\":{\"c\":2}}", input: "null",
+                  want: "[{\"a\":{\"b\":1,\"c\":2}}]" },
+        RunCase { src: "{\"a\":1} * {\"a\":{\"c\":2}}", input: "null",
+                  want: "[{\"a\":{\"c\":2}}]" },
+        RunCase { src: "\"ab\" * 0", input: "null",
+                  want: "[\"\"]" },
+        RunCase { src: "\"ab\" * 1.5", input: "null",
+                  want: "[\"ab\"]" },
+        RunCase { src: "\"a,b\" / \",\"", input: "null",
+                  want: "[[\"a\",\"b\"]]" },
+        RunCase { src: "1 % 0.3", input: "null",
+                  want: "[0.10000000000000009]" },
+        RunCase { src: "[1.5] | implode", input: "null",
+                  want: "[\"\\u0001\"]" },
+        RunCase { src: "[null] | implode", input: "null",
+                  want: "[]!bad-argument" },
+        RunCase { src: "5 | with_entries(.)", input: "null",
+                  want: "[]!cannot-index" },
+        RunCase { src: "1 | add", input: "null",
+                  want: "[]!cannot-iterate" },
+        RunCase { src: "1 | any", input: "null",
+                  want: "[]!cannot-iterate" },
+        RunCase { src: "1 | all", input: "null",
+                  want: "[]!cannot-iterate" },
+        RunCase { src: "1 | any(.)", input: "null",
+                  want: "[]!cannot-iterate" },
+        RunCase { src: "1 | all(.)", input: "null",
+                  want: "[]!cannot-iterate" },
+        RunCase { src: "select(error(\"x\"))", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "[1,2] | max", input: "null",
+                  want: "[2]" },
+        RunCase { src: "[{\"a\":2},{\"a\":1}] | min_by(.a)", input: "null",
+                  want: "[{\"a\":1}]" },
+        RunCase { src: "[{\"a\":2},{\"a\":1}] | max_by(.a)", input: "null",
+                  want: "[{\"a\":2}]" },
+        RunCase { src: "[1,2] | min", input: "null",
+                  want: "[1]" },
+        RunCase { src: "{(1): 2}", input: "null",
+                  want: "[]!type-mismatch" },
+        RunCase { src: "{(error(\"x\")): 2}", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "{a: error(\"x\")}", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "{a: 1, a: 2}", input: "null",
+                  want: "[{\"a\":2}]" },
+        RunCase { src: "[error(\"x\")]", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "(error(\"x\"), 1)", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "if true then error(\"x\") else 1 end", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "if false then 1 else error(\"x\") end", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "-\"a\"", input: "null",
+                  want: "[]!type-mismatch" },
+        RunCase { src: "try (def f: f; f) catch 1", input: "null",
+                  want: "[]!over-budget" },
+        RunCase { src: "reduce 1 as \$x (error(\"x\"); .)", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "reduce [1,2][] as \$x (empty; .)", input: "null",
+                  want: "[]" },
+        RunCase { src: "reduce [1,2][] as \$x (0; empty)", input: "null",
+                  want: "[null]" },
+        RunCase { src: "reduce [1,2][] as \$x (0; if \$x == 1 then empty else . + \$x end)",
+                  input: "null", want: "[2]" },
+        RunCase { src: "reduce (1,2) as \$x (0,10; . + \$x)", input: "null",
+                  want: "[3,13]" },
+        RunCase { src: "reduce (1, error(\"x\")) as \$x (0,5; .)", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "reduce 1 as \$x (0, error(\"z\"); . + \$x)", input: "null",
+                  want: "[1]!user-raised" },
+        RunCase { src: "reduce 1 as \$x (empty, 5; . + \$x)", input: "null",
+                  want: "[6]" },
+        RunCase { src: "reduce [1,2][] as \$x (0; error(\"x\"))", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "reduce (1, error(\"x\")) as \$x (0; empty)", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "foreach [1,2][] as \$x (error(\"x\"); .; .)", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "foreach [1,2][] as \$x (empty; .; .)", input: "null",
+                  want: "[]" },
+        RunCase { src: "foreach [1,2][] as \$x (0; empty; .)", input: "null",
+                  want: "[]" },
+        RunCase { src: "foreach (1,2) as \$x (0,10; . + \$x)", input: "null",
+                  want: "[1,3,11,13]" },
+        RunCase { src: "foreach (1, error(\"x\")) as \$x (0,5; . + \$x)", input: "null",
+                  want: "[1]!user-raised" },
+        RunCase { src: "foreach 1 as \$x (0, error(\"z\"); . + \$x)", input: "null",
+                  want: "[1]!user-raised" },
+        RunCase { src: "foreach 1 as \$x (empty, 5; . + \$x)", input: "null",
+                  want: "[6]" },
+        RunCase { src: "foreach (1,2) as \$x (0; if \$x == 1 then empty else . end; \"E\")",
+                  input: "null", want: "[\"E\"]" },
+        RunCase { src: "foreach [1,2][] as \$x (0; .; error(\"x\"))", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "foreach [1,2][] as \$x (0; error(\"x\"); .)", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: ". as \$x | error(\"x\")", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: ". as {(error(\"x\")): \$y} | 1", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "\"a\\(error(\"x\"))\"", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "1,2", input: "null",
+                  want: "[1,2]" },
+        RunCase { src: "range(0;10)", input: "null",
+                  want: "[0,1,2,3,4,5,6,7,8,9]" },
+        RunCase { src: "path(.a)", input: "{\"a\":1}",
+                  want: "[[\"a\"]]" },
+        RunCase { src: "path(recurse(.a))", input: "{\"a\":1}",
+                  want: "[[],[\"a\"]]!cannot-index" },
+        RunCase { src: "path(recurse(empty))", input: "null",
+                  want: "[[]]" },
+        RunCase { src: "path(.a, .b)", input: "{\"a\":1,\"b\":2}",
+                  want: "[[\"a\"],[\"b\"]]" },
+        RunCase { src: "path(first(.a) | .b)", input: "{\"a\":{\"b\":1}}",
+                  want: "[[\"a\",\"b\"]]" },
+        RunCase { src: "path(getpath(error(\"x\")))", input: "null",
+                  want: "[]!user-raised" },
+        RunCase { src: "path(getpath(empty))", input: "null",
+                  want: "[]" },
+        RunCase { src: "path(getpath([0.5]))", input: "null",
+                  want: "[[0]]" },
+        RunCase { src: "getpath([\"a\",0])", input: "{\"a\":1}",
+                  want: "[]!cannot-index" },
+        RunCase { src: "getpath([0.5])", input: "null",
+                  want: "[null]" },
+        RunCase { src: "path(.[])", input: "[1,2]",
+                  want: "[[0],[1]]" },
+        RunCase { src: "paths", input: "{\"a\":[1]}",
+                  want: "[[\"a\"],[\"a\",0]]" },
+        RunCase { src: "[1,2] | .[0:1]", input: "null",
+                  want: "[[1]]" },
+        RunCase { src: "null | .[0:1]", input: "null",
+                  want: "[null]" },
+        RunCase { src: "\"abc\" | .[0:2]", input: "null",
+                  want: "[\"ab\"]" },
+        RunCase { src: "path(.[1:2])", input: "[1,2,3]",
+                  want: "[[{\"start\":1,\"end\":2}]]" },
+        RunCase { src: ".. | .a?", input: "[[1]]",
+                  want: "[]" },
+        RunCase { src: "[.[] | select(. > 1)]", input: "[1,2,3]",
+                  want: "[[2,3]]" },
+        RunCase { src: "1 | .[]?", input: "null",
+                  want: "[]" },
+        RunCase { src: "[[1,2]][0] | .[0]", input: "null",
+                  want: "[1]" },
+        RunCase { src: "path(.[]?)", input: "1",
+                  want: "[]" },
+        RunCase { src: "path(.a + 1)", input: "{\"a\":1}",
+                  want: "parse:bad-path" },
+        RunCase { src: "path(.a | error)", input: "{\"a\":1}",
+                  want: "parse:bad-path" },
+        RunCase { src: "def g: .a; path(g)", input: "{\"a\":1}",
+                  want: "parse:bad-path" },
+        RunCase { src: "path(-.a)", input: "{\"a\":1}",
+                  want: "parse:bad-path" },
+        RunCase { src: "path([.a])", input: "{\"a\":1}",
+                  want: "parse:bad-path" },
+        RunCase { src: "path(.a as \$x | \$x)", input: "{\"a\":1}",
+                  want: "parse:bad-path" },
+        RunCase { src: "path(select(.a))", input: "{\"a\":1}",
+                  want: "[[]]" },
+        RunCase { src: "path(.a // 1)", input: "{\"a\":1}",
+                  want: "parse:bad-path" },
+        RunCase { src: "path(if .a then .b else .c end)", input: "{\"a\":1,\"b\":2,\"c\":3}",
+                  want: "[[\"b\"]]" },
+        RunCase { src: "path(limit(1; .a))", input: "{\"a\":1}",
+                  want: "[[\"a\"]]" },
+        RunCase { src: "path(last(.a))", input: "{\"a\":1}",
+                  want: "[[\"a\"]]" },
+        RunCase { src: "path(..)", input: "{\"a\":1}",
+                  want: "[[],[\"a\"]]" },
+        RunCase { src: "path(.a // .b)", input: "{\"a\":1,\"b\":2}",
+                  want: "[[\"a\"]]" },
+        RunCase { src: "path(.a?)", input: "{\"a\":1}",
+                  want: "[[\"a\"]]" },
+        RunCase { src: "path(try .a)", input: "{\"a\":1}",
+                  want: "[[\"a\"]]" },
+        RunCase { src: "path(empty)", input: "null",
+                  want: "[]" },
+        RunCase { src: "path(first(.a))", input: "{\"a\":1}",
+                  want: "[[\"a\"]]" },
+        RunCase { src: "def f: .a; def g: f; g", input: "{\"a\":9}",
+                  want: "[9]" },
+        RunCase { src: "def f(\$x; \$y): \$x + \$y; f(1; 2)", input: "null",
+                  want: "[3]" },
+        RunCase { src: "def f(g): g; f(.a)", input: "{\"a\":1}",
+                  want: "[1]" },
+        RunCase { src: "has(empty)", input: "{\"a\":1}",
+                  want: "[]" },
+        RunCase { src: "has(error)", input: "{\"a\":1}",
+                  want: "[]!user-raised" },
+        RunCase { src: "has(\"a\", \"b\")", input: "{\"a\":1}",
+                  want: "[true]" },
+        RunCase { src: "contains([{\"b\":1}])", input: "[{\"a\":1}]",
+                  want: "[false]" },
+        RunCase { src: "contains({\"b\":1})", input: "{\"a\":1}",
+                  want: "[false]" },
+        RunCase { src: "inside([{\"a\":1}])", input: "[{\"a\":1,\"b\":2}]",
+                  want: "[false]" },
+        RunCase { src: "\"\\u00e9\" | .[0:1] | explode", input: "null",
+                  want: "[[233]]" },
+        RunCase { src: "\"\\u00e9\" | .[1:2] | explode", input: "null",
+                  want: "[[]]" },
+        RunCase { src: "\"\\u00e9\" | explode", input: "null",
+                  want: "[[233]]" },
+        RunCase { src: ". as {(\"a\"): \$v} | \$v", input: "{}",
+                  want: "[null]" },
+        RunCase { src: ". as {(.k): \$v} | \$v", input: "{\"k\":1}",
+                  want: "[]!type-mismatch" },
+        RunCase { src: ". as {\$a, \$b} | \$a", input: "{\"a\":1}",
+                  want: "[1]" },
+        RunCase { src: ". as [\$a, \$b] | \$b", input: "[1]",
+                  want: "[null]" },
+        RunCase { src: ". as [\$a, \$b] | \$b", input: "{}",
+                  want: "[null]" },
+        RunCase { src: "1 | .a", input: "null",
+                  want: "[]!cannot-index" },
+        RunCase { src: "1 | .[0]", input: "null",
+                  want: "[]!cannot-index" },
+        RunCase { src: "{} | .[0]", input: "null",
+                  want: "[]!cannot-index" },
+        RunCase { src: "[1] | .a", input: "null",
+                  want: "[]!cannot-index" },
+        RunCase { src: "\"a\" * -1", input: "null",
+                  want: "[\"\"]" },
+        RunCase { src: "\"ab\" * 1.5", input: "null",
+                  want: "[\"ab\"]" },
+        RunCase { src: "{} * {}", input: "null",
+                  want: "[{}]" },
+        RunCase { src: "[] * []", input: "null",
+                  want: "[]!type-mismatch" },
+        RunCase { src: "{} * 1", input: "null",
+                  want: "[]!type-mismatch" },
+        RunCase { src: "[1] + 2", input: "null",
+                  want: "[]!type-mismatch" },
+        RunCase { src: "\"a\" - \"b\"", input: "null",
+                  want: "[]!type-mismatch" },
+        RunCase { src: "{\"a\":1} - {\"b\":2}", input: "null",
+                  want: "[]!type-mismatch" },
+        RunCase { src: "1 - \"a\"", input: "null",
+                  want: "[]!type-mismatch" },
+        RunCase { src: "[1,2] - [5]", input: "null",
+                  want: "[[1,2]]" },
+        RunCase { src: "{\"a\":1,\"b\":2} - {\"a\":1}", input: "null",
+                  want: "[]!type-mismatch" },
+        RunCase { src: "[{\"b\":1,\"a\":2}] == [{\"a\":2,\"b\":1}]", input: "null",
+                  want: "[true]" },
+        RunCase { src: "[{\"b\":1},{\"a\":1}] | sort", input: "null",
+                  want: "[[{\"a\":1},{\"b\":1}]]" },
+        RunCase { src: "[[1,2]] == [[1,3]]", input: "null",
+                  want: "[false]" },
+        RunCase { src: "[[1,2],[1,3]] | sort", input: "null",
+                  want: "[[[1,2],[1,3]]]" },
+        RunCase { src: "[\"b\",\"a\"] | sort", input: "null",
+                  want: "[[\"a\",\"b\"]]" },
+        RunCase { src: "1 == 1.0", input: "null",
+                  want: "[true]" },
+        RunCase { src: "1.5 == 1.5", input: "null",
+                  want: "[true]" },
+        RunCase { src: "1 < 1.0", input: "null",
+                  want: "[false]" },
+        RunCase { src: "null < false", input: "null",
+                  want: "[true]" },
+        RunCase { src: "false < true", input: "null",
+                  want: "[true]" },
+        RunCase { src: "1 < \"a\"", input: "null",
+                  want: "[true]" },
+        RunCase { src: "\"a\" < []", input: "null",
+                  want: "[true]" },
+        RunCase { src: "[] < {}", input: "null",
+                  want: "[true]" },
+        RunCase { src: "[1,2] < [1,3]", input: "null",
+                  want: "[true]" },
+        RunCase { src: "{\"a\":1} < {\"b\":1}", input: "null",
+                  want: "[true]" },
+        RunCase { src: "[1,\"a\"] | sort", input: "null",
+                  want: "[[1,\"a\"]]" },
+        RunCase { src: "[1,null,false] | sort", input: "null",
+                  want: "[[null,false,1]]" },
+        RunCase { src: "[{}] == [{}]", input: "null",
+                  want: "[true]" },
+        RunCase { src: "[[1],[2]] | group_by(.)", input: "null",
+                  want: "[[[[1]],[[2]]]]" },
+        RunCase { src: "[{\"a\":1},{\"a\":1}] | unique", input: "null",
+                  want: "[[{\"a\":1}]]" },
+        RunCase { src: "[1.5,1,2] | min_by(.)", input: "null",
+                  want: "[1]" },
+        RunCase { src: "[1.5,1,2] | max_by(.)", input: "null",
+                  want: "[2]" },
+        RunCase { src: "[1] | min_by(.)", input: "null",
+                  want: "[1]" },
+        RunCase { src: "[1] | max_by(.)", input: "null",
+                  want: "[1]" },
+        RunCase { src: "[] | min", input: "null",
+                  want: "[null]" },
+        RunCase { src: "[] | max", input: "null",
+                  want: "[null]" },
+        RunCase { src: "[] | min_by(.)", input: "null",
+                  want: "[null]" },
+        RunCase { src: "[] | max_by(.)", input: "null",
+                  want: "[null]" },
+        RunCase { src: "[] | add", input: "null",
+                  want: "[null]" },
+        RunCase { src: "[] | any", input: "null",
+                  want: "[false]" },
+        RunCase { src: "[] | all", input: "null",
+                  want: "[true]" },
+        RunCase { src: "[] | any(.)", input: "null",
+                  want: "[false]" },
+        RunCase { src: "[] | all(.)", input: "null",
+                  want: "[true]" },
+        RunCase { src: "[[1],[2]] | add", input: "null",
+                  want: "[[1,2]]" },
+        RunCase { src: "[{\"a\":1},{\"b\":2}] | add", input: "null",
+                  want: "[{\"a\":1,\"b\":2}]" },
+        RunCase { src: "[\"a\",\"b\"] | add", input: "null",
+                  want: "[\"ab\"]" },
+        RunCase { src: "[1,\"a\"] | add", input: "null",
+                  want: "[]!type-mismatch" },
+        RunCase { src: "[true,false] | add", input: "null",
+                  want: "[]!type-mismatch" },
+        RunCase { src: "[null,null] | add", input: "null",
+                  want: "[null]" },
+        RunCase { src: "{\"a\":1} | with_entries(.)", input: "null",
+                  want: "[{\"a\":1}]" },
+        RunCase { src: "range(0;3)", input: "null",
+                  want: "[0,1,2]" },
+        RunCase { src: "range(3;0)", input: "null",
+                  want: "[]" },
+        RunCase { src: "range(0;3;-1)", input: "null",
+                  want: "[]" },
+        RunCase { src: "range(0;1;0.5)", input: "null",
+                  want: "[0,0.5]" },
+        RunCase { src: "range(0;\"2\")", input: "null",
+                  want: "[]!bad-argument" },
+        RunCase { src: "[limit(2; repeat(.))]", input: "1",
+                  want: "parse:unknown-function" },
+        // An index has jq's two answers, one type at a time: a member
+        // that is not there is `null`, and a value that cannot have
+        // members is an error — the same split for `.[i]` and a slice.
+        RunCase { src: ".a", input: "\"x\"",
+                  want: "[]!cannot-index" },
+        RunCase { src: ".a", input: "5",
+                  want: "[]!cannot-index" },
+        RunCase { src: ".a", input: "true",
+                  want: "[]!cannot-index" },
+        RunCase { src: ".a", input: "[1]",
+                  want: "[]!cannot-index" },
+        RunCase { src: ".a", input: "null",
+                  want: "[null]" },
+        RunCase { src: ".a", input: "{}",
+                  want: "[null]" },
+        RunCase { src: ".a", input: "{\"b\":1}",
+                  want: "[null]" },
+        RunCase { src: ".a", input: "{\"a\":null}",
+                  want: "[null]" },
+        RunCase { src: ".a", input: "{\"a\":1}",
+                  want: "[1]" },
+        RunCase { src: ".[0]", input: "\"x\"",
+                  want: "[]!cannot-index" },
+        RunCase { src: ".[0]", input: "5",
+                  want: "[]!cannot-index" },
+        RunCase { src: ".[0]", input: "{\"a\":1}",
+                  want: "[]!cannot-index" },
+        RunCase { src: ".[0]", input: "[]",
+                  want: "[null]" },
+        RunCase { src: ".[-1]", input: "[1,2]",
+                  want: "[2]" },
+        RunCase { src: ".a.b.c", input: "{}",
+                  want: "[null]" },
+        RunCase { src: ".a.b.c", input: "{\"a\":null}",
+                  want: "[null]" },
+        RunCase { src: ".a.b.c", input: "{\"a\":5}",
+                  want: "[]!cannot-index" },
+        RunCase { src: ".[1:2]", input: "\"x\"",
+                  want: "[\"\"]" },
+        RunCase { src: ".[1:2]", input: "5",
+                  want: "[]!cannot-index" },
+        RunCase { src: ".[1:2]", input: "null",
+                  want: "[null]" },
+        // The comparisons jq defines over a whole container, and the
+        // two ranks that are equal to themselves.
+        RunCase { src: "null == null", input: "null",
+                  want: "[true]" },
+        RunCase { src: "true == true", input: "null",
+                  want: "[true]" },
+        RunCase { src: "[] < [1]", input: "null",
+                  want: "[true]" },
+        RunCase { src: "[1] < [1,2]", input: "null",
+                  want: "[true]" },
+        RunCase { src: "[1,2] < [1]", input: "null",
+                  want: "[false]" },
+        RunCase { src: "{} < {\"a\":1}", input: "null",
+                  want: "[true]" },
+        RunCase { src: "{\"a\":1} < {}", input: "null",
+                  want: "[false]" },
+        RunCase { src: "1 != 2", input: "null",
+                  want: "[true]" },
+        RunCase { src: "1 <= 1", input: "null",
+                  want: "[true]" },
+        RunCase { src: "1 >= 2", input: "null",
+                  want: "[false]" },
+        RunCase { src: "null < null", input: "null",
+                  want: "[false]" },
+        RunCase { src: "null <= null", input: "null",
+                  want: "[true]" },
+        RunCase { src: "false < true", input: "null",
+                  want: "[true]" },
+        // Numbers at the edge of the int-and-float split: one too large
+        // for an int stays a float, and `flatten`'s count is read as
+        // one of them, where an infinity and a NaN both mean "all of it".
+        RunCase { src: "1e300", input: "null",
+                  want: "[1e300]" },
+        RunCase { src: "[1] | flatten(1.5)", input: "null",
+                  want: "[[1]]" },
+        RunCase { src: "[1] | flatten(1e308 * 10)", input: "null",
+                  want: "[[1]]" },
+        RunCase { src: "[1] | flatten((1e308 * 10) - (1e308 * 10))", input: "null",
+                  want: "[[1]]" },
+        RunCase { src: "1e300 % 1", input: "null",
+                  want: "[1e300]" },
+        // A count nothing can repeat is a type mismatch; one with a
+        // fraction is truncated the way jq truncates it.
+        RunCase { src: "\"ab\" * 1.5", input: "null",
+                  want: "[\"ab\"]" },
+        RunCase { src: "\"ab\" * 1e300", input: "null",
+                  want: "[]!type-mismatch" },
+        RunCase { src: "getpath([1e300])", input: "null",
+                  want: "[]!bad-argument" },
+        // A computed pattern key has to be a string, and the fault an
+        // update raises travels out of the reducer that ran it.
+        RunCase { src: "reduce [1][] as {(1): \$b} (0; .)", input: "null",
+                  want: "[]!type-mismatch" },
+        RunCase { src: "foreach [1][] as {(1): \$b} (0; .; .)", input: "null",
+                  want: "[]!type-mismatch" },
+        RunCase { src: "1 | while(if . == 2 then error(\"x\") else . < 3 end; . + 1)", input: "null",
+                  want: "[1]!user-raised" },
+        // The members of an object nothing else walks: the empty name,
+        // and a value that is `null`.
+        RunCase { src: "{\"\":1} | with_entries(.)", input: "null",
+                  want: "[{\"\":1}]" },
+        RunCase { src: "{\"a\":null} | with_entries(.)", input: "null",
+                  want: "[{\"a\":null}]" },
+        // A string slices by code point, and two halves of a surrogate
+        // pair still decode to the one character they spell.
+        RunCase { src: "\"\\u00e9\" | .[1:2] | explode", input: "null",
+                  want: "[[]]" },
+        RunCase { src: "\"\\ud83d\\ude00\" | explode", input: "null",
+                  want: "[[128512]]" },
+        // The comma's two halves in order, and the first output of a
+        // stream a builtin needs only one of.
+        RunCase { src: "1 | (2,3), (4,5)", input: "null",
+                  want: "[2,3,4,5]" },
+        RunCase { src: "first(1,2)", input: "null",
+                  want: "[1]" },
+        // A def seen only inside the body that declares it, and an
+        // argument whose own body has to skip the entry it is.
+        RunCase { src: "def f: (def g: 1; g); f", input: "null",
+                  want: "[1]" },
+        RunCase { src: "def one: 1; def id(f): f; id(one)", input: "null",
+                  want: "[1]" },
+        // `..` as a path: the node itself and everything under it,
+        // pre-order, over a container, an empty object and a scalar.
+        RunCase { src: "path(..)", input: "{\"a\":{\"b\":1}}",
+                  want: "[[],[\"a\"],[\"a\",\"b\"]]" },
+        RunCase { src: "path(..)", input: "{}",
+                  want: "[[]]" },
+        RunCase { src: "path(..)", input: "5",
+                  want: "[[]]" },
+        RunCase { src: "[path(..)]", input: "{\"a\":[1]}",
+                  want: "[[[],[\"a\"],[\"a\",0]]]" },
+        RunCase { src: "[paths]", input: "{\"a\":[1]}",
+                  want: "[[[\"a\"],[\"a\",0]]]" },
+        RunCase { src: "path(.a | .b)", input: "5",
+                  want: "[]!cannot-index" },
+        RunCase { src: "path(.a, .b)", input: "5",
+                  want: "[]!cannot-index" },
+        RunCase { src: "first(repeat(.))", input: "1",
+                  want: "parse:unknown-function" }]
+
+@test
+fn test_every_arm_answers_what_was_measured() [io]
+    for c in arm_cases()
+        test.case("${c.src} over ${c.input}")
+        test.assert_eq_str(outputs(c.src, c.input), c.want)
+
+// ────────────────────────────────────────────────────────────────────
+// The parser, the scanner and the renderers
+// ────────────────────────────────────────────────────────────────────
+
+// One row of the tour: a program and the whole line `tour` answers for
+// it.  The programs are chosen so that between them every node kind is
+// parsed, rendered, walked for variables, defs and builtins, measured
+// for depth, and asked whether it is a path expression.
+struct TourCase
+    src: Str
+    want: Str
+
+fn tour_cases() -> [TourCase] []
+    [
+        TourCase { src: ".",
+                   want: "render=. | vars= | defs= | calls= | depth=1 | at=0 | path=yes" },
+        TourCase { src: ".a",
+                   want: "render=.a | vars= | defs= | calls= | depth=2 | at=0 | path=yes" },
+        TourCase { src: ".a.b[0]",
+                   want: "render=.a.b[0] | vars= | defs= | calls= | depth=4 | at=0 | path=yes" },
+        TourCase { src: ".[]",
+                   want: "render=.[] | vars= | defs= | calls= | depth=2 | at=1 | path=yes" },
+        TourCase { src: ".[1:2]",
+                   want: "render=.[1:2] | vars= | defs= | calls= | depth=2 | at=1 | path=yes" },
+        TourCase { src: ".\"a b\"",
+                   want: "render=.['a b'] | vars= | defs= | calls= | depth=2 | at=0 | path=yes" },
+        TourCase { src: ".a?",
+                   want: "render=try .a | vars= | defs= | calls=empty/0 | depth=3 | at=0 | path=yes" },
+        TourCase { src: "..",
+                   want: "render=recurse | vars= | defs= | calls=recurse/0 | depth=1 | at=0 | path=yes" },
+        TourCase { src: "1",
+                   want: "render=1 | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "-1.5e3",
+                   want: "render=-1500 | vars= | defs= | calls= | depth=2 | at=0 | path=no" },
+        TourCase { src: "\"s\"",
+                   want: "render=\"s\" | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "\"a\\(.b)c\"",
+                   want: "render=\"a\\(.b)c\" | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: "true",
+                   want: "render=true | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "null",
+                   want: "render=null | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "1,2",
+                   want: "render=1, 2 | vars= | defs= | calls= | depth=2 | at=0 | path=no" },
+        TourCase { src: ".a | .b",
+                   want: "render=.a.b | vars= | defs= | calls= | depth=3 | at=0 | path=yes" },
+        TourCase { src: "[.a]",
+                   want: "render=[.a] | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: "{a: .b}",
+                   want: "render={a: .b} | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: "{\"k\": 1}",
+                   want: "render={k: 1} | vars= | defs= | calls= | depth=2 | at=0 | path=no" },
+        TourCase { src: "{(.a): 1}",
+                   want: "render={(.a): 1} | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: "{\$x}",
+                   want: "render={x: \$x} | vars=x | defs= | calls= | depth=2 | at=0 | path=no" },
+        TourCase { src: "{a, b}",
+                   want: "render={a: .a, b: .b} | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ".a + .b",
+                   want: "render=.a + .b | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ".a - 1",
+                   want: "render=.a - 1 | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ".a * 2",
+                   want: "render=.a * 2 | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ".a / 2",
+                   want: "render=.a / 2 | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ".a % 2",
+                   want: "render=.a % 2 | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ".a == 1",
+                   want: "render=.a == 1 | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ".a != 1",
+                   want: "render=.a != 1 | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ".a < 1",
+                   want: "render=.a < 1 | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ".a <= 1",
+                   want: "render=.a <= 1 | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ".a > 1",
+                   want: "render=.a > 1 | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ".a >= 1",
+                   want: "render=.a >= 1 | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ".a and .b",
+                   want: "render=.a and .b | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ".a or .b",
+                   want: "render=.a or .b | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ".a // .b",
+                   want: "render=.a // .b | vars= | defs= | calls= | depth=3 | at=0 | path=yes" },
+        TourCase { src: "if .a then .b else .c end",
+                   want: "render=if .a then .b else .c end | vars= | defs= | calls= | depth=3 | at=0 | path=yes" },
+        TourCase { src: "if .a then .b end",
+                   want: "render=if .a then .b else . end | vars= | defs= | calls= | depth=3 | at=0 | path=yes" },
+        TourCase { src: "try .a",
+                   want: "render=try .a | vars= | defs= | calls=empty/0 | depth=3 | at=0 | path=yes" },
+        TourCase { src: "try .a catch .b",
+                   want: "render=try .a catch .b | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: "reduce .[] as \$x (0; . + \$x)",
+                   want: "render=reduce .[] as \$x (0; . + \$x) | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: "reduce .[] as [\$a, \$b] (0; .)",
+                   want: "render=reduce .[] as [\$a, \$b] (0; .) | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: "reduce .[] as {n} (0; .)",
+                   want: "render=reduce .[] as {n: \$n} (0; .) | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: "reduce .[] as {(.k): \$v} (0; .)",
+                   want: "render=reduce .[] as {(.k): \$v} (0; .) | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: "foreach .[] as \$x (0; . + \$x; .)",
+                   want: "render=foreach .[] as \$x (0; . + \$x; .) | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ".a as \$x | \$x",
+                   want: "render=.a as \$x | \$x | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ". as [\$a] | \$a",
+                   want: "render=. as [\$a] | \$a | vars= | defs= | calls= | depth=2 | at=0 | path=no" },
+        TourCase { src: ". as {\$n} | \$n",
+                   want: "render=. as {n: \$n} | \$n | vars= | defs= | calls= | depth=2 | at=0 | path=no" },
+        TourCase { src: "map(.a)",
+                   want: "render=map(.a) | vars= | defs= | calls=map/1 | depth=3 | at=0 | path=no" },
+        TourCase { src: "select(.a)",
+                   want: "render=select(.a) | vars= | defs= | calls=select/1 | depth=3 | at=0 | path=yes" },
+        TourCase { src: "keys",
+                   want: "render=keys | vars= | defs= | calls=keys/0 | depth=1 | at=0 | path=no" },
+        TourCase { src: "length",
+                   want: "render=length | vars= | defs= | calls=length/0 | depth=1 | at=0 | path=no" },
+        TourCase { src: "empty",
+                   want: "render=empty | vars= | defs= | calls=empty/0 | depth=1 | at=0 | path=yes" },
+        TourCase { src: "first(.a)",
+                   want: "render=first(.a) | vars= | defs= | calls=first/1 | depth=3 | at=0 | path=yes" },
+        TourCase { src: "limit(1; .a)",
+                   want: "render=limit(1; .a) | vars= | defs= | calls=limit/2 | depth=3 | at=0 | path=yes" },
+        TourCase { src: "getpath([\"a\"])",
+                   want: "render=getpath([\"a\"]) | vars= | defs= | calls=getpath/1 | depth=3 | at=0 | path=yes" },
+        TourCase { src: "paths",
+                   want: "render=paths | vars= | defs= | calls=paths/0 | depth=1 | at=0 | path=yes" },
+        TourCase { src: "def f: .a; f",
+                   want: "render=def f: .a; f | vars= | defs=f | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: "def f(\$x): \$x; f(1)",
+                   want: "render=def f(\$x): \$x; f(1) | vars= | defs=f | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: "def f(g): g | g; f(.a)",
+                   want: "render=def f(g): g | g; f(.a) | vars= | defs=f | calls= | depth=4 | at=0 | path=no" },
+        TourCase { src: "def f: .a; def g: .b; f",
+                   want: "render=def f: .a; def g: .b; f | vars= | defs=f,g | calls= | depth=4 | at=0 | path=no" },
+        TourCase { src: "\"\\(1)\\(\"x\")\"",
+                   want: "render=\"\\(1)\\(\"x\")\" | vars= | defs= | calls= | depth=2 | at=0 | path=no" },
+        TourCase { src: "\"a\\tb\"",
+                   want: "render=\"a\\tb\" | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "\"\\u0007\"",
+                   want: "render=\"\\u0007\" | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "\"a\\\\b\"",
+                   want: "render=\"a\\\\b\" | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "\"a\\\"b\"",
+                   want: "render=\"a\\\"b\" | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "\"a\\/b\"",
+                   want: "render=\"a/b\" | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "\"a\\nb\\rc\"",
+                   want: "render=\"a\\nb\\rc\" | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "\"\\ud83d\\ude00\"",
+                   want: "render=\"😀\" | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "\"a\\(1)b\\(2)c\"",
+                   want: "render=\"a\\(1)b\\(2)c\" | vars= | defs= | calls= | depth=2 | at=0 | path=no" },
+        TourCase { src: "# a comment\n.a",
+                   want: "render=.a | vars= | defs= | calls= | depth=2 | at=12 | path=yes" },
+        TourCase { src: ".a # trailing\n",
+                   want: "render=.a | vars= | defs= | calls= | depth=2 | at=0 | path=yes" },
+        TourCase { src: "1e3",
+                   want: "render=1000 | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "0.5",
+                   want: "render=0.5 | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "1E-2",
+                   want: "render=0.01 | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "-0",
+                   want: "render=-0 | vars= | defs= | calls= | depth=2 | at=0 | path=no" },
+        TourCase { src: "1 as \$x | \$x + 1",
+                   want: "render=1 as \$x | \$x + 1 | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ".a as \$x | .b as \$y | \$x + \$y",
+                   want: "render=.a as \$x | .b as \$y | \$x + \$y | vars= | defs= | calls= | depth=4 | at=0 | path=no" },
+        TourCase { src: "path(.a.b[0])",
+                   want: "render=path(.a.b[0]) | vars= | defs= | calls=path/1 | depth=5 | at=0 | path=no" },
+        // The renders nothing else renders: an empty array, the
+        // shorthand a quoted name takes, the names that quote
+        // themselves, and the parenthesis a comma under an operator
+        // needs.
+        TourCase { src: "[]",
+                   want: "render=[] | vars= | defs= | calls=empty/0 | depth=2 | at=0 | path=no" },
+        TourCase { src: "false",
+                   want: "render=false | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "{\"a b\": 1}",
+                   want: "render={\"a b\": 1} | vars= | defs= | calls= | depth=2 | at=0 | path=no" },
+        TourCase { src: "{\"\": 1}",
+                   want: "render={\"\": 1} | vars= | defs= | calls= | depth=2 | at=0 | path=no" },
+        TourCase { src: "{\"1a\": 1}",
+                   want: "render={\"1a\": 1} | vars= | defs= | calls= | depth=2 | at=0 | path=no" },
+        TourCase { src: "(1, 2) + 3",
+                   want: "render=(1, 2) + 3 | vars= | defs= | calls= | depth=3 | at=1 | path=no" },
+        TourCase { src: "1, def f: 2; f",
+                   want: "render=1, (def f: 2; f) | vars= | defs=f | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: ". | 1",
+                   want: "render=. | 1 | vars= | defs= | calls= | depth=2 | at=0 | path=no" },
+        // A dot-quoted name with an escape in it, decoded by the
+        // scanner and re-quoted by the renderer.
+        TourCase { src: ".\"a\\\"b\"",
+                   want: "render=.['a\"b'] | vars= | defs= | calls= | depth=2 | at=0 | path=yes" },
+        TourCase { src: ".\"\\u00e9\"",
+                   want: "render=.['é'] | vars= | defs= | calls= | depth=2 | at=0 | path=yes" },
+        // The bracket form of the same name, untouched by the scanner
+        // and handed to the delegate with its quotes already in place.
+        TourCase { src: ".[\"a\\\"b\"]",
+                   want: "render=.['a\"b'] | vars= | defs= | calls= | depth=2 | at=1 | path=yes" },
+        TourCase { src: ".[\"a\\tb\"]",
+                   want: "render=.['a\tb'] | vars= | defs= | calls= | depth=2 | at=1 | path=yes" },
+        TourCase { src: ".[\"a\",\"b\"]",
+                   want: "render=.['a','b'] | vars= | defs= | calls= | depth=2 | at=1 | path=yes" },
+        // `[*]` is `.[]`, and a group holds a selector, a wildcard and
+        // a filter side by side.
+        TourCase { src: ".[*]",
+                   want: "render=.[] | vars= | defs= | calls= | depth=2 | at=1 | path=yes" },
+        TourCase { src: ".[*,1]",
+                   want: "render=.[*,1] | vars= | defs= | calls= | depth=2 | at=1 | path=yes" },
+        TourCase { src: ".[?@.a]",
+                   want: "render=.[?@['a']] | vars= | defs= | calls= | depth=2 | at=1 | path=yes" },
+        TourCase { src: ".[?@.a > 1, \"b\"]",
+                   want: "render=.[?@['a'] > 1,'b'] | vars= | defs= | calls= | depth=2 | at=1 | path=yes" },
+        TourCase { src: ".[0]",
+                   want: "render=.[0] | vars= | defs= | calls= | depth=2 | at=1 | path=yes" },
+        TourCase { src: ".[:2]",
+                   want: "render=.[:2] | vars= | defs= | calls= | depth=2 | at=1 | path=yes" },
+        TourCase { src: ".[1:4:2]",
+                   want: "render=.[1:4:2] | vars= | defs= | calls= | depth=2 | at=1 | path=yes" },
+        // The escapes a string literal keeps: a backspace and a form
+        // feed render as the four-digit form, a lone `\u000b` stays
+        // one, and a surrogate pair becomes the character it spells.
+        TourCase { src: "\"a\\bb\"",
+                   want: "render=\"a\\u0008b\" | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "\"c\\fd\"",
+                   want: "render=\"c\\u000cd\" | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "\"\\u000b\"",
+                   want: "render=\"\\u000b\" | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        TourCase { src: "\"\\uD83D\\uDE00\"",
+                   want: "render=\"😀\" | vars= | defs= | calls= | depth=1 | at=0 | path=no" },
+        // `def f()` loses its parentheses, and a pattern's computed
+        // key is copied out as the field it computes.
+        TourCase { src: "def f(): 1; f",
+                   want: "render=def f: 1; f | vars= | defs=f | calls= | depth=2 | at=0 | path=no" },
+        TourCase { src: "reduce .[] as [] (0; .)",
+                   want: "render=reduce .[] as [] (0; .) | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: "reduce .[] as {} (0; .)",
+                   want: "render=reduce .[] as {} (0; .) | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: "reduce .[] as {\$a, \$b} (0; .)",
+                   want: "render=reduce .[] as {a: \$a, b: \$b} (0; .) | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: "reduce .[] as {\"a\": \$x} (0; .)",
+                   want: "render=reduce .[] as {a: \$x} (0; .) | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: "reduce .[] as {a: \$x} (0; .)",
+                   want: "render=reduce .[] as {a: \$x} (0; .) | vars= | defs= | calls= | depth=3 | at=0 | path=no" },
+        TourCase { src: "# a comment\n.a",
+                   want: "render=.a | vars= | defs= | calls= | depth=2 | at=12 | path=yes" },
+        TourCase { src: ".a # trailing\n",
+                   want: "render=.a | vars= | defs= | calls= | depth=2 | at=0 | path=yes" }]
+
+@test
+fn test_every_tour_row_parses_renders_and_walks() [io]
+    for c in tour_cases()
+        test.case("${c.src}")
+        test.assert_eq_str(tour(c.src), c.want)
+
+// The programs the parser refuses, and the fault each one names.  The
+// scanner's whole surface is here: every escape, a comment, a quoted
+// name, a bracket group, a number with an exponent, and each of the
+// operators left dangling.
+fn refusal_cases() -> [RunCase] []
+    [
+        RunCase { src: "\"\\q\"", input: "null",
+                  want: "parse:bad-escape" },
+        RunCase { src: "\"abc", input: "null",
+                  want: "parse:unterminated-string" },
+        RunCase { src: "\"a\\(1\"", input: "null",
+                  want: "parse:bad-interpolation" },
+        RunCase { src: "1e", input: "null",
+                  want: "parse:bad-number" },
+        RunCase { src: "1.2.3", input: "null",
+                  want: "parse:bad-number" },
+        RunCase { src: ".a[", input: "null",
+                  want: "parse:unclosed-bracket" },
+        RunCase { src: "(.a", input: "null",
+                  want: "parse:unclosed-bracket" },
+        RunCase { src: "{a: }", input: "null",
+                  want: "parse:unexpected-byte" },
+        RunCase { src: "1 +", input: "null",
+                  want: "parse:dangling-operator" },
+        RunCase { src: ".a |", input: "null",
+                  want: "parse:dangling-operator" },
+        RunCase { src: "1,", input: "null",
+                  want: "parse:dangling-operator" },
+        RunCase { src: ".a and", input: "null",
+                  want: "parse:dangling-operator" },
+        RunCase { src: ".a or", input: "null",
+                  want: "parse:dangling-operator" },
+        RunCase { src: ".a ==", input: "null",
+                  want: "parse:dangling-operator" },
+        RunCase { src: ".a <=", input: "null",
+                  want: "parse:dangling-operator" },
+        RunCase { src: ".a +", input: "null",
+                  want: "parse:dangling-operator" },
+        RunCase { src: ".a -", input: "null",
+                  want: "parse:dangling-operator" },
+        RunCase { src: ".a *", input: "null",
+                  want: "parse:dangling-operator" },
+        RunCase { src: ".a /", input: "null",
+                  want: "parse:dangling-operator" },
+        RunCase { src: ".a %", input: "null",
+                  want: "parse:dangling-operator" },
+        RunCase { src: "reduce .[] (0; .)", input: "null",
+                  want: "parse:bad-pattern" },
+        RunCase { src: "reduce .[] as \$x 0", input: "null",
+                  want: "parse:unexpected-byte" },
+        RunCase { src: "foreach .[] as \$x (0; .)", input: "null",
+                  want: "[]!cannot-iterate" },
+        RunCase { src: "foreach .[] as \$x (0; .; .) extra", input: "null",
+                  want: "parse:trailing-input" },
+        RunCase { src: "\$x", input: "null",
+                  want: "parse:unbound-variable" },
+        RunCase { src: "def f: 1", input: "null",
+                  want: "parse:unexpected-byte" },
+        RunCase { src: "def 1: 2; 3", input: "null",
+                  want: "parse:unexpected-byte" },
+        RunCase { src: "def f(1): 2; 3", input: "null",
+                  want: "parse:unexpected-byte" },
+        RunCase { src: "def f(\$x: 2; 3", input: "null",
+                  want: "parse:unexpected-byte" },
+        RunCase { src: "{a: 1", input: "null",
+                  want: "parse:unexpected-byte" },
+        RunCase { src: "{1: 2}", input: "null",
+                  want: "parse:bad-object-key" },
+        RunCase { src: "{(1): 2} x", input: "null",
+                  want: "parse:trailing-input" },
+        RunCase { src: "if .a then .b", input: "null",
+                  want: "parse:unexpected-byte" },
+        RunCase { src: "floor_it", input: "null",
+                  want: "parse:unknown-function" },
+        RunCase { src: "map", input: "null",
+                  want: "parse:wrong-arity" },
+        RunCase { src: "map(.; .)", input: "null",
+                  want: "parse:wrong-arity" },
+        RunCase { src: "gsub(\"a\"; \"b\")", input: "null",
+                  want: "parse:refused-function" },
+        RunCase { src: "test(\"a\"; \"b\")", input: "null",
+                  want: "parse:refused-function" },
+        RunCase { src: ".a[1:2:3]", input: "null",
+                  want: "[null]" },
+        RunCase { src: ".a[?1]", input: "null",
+                  want: "parse:bad-path" },
+        RunCase { src: ".[\"x\"]", input: "null",
+                  want: "[null]" },
+        RunCase { src: ".a.b.", input: "null",
+                  want: "[null]" },
+        RunCase { src: "1abc", input: "null",
+                  want: "parse:trailing-input" },
+        RunCase { src: "..a", input: "null",
+                  want: "parse:trailing-input" },
+        RunCase { src: ".a as \$x", input: "null",
+                  want: "parse:dangling-operator" },
+        RunCase { src: "as \$x | \$x", input: "null",
+                  want: "parse:unknown-function" },
+        RunCase { src: "\\(1)", input: "null",
+                  want: "parse:unexpected-byte" },
+        RunCase { src: "}", input: "null",
+                  want: "parse:unexpected-byte" },
+        RunCase { src: "]", input: "null",
+                  want: "parse:unexpected-byte" },
+        RunCase { src: ")", input: "null",
+                  want: "parse:unexpected-byte" },
+        RunCase { src: "|", input: "null",
+                  want: "parse:unexpected-byte" },
+        // The two spellings of a quoted name the scanner owns: a
+        // dot-quoted one it decodes itself, and a bracket one it only
+        // skips over for the delegate to refuse.
+        RunCase { src: ".\"a", input: "null",
+                  want: "parse:unterminated-string" },
+        RunCase { src: ".\"\\q\"", input: "null",
+                  want: "parse:bad-escape" },
+        RunCase { src: ".\"a\\tb\"", input: "null",
+                  want: "parse:bad-path" },
+        RunCase { src: ".[\"a", input: "null",
+                  want: "parse:unclosed-bracket" },
+        RunCase { src: ".[\"\\q\"]", input: "null",
+                  want: "parse:bad-path" },
+        RunCase { src: ".[[0]]", input: "null",
+                  want: "parse:bad-path" },
+        RunCase { src: ".a..b", input: "null",
+                  want: "parse:unexpected-byte" },
+        // A number whose exponent leaves it, and an operator whose
+        // right side is the word that ends the construct around it.
+        RunCase { src: "1e999", input: "null",
+                  want: "parse:bad-number" },
+        RunCase { src: "1 //else", input: "null",
+                  want: "parse:dangling-operator" },
+        // The patterns a `as` may bind: a name, a bracketed list of
+        // them, or an object of them — and nothing else.
+        RunCase { src: "reduce .[] as \$ (0; .)", input: "null",
+                  want: "parse:bad-pattern" },
+        RunCase { src: "reduce .[] as [\$a \$b] (0; .)", input: "null",
+                  want: "parse:bad-pattern" },
+        RunCase { src: "reduce .[] as {\$a \$b} (0; .)", input: "null",
+                  want: "parse:bad-pattern" },
+        RunCase { src: "reduce .[] as {(1 \$x)} (0; .)", input: "null",
+                  want: "parse:unclosed-bracket" },
+        RunCase { src: "reduce .[] as {: \$x} (0; .)", input: "null",
+                  want: "parse:bad-pattern" },
+        RunCase { src: "reduce .[] as {\"a\"} (0; .)", input: "null",
+                  want: "parse:bad-pattern" },
+        RunCase { src: "reduce .[] as [\"a\"] (0; .)", input: "null",
+                  want: "parse:bad-pattern" },
+        RunCase { src: "reduce .[] as \$x (0; .", input: "null",
+                  want: "parse:unclosed-bracket" },
+        // `foreach` needs three parts, and each of them is checked
+        // where it is parsed.
+        RunCase { src: "foreach .[] as \$x 0; 1; 2)", input: "null",
+                  want: "parse:unexpected-byte" },
+        RunCase { src: "foreach .[] as \$x (0 1; 2)", input: "null",
+                  want: "parse:unexpected-byte" },
+        RunCase { src: "foreach .[] as \$x (0; 1; 2", input: "null",
+                  want: "parse:unclosed-bracket" },
+        // The names a program may not use: a variable the standard
+        // library reserves, and one a def declares but the parser
+        // cannot resolve.
+        RunCase { src: "\$ENV", input: "null",
+                  want: "parse:refused-function" },
+        RunCase { src: "def f: nosuchname; f", input: "null",
+                  want: "parse:unknown-function" },
+        RunCase { src: "def f: g; def g: 1; f", input: "null",
+                  want: "parse:unknown-function" },
+        RunCase { src: "def f: (def g: h; g); f", input: "null",
+                  want: "parse:unknown-function" },
+        // Object keys that are neither a name nor a computed filter,
+        // and the `if` that lost its `then`.
+        RunCase { src: "{\$x: 1}", input: "null",
+                  want: "parse:bad-object-key" },
+        RunCase { src: "{(1 2)}", input: "null",
+                  want: "parse:unclosed-bracket" },
+        RunCase { src: "{a 1}", input: "null",
+                  want: "parse:bad-object-key" },
+        RunCase { src: "if . else 1 end", input: "null",
+                  want: "parse:unexpected-byte" },
+        // A def's parameter list is names, and an empty one is
+        // spelled as no list at all.
+        RunCase { src: "def f(\$): 1; f", input: "null",
+                  want: "parse:unexpected-byte" },
+        RunCase { src: "and", input: "null",
+                  want: "parse:unknown-function" }]
+
+@test
+fn test_every_refused_program_names_its_fault() [io]
+    for c in refusal_cases()
+        test.case("${c.src}")
+        test.assert_eq_str(outputs(c.src, c.input), c.want)
+
+// ────────────────────────────────────────────────────────────────────
+// The budget, the table and the paths
+// ────────────────────────────────────────────────────────────────────
+
+// One row of the budget sweep: a program, its input, the three ceilings
+// and what the run answers when one is crossed.
+struct BudgetCase
+    src: Str
+    input: Str
+    outs: Int
+    steps: Int
+    depth: Int
+    want: Str
+
+// A run that does not stop itself has to be stopped, and the row says
+// where: an output ceiling reached mid-stream, a step ceiling inside a
+// source, a depth ceiling in `recurse` and in a path, and a ceiling no
+// program meets.
+fn budget_cases() -> [BudgetCase] []
+    [
+        BudgetCase { src: "1,2", input: "null",
+                     outs: 2, steps: 10000000, depth: 256, want: "[1,2]" },
+        BudgetCase { src: "path(.a)", input: "{\"a\":1}",
+                     outs: 100000, steps: 10000000, depth: 0, want: "[]!over-budget" },
+        BudgetCase { src: "recurse", input: "1",
+                     outs: 100000, steps: 10000000, depth: 0, want: "[1]" },
+        BudgetCase { src: "path(recurse(.a))", input: "{\"a\":1}",
+                     outs: 100000, steps: 10000000, depth: 0, want: "[]!over-budget" },
+        BudgetCase { src: "path(.[])", input: "[1,2]",
+                     outs: 1, steps: 10000000, depth: 256, want: "[[0]]!over-budget" },
+        BudgetCase { src: "paths", input: "{\"a\":[1]}",
+                     outs: 1, steps: 10000000, depth: 256, want: "[[\"a\"]]!over-budget" },
+        BudgetCase { src: "1,2", input: "null",
+                     outs: 1, steps: 10000000, depth: 256, want: "[1]!over-budget" },
+        BudgetCase { src: "(true and 1),(false and 1)", input: "null",
+                     outs: 1, steps: 10000000, depth: 256, want: "[true]!over-budget" },
+        BudgetCase { src: "map(.+1)", input: "[1,2]",
+                     outs: 1, steps: 10000000, depth: 256, want: "[[2,3]]" },
+        BudgetCase { src: "reduce [1,2][] as \$x (0; .+\$x)", input: "null",
+                     outs: 100000, steps: 2, depth: 256, want: "[]!over-budget" },
+        BudgetCase { src: "foreach [1,2][] as \$x (0; .+\$x; .)", input: "null",
+                     outs: 100000, steps: 2, depth: 256, want: "[]!over-budget" },
+        BudgetCase { src: "while(.<3; .+1)", input: "0",
+                     outs: 100000, steps: 10000000, depth: 0, want: "[]!over-budget" },
+        // The ceilings the walkers and the streamed arms meet: an
+        // output ceiling crossed inside a pipe, an array whose own
+        // construction spends the output budget before its one output
+        // is made, and the four operators that draw one value per
+        // combination of their sides.
+        BudgetCase { src: ".[] | (., .)", input: "[1,2]",
+                     outs: 2, steps: 10000000, depth: 256, want: "[1,1]!over-budget" },
+        BudgetCase { src: ".[] | (., .)", input: "[1,2]",
+                     outs: 3, steps: 10000000, depth: 256, want: "[1,1,2]!over-budget" },
+        BudgetCase { src: "(1,2,3)", input: "null",
+                     outs: 2, steps: 10000000, depth: 256, want: "[1,2]!over-budget" },
+        BudgetCase { src: "[range(0;10)]", input: "null",
+                     outs: 2, steps: 10000000, depth: 256, want: "[]!over-budget" },
+        BudgetCase { src: "1 as \$x | [1,2,3][]", input: "null",
+                     outs: 2, steps: 10000000, depth: 256, want: "[]!over-budget" },
+        BudgetCase { src: "range(0;10)", input: "null",
+                     outs: 3, steps: 10000000, depth: 256, want: "[0,1,2]!over-budget" },
+        BudgetCase { src: "range(0;10) | .", input: "null",
+                     outs: 2, steps: 10000000, depth: 256, want: "[0,1]!over-budget" },
+        BudgetCase { src: ".[] + 0", input: "[1,2,3]",
+                     outs: 2, steps: 10000000, depth: 256, want: "[1,2]!over-budget" },
+        BudgetCase { src: "true and .[]", input: "[1,2,3]",
+                     outs: 2, steps: 10000000, depth: 256, want: "[true,true]!over-budget" },
+        BudgetCase { src: ".[] and 1", input: "[false,false,false]",
+                     outs: 2, steps: 10000000, depth: 256, want: "[false,false]!over-budget" },
+        BudgetCase { src: ".[] or true", input: "[1,2,3]",
+                     outs: 2, steps: 10000000, depth: 256, want: "[true,true]!over-budget" },
+        BudgetCase { src: ".[] or 1", input: "[null,null,null]",
+                     outs: 2, steps: 10000000, depth: 256, want: "[true,true]!over-budget" },
+        // A depth ceiling met in `recurse`, in `recurse(f)`, in `..`
+        // as a path and in `while`.
+        BudgetCase { src: "recurse", input: "[[1]]",
+                     outs: 100000, steps: 10000000, depth: 0, want: "[[[1]]]!over-budget" },
+        BudgetCase { src: "recurse(.[])", input: "[[1]]",
+                     outs: 100000, steps: 10000000, depth: 0, want: "[[[1]]]!over-budget" },
+        BudgetCase { src: "recurse", input: "[[1]]",
+                     outs: 1, steps: 10000000, depth: 256, want: "[[[1]]]!over-budget" },
+        BudgetCase { src: "1 | while(. < 1000000; . + 1)", input: "0",
+                     outs: 100000, steps: 10000000, depth: 0, want: "[]!over-budget" },
+        BudgetCase { src: "1 | while(. < 1000000; . + 1)", input: "0",
+                     outs: 3, steps: 10000000, depth: 256, want: "[1,2,3]!over-budget" },
+        BudgetCase { src: "path(..)", input: "{\"a\":[1]}",
+                     outs: 100000, steps: 10000000, depth: 0, want: "[]!over-budget" },
+        BudgetCase { src: "path(..)", input: "{\"a\":[1]}",
+                     outs: 100000, steps: 10000000, depth: 256, want: "[[],[\"a\"],[\"a\",0]]" },
+        BudgetCase { src: "path(recurse(.[]))", input: "[[1]]",
+                     outs: 100000, steps: 10000000, depth: 0, want: "[]!over-budget" },
+        BudgetCase { src: "(1,2,3), 4", input: "null",
+                     outs: 2, steps: 10000000, depth: 256, want: "[1,2]!over-budget" },
+        BudgetCase { src: "1, 2", input: "null",
+                     outs: 0, steps: 10000000, depth: 256, want: "[]!over-budget" },
+        BudgetCase { src: "recurse(.)", input: "1",
+                     outs: 2, steps: 10000000, depth: 256, want: "[1,1]!over-budget" },
+        BudgetCase { src: "recurse(.)", input: "1",
+                     outs: 100000, steps: 10000000, depth: 0, want: "[1]!over-budget" },
+        BudgetCase { src: "1 | recurse(.)", input: "null",
+                     outs: 100000, steps: 10000000, depth: 0, want: "[]!over-budget" },
+        BudgetCase { src: "1 | while(. < 10; . + 1)", input: "null",
+                     outs: 100000, steps: 10000000, depth: 0, want: "[]!over-budget" },
+        BudgetCase { src: "1 | while(. < 10; . + 1)", input: "null",
+                     outs: 100000, steps: 10000000, depth: 3, want: "[1]!over-budget" },
+        BudgetCase { src: "path(recurse(.[]))", input: "[[1]]",
+                     outs: 100000, steps: 10000000, depth: 1, want: "[]!over-budget" },
+        BudgetCase { src: "path(recurse(.[]))", input: "[[1]]",
+                     outs: 100000, steps: 10000000, depth: 2, want: "[[]]!over-budget" },
+        BudgetCase { src: "paths(.)", input: "{\"a\":[1]}",
+                     outs: 1, steps: 10000000, depth: 256, want: "[[\"a\"]]!over-budget" },
+        BudgetCase { src: "until(.>2; .+1)", input: "0",
+                     outs: 100000, steps: 10000000, depth: 0, want: "[]!over-budget" }]
+
+@test
+fn test_every_budget_row_stops_at_the_ceiling() [io]
+    for c in budget_cases()
+        test.case("${c.src} under ${str.from_int(c.outs)}/${str.from_int(c.steps)}/${str.from_int(c.depth)}")
+        test.assert_eq_str(limited(c.src, c.input, c.outs, c.steps, c.depth), c.want)
+
+// One row of the table sweep: a value of one of the six shapes and what
+// all four entry points answer for it.
+struct ShapeCase
+    text: Str
+    want: Str
+
+// The six shapes `jqfmt.shape` names, so every arm of the grid, the
+// problem sentence, the tabular rendering and the CSV writer runs over
+// the shape it was written for and over the ones it refuses.
+fn shape_cases() -> [ShapeCase] []
+    [
+        ShapeCase { text: "[{\"a\":1,\"b\":2},{\"a\":3,\"b\":4}]",
+                    want: "shape=rows g3 - t:a b\n1 2\n3 4 c:a,b\n1,2\n3,4" },
+        ShapeCase { text: "{\"a\":1,\"b\":2}",
+                    want: "shape=row g2 - t:a b\n1 2 c:a,b\n1,2" },
+        ShapeCase { text: "[1,2]",
+                    want: "shape=column - p:an array of numbers has no columns — pipe it through `map({value: .})` - -" },
+        ShapeCase { text: "3",
+                    want: "shape=scalar - p:a number is not a table — wrap it in an object for one row, or an array of objects for many - -" },
+        ShapeCase { text: "[]",
+                    want: "shape=empty g1 - t: c:" },
+        ShapeCase { text: "[1,{\"a\":2}]",
+                    want: "shape=ragged - p:a ragged array is not a table — a table is an array of objects, and these elements are not all the same shape - -" }]
+
+@test
+fn test_every_shape_answers_grid_problem_tabular_and_csv() [io]
+    for c in shape_cases()
+        test.case("${c.text}")
+        test.assert_eq_str(fmt(c.text), c.want)
+
+// One row of the path sweep: an RFC 9535 query, the input, and what
+// both delegates answer.  The four places jq disagrees with the RFC are
+// the difference between the two halves of each line.
+struct PathCase
+    query: Str
+    input: Str
+    want: Str
+
+fn path_cases() -> [PathCase] []
+    [
+        PathCase { query: "\$", input: "{\"a\":1}",
+                   want: "jq=[{\"a\":1}] rfc=[{\"a\":1}]" },
+        PathCase { query: "\$.a", input: "{\"a\":1}",
+                   want: "jq=[1] rfc=[1]" },
+        PathCase { query: "\$..a", input: "{\"a\":{\"a\":1}}",
+                   want: "jq=[{\"a\":1},1]!cannot-index rfc=[{\"a\":1},1]" },
+        PathCase { query: "\$..a", input: "{\"a\":null}",
+                   want: "jq=[null,null] rfc=[null]" },
+        PathCase { query: "\$.a[0]", input: "{\"a\":[1]}",
+                   want: "jq=[1] rfc=[1]" },
+        PathCase { query: "\$[*]", input: "[1,2]",
+                   want: "jq=[1,2] rfc=[1,2]" },
+        PathCase { query: "\$.a[?@.b > 1]", input: "{\"a\":[{\"b\":1},{\"b\":2}]}",
+                   want: "jq=[{\"b\":2}] rfc=[{\"b\":2}]" },
+        PathCase { query: "\$[0:2]", input: "[1,2,3]",
+                   want: "jq=[[1,2]] rfc=[1,2]" },
+        PathCase { query: "\$[?@ > 1]", input: "[1,2,3]",
+                   want: "jq=[2,3] rfc=[2,3]" },
+        PathCase { query: "\$.a.b", input: "{\"a\":1}",
+                   want: "jq=[]!cannot-index rfc=[]" }]
+
+@test
+fn test_every_path_row_answers_jq_rules_and_the_rfc() [io]
+    for c in path_cases()
+        test.case("${c.query} over ${c.input}")
+        test.assert_eq_str(sel(c.query, c.input), c.want)
+
+// ────────────────────────────────────────────────────────────────────
+// The arms a program cannot spell
+// ────────────────────────────────────────────────────────────────────
+
+// A fault's own message, which is the `impl Error` and not a name: the
+// sentence a caller reads when the parse is refused.
+@test
+fn test_a_faults_message_is_its_own_sentence() [io]
+    match jqlang.parse("floor_it")
+        Err(f) => test.assert_eq_str(f.message(), "unknown-function 'floor_it' at bytes 0 to 8 of the program")
+        Ok(_)  => test.assert(false)
+
+// Every one of the six kinds, since a branch that names a type is only
+// measured when a value of that type goes through it.
+@test
+fn test_kind_names_all_six_types() [io]
+    test.assert(jqeval.kind(value_of("null")) == JqKNull)
+    test.assert(jqeval.kind(value_of("true")) == JqKBoolean)
+    test.assert(jqeval.kind(value_of("1")) == JqKNumber)
+    test.assert(jqeval.kind(value_of("\"s\"")) == JqKString)
+    test.assert(jqeval.kind(value_of("[1]")) == JqKArray)
+    test.assert(jqeval.kind(value_of("{}")) == JqKObject)
+
+// jq's exit codes: a fault is 5, no output is 1, and with `-e` a last
+// value of `null` or `false` is 1 as well.
+@test
+fn test_exit_code_answers_jq_codes() [io]
+    test.assert(jqeval.exit_code(jqeval.raised([], jqerror.error(JqUserRaised, json.string("x"), 0)), false) == 5)
+    test.assert(jqeval.exit_code(jqeval.produced([]), false) == 1)
+    test.assert(jqeval.exit_code(jqeval.produced([json.bool(false)]), true) == 1)
+    test.assert(jqeval.exit_code(jqeval.produced([json.bool(false)]), false) == 0)
+    test.assert(jqeval.exit_code(jqeval.produced([json.null()]), true) == 1)
+    test.assert(jqeval.exit_code(jqeval.produced([json.bool(true)]), true) == 0)
+
+// The order's cross-type arms, so `null < false < true < numbers <
+// strings < arrays < objects` is measured in both directions.
+@test
+fn test_order_crosses_every_rank() [io]
+    test.assert(jqeval.order(value_of("null"), value_of("false")) < 0)
+    test.assert(jqeval.order(value_of("1"), value_of("\"a\"")) < 0)
+    test.assert(jqeval.order(value_of("\"a\""), value_of("[]")) < 0)
+    test.assert(jqeval.order(value_of("[]"), value_of("{}")) < 0)
+    test.assert(jqeval.order(value_of("{}"), value_of("[]")) > 0)
+    test.assert(jqeval.order(value_of("1.5"), value_of("1")) > 0)
+    test.assert(jqeval.order(value_of("[1,2]"), value_of("[1,3]")) < 0)
+    test.assert(jqeval.order(value_of("{\"a\":1}"), value_of("{\"b\":1}")) < 0)
+
+// A tree a program cannot spell but a caller of the public enums can:
+// the path walker meeting a filter that is not a path expression, the
+// callee that is a `def`, and the builtin that is not one of the path
+// calls.  Arity is checked at parse time, so a call with no argument
+// list is a tree only the enums can build.
+@test
+fn test_a_hand_built_tree_reaches_the_arms_a_program_cannot() [io]
+    let none: [jqlang.JqFilter] = []
+    test.assert(not jqlang.is_path_expression(JqFCall(0, JqCBuiltin(JqbSelect1), none)))
+    test.assert(not jqlang.is_path_expression(JqFCall(0, JqCBuiltin(JqbLimit2), none)))
+    let ev = jqeval.empty_env()
+    let body: [jqlang.JqFilter] = [JqFArray(0, JqFIdentity(0))]
+    let notpath = JqFCall(0, JqCBuiltin(JqbPath1), body)
+    test.assert_eq_str(outputs_of(notpath, "1", ev), "[]!bad-argument")
+    let defined: [jqlang.JqFilter] = [JqFCall(0, JqCDefined("g"), none)]
+    let viadef = JqFCall(0, JqCBuiltin(JqbPath1), defined)
+    test.assert_eq_str(outputs_of(viadef, "1", ev), "[]!bad-argument")
+    let qa = JqFPath(0, JpQuery { absolute: true, segments: [JpChildSeg([JpNameSel("a")])] })
+    let qb = JqFPath(0, JpQuery { absolute: true, segments: [JpChildSeg([JpNameSel("b")])] })
+    let pipe = JqFPipe(0, qa, qb)
+    test.assert_eq_str(outputs_of(pipe, "{\"a\":{\"b\":1}}", ev), "[1]")
+    let viap: [jqlang.JqFilter] = [pipe]
+    let pathpipe = JqFCall(0, JqCBuiltin(JqbPath1), viap)
+    test.assert_eq_str(outputs_of(pathpipe, "5", ev), "[]!cannot-index")
+    let rng: [jqlang.JqFilter] = [JqFLiteral(0, JqLNumber(0.0)), JqFLiteral(0, JqLNumber(1.0))]
+    let arg = JqFCall(0, JqCBuiltin(JqbRange2), rng)
+    let wrongcall: [jqlang.JqFilter] = [arg]
+    let viacall = JqFCall(0, JqCBuiltin(JqbPath1), wrongcall)
+    test.assert_eq_str(outputs_of(viacall, "1", ev), "[]!bad-argument")
+
+// A name supplied to the parser and a binding carried beside the
+// program — `--arg x 3` as two calls — and the arm a run takes when the
+// name was supplied to the parser but never bound.
+@test
+fn test_a_supplied_name_and_a_bound_environment_answer_the_same_way() [io]
+    let bound = jqeval.bind(jqeval.empty_env(), "x", value_of("3"))
+    match jqeval.lookup(bound, "x")
+        None    => test.assert(false)
+        Some(v) => test.assert_eq_str(json.stringify(v), "3")
+    match jqeval.lookup(bound, "y")
+        None    => ()
+        Some(_) => test.assert(false)
+    match jqlang.parse_with("\$x + 1", ["x"])
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert_eq_str(outputs_of(p.root, "null", bound), "[4]")
+    match jqlang.parse_with("\$y", ["y"])
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert_eq_str(outputs_of(p.root, "null", jqeval.empty_env()),
+                                     "[]!bad-argument")
+
+// The helpers a program can only reach through text: the renderer over
+// a query no source spells, the fault reader over a subject that is and
+// is not a query, and the trees the call and def arms are handed with
+// the arity a program cannot write.
+@test
+fn test_the_public_helpers_answer_hand_built_trees() [io]
+    let ev = jqeval.empty_env()
+    let desc = JqFPath(0, JpQuery { absolute: true, segments: [JpDescendantSeg([JpNameSel("a")])] })
+    test.assert_eq_str(jqlang.render_filter(desc), "..['a']")
+    let bare = JqFPath(0, JpQuery { absolute: true, segments: [] })
+    test.assert_eq_str(jqlang.render_filter(bare), ".")
+    match jqlang.path_fault(jqerror.fault(JqBadPath, 0, 3, "\$.a"))
+        None    => ()
+        Some(_) => test.assert(false)
+    match jqlang.path_fault(jqerror.fault(JqUnexpectedByte, 0, 1, ""))
+        None    => ()
+        Some(_) => test.assert(false)
+    match jqlang.path_fault(jqerror.fault(JqBadPath, 0, 2, "\$["))
+        None    => test.assert(false)
+        Some(_) => ()
+    let noneargs: [jqlang.JqFilter] = []
+    let gcall = JqFCall(0, JqCDefined("g"), noneargs)
+    test.assert_eq_str(outputs_of(gcall, "1", ev), "[]!bad-argument")
+    let onearg: [jqlang.JqFilter] = [JqFLiteral(0, JqLNumber(1.0))]
+    let twoargs: [jqlang.JqFilter] = [JqFLiteral(0, JqLNumber(1.0)), JqFLiteral(0, JqLNumber(2.0))]
+    let overcall = JqFCall(0, JqCDefined("f"), twoargs)
+    let overdef = JqFDefine(0, "f", ["p"], JqFLiteral(0, JqLNumber(7.0)), overcall)
+    test.assert_eq_str(outputs_of(overdef, "1", ev), "[7]")
+    let pcall = JqFCall(0, JqCDefined("p"), noneargs)
+    let pdef = JqFDefine(0, "f", ["p"], pcall, JqFCall(0, JqCDefined("f"), onearg))
+    test.assert_eq_str(outputs_of(pdef, "1", ev), "[1]")
+    let vdef = JqFDefine(0, "f", ["p"], JqFVariable(0, "p"), JqFCall(0, JqCDefined("f"), onearg))
+    test.assert_eq_str(outputs_of(vdef, "1", ev), "[]!bad-argument")
+    // A string the JSON reader refuses to make — the second byte of
+    // `\u00e9`, alone — reaches `explode` through the value API, and
+    // `codepoint_of` answers its first byte, as its comment says.
+    let eacute = json.to_str(value_of("\"\\u00e9\"")) ?? ""
+    let lonesome = str.slice(eacute, 1, 2)
+    match jqlang.parse("explode")
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            let o = jqeval.apply(p.root, json.string(lonesome), ev)
+            test.assert_eq_str(json.stringify(list.first(o.values) ?? jqeval.null_value()), "[169]")

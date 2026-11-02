@@ -1,10 +1,6 @@
 // jqlang_tests.nv — the program language: what parses, what is refused,
 // and where the caret goes.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: jsonquery-nv.<module>.<fn>`.
-// That is the expected result until the bodies land.
-//
 // THE REFUSALS ARE HALF THE SUITE, and each one is a mistake somebody
 // has typed at a real jq.  A parser that accepts everything and answers
 // nothing is the failure mode this package is a rewrite of: `orbit/nq`
@@ -175,7 +171,7 @@ fn test_a_path_expression_is_told_apart_from_a_value_expression() [io]
     test.case("arithmetic over a path is not")
     match jqlang.parse(".a + 1")
         Err(_) => test.assert(false)
-        Ok(p)  => test.assert(jqlang.is_path_expression(p.root) == false)
+        Ok(p)  => test.assert(not jqlang.is_path_expression(p.root))
 
     test.case("an `if` whose branches are both paths is one")
     match jqlang.parse("if .x then .a else .b end")

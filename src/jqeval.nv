@@ -1,8 +1,6 @@
 // jqeval.nv — a program run against a value, answering the outputs it
 // produced and the error it stopped on.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE LOAD-BEARING INTERFACE IS `JqOutcome`, AND THE ARGUMENT FOR IT IS
 // ONE SENTENCE: a jq filter that fails has usually already produced
 // output, and a `Result` throws that away.
@@ -48,7 +46,14 @@
 // the tests that moves here with the code.
 
 use std.json
+use std.list
+use std.math
+use std.str
+use jperror
+use jpeval
 use jpquery
+use jpregex
+use jqbuiltin
 use jqerror
 use jqlang
 
@@ -64,16 +69,17 @@ pub struct JqOutcome
 
 // What a run will not do.
 //
-// A bound rather than a promise.  `repeat(.)` and `recurse` are both
-// unbounded by construction, and a service evaluating a program a user
+// A bound rather than a promise.  `recurse(.)` is unbounded by
+// construction, and a service evaluating a program a user
 // typed wants a ceiling it chose rather than a process that does not
 // come back.
 pub struct JqLimits
     // How many outputs the run may produce before it stops.
     max_outputs: Int
     // How many filter applications it may make.  The larger number,
-    // and the one that bounds the cost: `[limit(1; repeat(.))]`
-    // produces one output and applies a filter forever.
+    // and the one that bounds the cost: `limit(1; recurse(.))` never
+    // finishes on its own, so its answer arrives only because a
+    // ceiling stopped the run.
     max_steps: Int
     // How deeply the evaluator may recurse, which bounds `recurse` and
     // a deeply nested program together.
@@ -94,11 +100,12 @@ pub struct JqEnv
 
 // The six JSON types, as jq names them.
 //
-// Assembled from the standard library's typed accessors, with the
-// rendering as the fallback for the one pair they cannot separate —
-// `{}` and `null`.  Published because `type` is a builtin, because
-// every error message needs it, and because a caller branching on a
-// value's kind should not write the same six-way question again.
+// One call to `json.type_of`, which separates every pair the typed
+// accessors cannot — `{}` and `null` included, the case that needs a
+// rendering when the question is asked the long way.  Published
+// because `type` is a builtin, because every error message needs it,
+// and because a caller branching on a value's kind should not write
+// the same six-way question again.
 pub enum JqKind
     JqKNull
     JqKBoolean
@@ -119,7 +126,7 @@ pub enum JqKind
 //     println("${jqeval.default_limits().max_outputs}")
 // ```
 pub fn default_limits() -> JqLimits []
-    todo("jsonquery-nv.jqeval.default_limits")
+    JqLimits { max_outputs: 100000, max_steps: 10000000, max_depth: 256 }
 
 // An environment with no bindings and the default budget.
 //
@@ -131,7 +138,7 @@ pub fn default_limits() -> JqLimits []
 //     println("${list.len(jqeval.empty_env().bindings)}")
 // ```
 pub fn empty_env() -> JqEnv []
-    todo("jsonquery-nv.jqeval.empty_env")
+    JqEnv { bindings: [], limits: default_limits() }
 
 // An environment with a budget the caller chose.
 //
@@ -142,7 +149,7 @@ pub fn empty_env() -> JqEnv []
 //     println("${jqeval.env_with(jqeval.default_limits()).limits.max_steps}")
 // ```
 pub fn env_with(limits: JqLimits) -> JqEnv []
-    todo("jsonquery-nv.jqeval.env_with")
+    JqEnv { bindings: [], limits: limits }
 
 // Bind a name, shadowing any earlier binding of it.
 //
@@ -155,8 +162,10 @@ pub fn env_with(limits: JqLimits) -> JqEnv []
 //         None    => println("unreachable")
 //         Some(v) => println("${jqeval.bind(jqeval.empty_env(), "n", v).bindings}")
 // ```
-pub fn bind(env: JqEnv, name: Str, value: JsonValueH) -> JqEnv []
-    todo("jsonquery-nv.jqeval.bind")
+pub fn bind(environment: JqEnv, name: Str, value: JsonValueH) -> JqEnv []
+    JqEnv { bindings: bound_with(environment.bindings,
+                                 JqBinding { name: name, value: value }),
+            limits: environment.limits }
 
 // What a name is bound to, or `None`.
 //
@@ -168,8 +177,10 @@ pub fn bind(env: JqEnv, name: Str, value: JsonValueH) -> JqEnv []
 //         None    => println("unbound")
 //         Some(_) => println("bound")
 // ```
-pub fn lookup(env: JqEnv, name: Str) -> ?JsonValueH []
-    todo("jsonquery-nv.jqeval.lookup")
+pub fn lookup(environment: JqEnv, name: Str) -> ?JsonValueH []
+    match find_binding(environment.bindings, name)
+        None    => None
+        Some(b) => Some(b.value)
 
 // Run a program over one value.
 //
@@ -192,7 +203,7 @@ pub fn lookup(env: JqEnv, name: Str) -> ?JsonValueH []
 //                         println(json.stringify(out))
 // ```
 pub fn run(p: jqlang.JqProgram, input: JsonValueH) -> JqOutcome []
-    todo("jsonquery-nv.jqeval.run")
+    run_with(p, input, empty_env())
 
 // Run a program with bindings and a budget.
 //
@@ -209,8 +220,9 @@ pub fn run(p: jqlang.JqProgram, input: JsonValueH) -> JqOutcome []
 //                 None    => println("not json")
 //                 Some(v) => println("${jqeval.failed(jqeval.run_with(p, v, jqeval.empty_env()))}")
 // ```
-pub fn run_with(p: jqlang.JqProgram, input: JsonValueH, env: JqEnv) -> JqOutcome []
-    todo("jsonquery-nv.jqeval.run_with")
+pub fn run_with(p: jqlang.JqProgram, input: JsonValueH, environment: JqEnv) -> JqOutcome []
+    var r = run_of(environment)
+    eval(var r, p.root, input, 0, top_scope())
 
 // Run a program over each of several values, answering one outcome
 // per input.
@@ -235,8 +247,11 @@ pub fn run_with(p: jqlang.JqProgram, input: JsonValueH, env: JqEnv) -> JqOutcome
 //                 None    => println("not json")
 //                 Some(v) => println("${list.len(jqeval.run_stream(p, [v], jqeval.empty_env()))}")
 // ```
-pub fn run_stream(p: jqlang.JqProgram, inputs: [JsonValueH], env: JqEnv) -> [JqOutcome] []
-    todo("jsonquery-nv.jqeval.run_stream")
+pub fn run_stream(p: jqlang.JqProgram, inputs: [JsonValueH], environment: JqEnv) -> [JqOutcome] []
+    var outs: [JqOutcome] = []
+    for v in inputs
+        list.push(outs, run_with(p, v, environment))
+    outs
 
 // Apply one filter to one value.
 //
@@ -254,8 +269,9 @@ pub fn run_stream(p: jqlang.JqProgram, inputs: [JsonValueH], env: JqEnv) -> [JqO
 //         None    => println("not json")
 //         Some(v) => println("${jqeval.failed(jqeval.apply(JqFIdentity(0), v, jqeval.empty_env()))}")
 // ```
-pub fn apply(f: jqlang.JqFilter, input: JsonValueH, env: JqEnv) -> JqOutcome []
-    todo("jsonquery-nv.jqeval.apply")
+pub fn apply(f: jqlang.JqFilter, input: JsonValueH, environment: JqEnv) -> JqOutcome []
+    var r = run_of(environment)
+    eval(var r, f, input, 0, top_scope())
 
 // Run a JSONPath query with JQ's rules.
 //
@@ -294,7 +310,8 @@ pub fn apply(f: jqlang.JqFilter, input: JsonValueH, env: JqEnv) -> JqOutcome []
 //                 Some(v) => println("${jqeval.failed(jqeval.select_path(q, v))}")
 // ```
 pub fn select_path(q: jpquery.JpQuery, v: JsonValueH) -> JqOutcome []
-    todo("jsonquery-nv.jqeval.select_path")
+    let walked = select_nodes(q, v, 0)
+    JqOutcome { values: values_of(walked.nodes), fault: walked.fault }
 
 // Run a JSONPath query with RFC 9535's rules, unchanged.
 //
@@ -321,7 +338,7 @@ pub fn select_path(q: jpquery.JpQuery, v: JsonValueH) -> JqOutcome []
 //                 Some(v) => println("${list.len(jqeval.select_path_rfc(q, v))}")
 // ```
 pub fn select_path_rfc(q: jpquery.JpQuery, v: JsonValueH) -> [JsonValueH] []
-    todo("jsonquery-nv.jqeval.select_path_rfc")
+    jpeval.select_values(q, v)
 
 // An outcome that produced these values and did not fail.
 //
@@ -333,7 +350,7 @@ pub fn select_path_rfc(q: jpquery.JpQuery, v: JsonValueH) -> [JsonValueH] []
 //     println("${list.len(jqeval.produced([]).values)}")
 // ```
 pub fn produced(values: [JsonValueH]) -> JqOutcome []
-    todo("jsonquery-nv.jqeval.produced")
+    JqOutcome { values: values, fault: None }
 
 // An outcome that produced these values and then failed.
 //
@@ -351,7 +368,7 @@ pub fn produced(values: [JsonValueH]) -> JqOutcome []
 //         Some(v) => println("${jqeval.failed(jqeval.raised([], jqerror.error(JqUserRaised, v, 0)))}")
 // ```
 pub fn raised(values: [JsonValueH], e: jqerror.JqError) -> JqOutcome []
-    todo("jsonquery-nv.jqeval.raised")
+    JqOutcome { values: values, fault: Some(e) }
 
 // Whether a run stopped on an error.
 //
@@ -363,7 +380,9 @@ pub fn raised(values: [JsonValueH], e: jqerror.JqError) -> JqOutcome []
 //     println("${jqeval.failed(jqeval.produced([]))}")
 // ```
 pub fn failed(o: JqOutcome) -> Bool []
-    todo("jsonquery-nv.jqeval.failed")
+    match o.fault
+        None    => false
+        Some(_) => true
 
 // jq's exit code for an outcome, with `-e` on or off.
 //
@@ -379,7 +398,24 @@ pub fn failed(o: JqOutcome) -> Bool []
 //     println("${jqeval.exit_code(jqeval.produced([]), false)}")
 // ```
 pub fn exit_code(o: JqOutcome, want_status: Bool) -> Int []
-    todo("jsonquery-nv.jqeval.exit_code")
+    match o.fault
+        Some(_) => 5
+        None    => status_code(o.values, want_status)
+
+// jq's rule for the code once nothing failed: no output is 1, and with
+// `-e` a last value of `null` or `false` is also 1.
+fn status_code(values: [JsonValueH], want_status: Bool) -> Int []
+    if list.len(values) == 0
+        return 1
+    if not want_status
+        return 0
+    match list.last(values)
+        // cov: skip — the empty list returned above, so list.last is always Some here
+        None    => 1
+        Some(v) =>
+            if truthy(v)
+                return 0
+            1
 
 // What kind of value this is.
 //
@@ -393,7 +429,13 @@ pub fn exit_code(o: JqOutcome, want_status: Bool) -> Int []
 //         Some(v) => println(jqeval.type_name(v))
 // ```
 pub fn kind(v: JsonValueH) -> JqKind []
-    todo("jsonquery-nv.jqeval.kind")
+    match json.type_of(v)
+        "null"    => JqKNull
+        "boolean" => JqKBoolean
+        "number"  => JqKNumber
+        "string"  => JqKString
+        "array"   => JqKArray
+        _         => JqKObject
 
 // The name `type` answers: "null", "boolean", "number", "string",
 // "array", "object".
@@ -408,7 +450,7 @@ pub fn kind(v: JsonValueH) -> JqKind []
 //         Some(v) => println(jqeval.type_name(v))
 // ```
 pub fn type_name(v: JsonValueH) -> Str []
-    todo("jsonquery-nv.jqeval.type_name")
+    json.type_of(v)
 
 // Whether a value is truthy.
 //
@@ -426,7 +468,11 @@ pub fn type_name(v: JsonValueH) -> Str []
 //         Some(v) => println("${jqeval.truthy(v)}")
 // ```
 pub fn truthy(v: JsonValueH) -> Bool []
-    todo("jsonquery-nv.jqeval.truthy")
+    if json.is_null(v)
+        return false
+    match json.to_bool(v)
+        None    => true
+        Some(b) => b
 
 // jq's total order over every pair of values: negative, zero or
 // positive.
@@ -452,14 +498,21 @@ pub fn truthy(v: JsonValueH) -> Bool []
 //         Some(v) => println("${jqeval.order(v, v)}")
 // ```
 pub fn order(a: JsonValueH, b: JsonValueH) -> Int []
-    todo("jsonquery-nv.jqeval.order")
+    let ra = rank_of(a)
+    let rb = rank_of(b)
+    if ra < rb
+        return 0 - 1
+    if ra > rb
+        return 1
+    compare_ranked(ra, a, b)
 
 // Structural equality: `1` and `1.0` are equal, member order is
 // irrelevant, and arrays compare element by element.
 //
-// `jpeval.value_equals` is the same predicate and this delegates to
-// it; there is no `json.equals` in the standard library for either of
-// them to defer to, which jsonpath-nv has already filed.
+// `jpeval.value_equals` is the same predicate, and this delegates to
+// it rather than asking the standard library's `json.equals` twice
+// over: one implementation of RFC 9535 § 2.3.5.2.2 in this directory
+// is one place for it to be wrong.
 //
 // ```novo
 // use std.json
@@ -471,7 +524,7 @@ pub fn order(a: JsonValueH, b: JsonValueH) -> Int []
 //         Some(v) => println("${jqeval.equal(v, v)}")
 // ```
 pub fn equal(a: JsonValueH, b: JsonValueH) -> Bool []
-    todo("jsonquery-nv.jqeval.equal")
+    jpeval.value_equals(a, b)
 
 // The JSON `null`.
 //
@@ -486,4 +539,2959 @@ pub fn equal(a: JsonValueH, b: JsonValueH) -> Bool []
 //     println(json.stringify(jqeval.null_value()))
 // ```
 pub fn null_value() -> JsonValueH []
-    todo("jsonquery-nv.jqeval.null_value")
+    json.null()
+
+// ── Values ───────────────────────────────────────────────────────────
+
+// Where a value sits in jq's total order, which is the one thing that
+// order is defined by: `null < false < true < numbers < strings <
+// arrays < objects`.
+fn rank_of(v: JsonValueH) -> Int []
+    match json.type_of(v)
+        "null"    => 0
+        "boolean" => bool_rank(json.to_bool(v) ?? false)
+        "number"  => 3
+        "string"  => 4
+        "array"   => 5
+        _         => 6
+
+fn bool_rank(b: Bool) -> Int []
+    if b
+        return 2
+    1
+
+// Two values of the same rank, compared.
+fn compare_ranked(rank: Int, a: JsonValueH, b: JsonValueH) -> Int []
+    if rank < 3
+        return 0
+    if rank == 3
+        return compare_floats(number_of(a) ?? 0.0, number_of(b) ?? 0.0)
+    if rank == 4
+        return compare_text(json.to_str(a) ?? "", json.to_str(b) ?? "")
+    if rank == 5
+        return compare_lists(json.to_list(a) ?? [], json.to_list(b) ?? [])
+    compare_members(object_pairs(a), object_pairs(b))
+
+// Negative, zero or positive for the two floats' order.
+fn compare_floats(a: Float, b: Float) -> Int []
+    if a < b
+        return 0 - 1
+    if a > b
+        return 1
+    0
+
+// The same for two strings, which novo compares itself.
+fn compare_text(a: Str, b: Str) -> Int []
+    if a < b
+        return 0 - 1
+    if a > b
+        return 1
+    0
+
+// Element by element, and a prefix sorts before what it is a prefix of.
+fn compare_lists(a: [JsonValueH], b: [JsonValueH]) -> Int []
+    var i = 0
+    var answer = 0
+    var go = true
+    while go
+        if i >= list.len(a)
+            go = false
+            if i < list.len(b)
+                answer = 0 - 1
+        elif i >= list.len(b)
+            go = false
+            answer = 1
+        else
+            let c = order(a[i], b[i])
+            if c == 0
+                i = i + 1
+            else
+                go = false
+                answer = c
+    answer
+
+// An object's members in the sorted-key order jq compares them by.
+fn compare_members(a: [(Str, JsonValueH)], b: [(Str, JsonValueH)]) -> Int []
+    let ka = sorted_names(keys_of(a))
+    let kb = sorted_names(keys_of(b))
+    let by_key = compare_texts(ka, kb)
+    if by_key != 0
+        return by_key
+    compare_lists(values_for(ka, a), values_for(ka, b))
+
+fn keys_of(xs: [(Str, JsonValueH)]) -> [Str] []
+    var out: [Str] = []
+    for p in xs
+        list.push(out, pair_key(p))
+    out
+
+fn values_for(ks: [Str], xs: [(Str, JsonValueH)]) -> [JsonValueH] []
+    var out: [JsonValueH] = []
+    for k in ks
+        list.push(out, lookup_pair(xs, k))
+    out
+
+fn lookup_pair(xs: [(Str, JsonValueH)], k: Str) -> JsonValueH []
+    var found = json.null()
+    var go = true
+    for p in xs
+        if go
+            if pair_key(p) == k
+                found = pair_value(p)
+                go = false
+    found
+
+fn pair_key(p: (Str, JsonValueH)) -> Str []
+    let k = p.0
+    k
+
+fn pair_value(p: (Str, JsonValueH)) -> JsonValueH []
+    let v = p.1
+    v
+
+// Two lists of names in codepoint order.
+fn compare_texts(a: [Str], b: [Str]) -> Int []
+    var i = 0
+    var answer = 0
+    var go = true
+    while go
+        if i >= list.len(a)
+            go = false
+            if i < list.len(b)
+                answer = 0 - 1
+        elif i >= list.len(b)
+            go = false
+            answer = 1
+        else
+            let c = compare_text(a[i], b[i])
+            if c == 0
+                i = i + 1
+            else
+                go = false
+                answer = c
+    answer
+
+// A number's value, whatever JSON type carries it.
+fn number_of(v: JsonValueH) -> ?Float []
+    json.to_float(v)
+
+// Whether a value is a number at all.
+fn is_number(v: JsonValueH) -> Bool []
+    json.type_of(v) == "number"
+
+fn is_whole(f: Float) -> Bool []
+    if math.is_nan(f)
+        return false
+    if math.is_inf(f)
+        return false
+    math.floor(f) == f
+
+// A number built so that an integral one answers an integer, which is
+// the difference between `2` and `2.0` in every rendering jq prints.
+fn number_from(f: Float) -> JsonValueH []
+    if is_whole(f)
+        return whole_value(f)
+    json.float(f)
+
+fn whole_value(f: Float) -> JsonValueH []
+    match math.checked_to_int(f)
+        None    => json.float(f)
+        Some(n) => json.int(n)
+
+// Whether a value is the JSON string `s`.
+fn is_str(v: JsonValueH) -> Bool []
+    json.type_of(v) == "string"
+
+fn text_of(v: JsonValueH) -> Str []
+    json.to_str(v) ?? ""
+
+// The members of an object, in the document's order.
+fn object_pairs(v: JsonValueH) -> [(Str, JsonValueH)] []
+    var out: [(Str, JsonValueH)] = []
+    for k in json.keys(v)
+        for x in child_list(json.get(v, k))
+            list.push(out, (k, x))
+    out
+
+// The elements of an array, or the member values of an object, in
+// document order.
+fn children(v: JsonValueH) -> [JsonValueH] []
+    let t = json.type_of(v)
+    if t == "array"
+        return json.to_list(v) ?? []
+    if t == "object"
+        var out: [JsonValueH] = []
+        for p in object_pairs(v)
+            list.push(out, pair_value(p))
+        return out
+    []
+
+// A one-element list from an optional value.
+fn child_list(v: ?JsonValueH) -> [JsonValueH] []
+    match v
+        // cov: skip — every caller passes a member of an object it has just listed, so json.get is always Some
+        None    => []
+        Some(x) => [x]
+
+fn produced_one(v: JsonValueH) -> JqOutcome []
+    JqOutcome { values: [v], fault: None }
+
+// ── The run ──────────────────────────────────────────────────────────
+
+// One `def` in scope: what it is called, the names it takes, its body,
+// and the index the body's scope starts at.
+//
+// The scope is what makes jq's parameters possible here without
+// closures.  jq's function parameters are FILTERS rather than values —
+// `def twice(f): f | f` given `.a` evaluates `.a` twice — so a call
+// pushes each argument as a zero-parameter entry whose body is the
+// argument filter, and the index says how far down the stack that
+// filter may look.  Without it, an argument named `x` handed to a
+// parameter named `x` would resolve to itself and never terminate.
+struct JqDef
+    name: Str
+    parameters: [Str]
+    body: jqlang.JqFilter
+    scope: JqScope
+
+// Where a name is looked up from: the lowest definition index that is
+// visible, and the one entry that is not.
+struct JqScope
+    floor: Int
+    skip: Int
+
+// The state one run carries.
+//
+// The two counters are fields of a `var` struct rather than `var Int`
+// parameters because a scalar `var` parameter the callee writes keeps
+// the write, and every step of a run has to charge the same budget.
+struct Run
+    var bindings: [JqBinding]
+    var defs: [JqDef]
+    max_outputs: Int
+    max_steps: Int
+    max_depth: Int
+    var steps: Int
+    var over: Bool
+
+// The scope a program starts in: everything visible, nothing skipped.
+fn top_scope() -> JqScope []
+    JqScope { floor: 0, skip: 0 - 1 }
+
+// A list of bindings handed on without lending out the one it came
+// from.
+fn copy_bindings(xs: [JqBinding]) -> [JqBinding] []
+    var out: [JqBinding] = []
+    for x in xs
+        list.push(out, x)
+    out
+
+// The run an environment describes.
+fn run_of(environment: JqEnv) -> Run []
+    Run { bindings: copy_bindings(environment.bindings), defs: [],
+          max_outputs: environment.limits.max_outputs,
+          max_steps: environment.limits.max_steps, max_depth: environment.limits.max_depth,
+          steps: 0, over: false }
+
+// The error a run raises when a budget is crossed.
+//
+// The pool of a budget is that a program cannot decide to ignore one,
+// which is why `jqerror.is_catchable` says `false` for it.
+fn budget_error(f: jqlang.JqFilter) -> jqerror.JqError []
+    jqerror.error(JqOverBudget, json.string("the run crossed its budget"),
+                  jqlang.position(f))
+
+// Append one output, unless the output budget is spent.  Answers false
+// when the run has to stop, having set the flag `eval` reads.
+fn emit(var r: Run, var out: [JsonValueH], v: JsonValueH) -> Bool []
+    if list.len(out) >= r.max_outputs
+        r.over = true
+        return false
+    list.push(out, v)
+    true
+
+// Append every value of a list, answering false when the budget stops
+// the run part way.
+fn emit_all(var r: Run, var out: [JsonValueH], xs: [JsonValueH]) -> Bool []
+    var ok = true
+    for v in xs
+        if ok
+            if not emit(r, out, v)
+                ok = false
+    ok
+
+// The error that stops a run: the inner one where there is one, else
+// the outer.
+fn pick_error(inner: ?jqerror.JqError, outer: ?jqerror.JqError) -> ?jqerror.JqError []
+    match inner
+        Some(_) => inner
+        None    => outer
+
+// Whether an optional error is one.
+fn broke(e: ?jqerror.JqError) -> Bool []
+    match e
+        None    => false
+        Some(_) => true
+
+// An outcome carrying what it has and the error that stopped it.
+fn stopped(values: [JsonValueH], e: ?jqerror.JqError) -> JqOutcome []
+    JqOutcome { values: values, fault: e }
+
+// ── Bindings and definitions ─────────────────────────────────────────
+
+// One more binding, without touching the list it came from.
+fn bound_with(xs: [JqBinding], b: JqBinding) -> [JqBinding] []
+    var out: [JqBinding] = []
+    for x in xs
+        list.push(out, x)
+    list.push(out, b)
+    out
+
+// The last binding of a name, which is the one that wins.
+fn find_binding(xs: [JqBinding], name: Str) -> ?JqBinding []
+    var i = list.len(xs)
+    var found: ?JqBinding = None
+    var go = true
+    while go
+        if i == 0
+            go = false
+        else
+            i = i - 1
+            let b = xs[i]
+            if b.name == name
+                found = Some(b)
+                go = false
+    found
+
+// The definition a name resolves to, searched from the top down to the
+// floor and skipping the one entry the scope excludes.
+fn find_def_index(defs: [JqDef], name: Str, sc: JqScope) -> ?Int []
+    var i = list.len(defs) - 1
+    var found: ?Int = None
+    var go = true
+    while go
+        if i < sc.floor
+            go = false
+        elif i == sc.skip
+            i = i - 1
+        else
+            let d = defs[i]
+            if d.name == name
+                found = Some(i)
+                go = false
+            else
+                i = i - 1
+    found
+
+// Push every name a pattern binds, answering the error a computed key
+// raised.
+fn bind_pattern(var r: Run, p: jqlang.JqPattern, v: JsonValueH, d: Int,
+                sc: JqScope) -> ?jqerror.JqError []
+    match p
+        JqPVariable(nm)    =>
+            r.bindings = bound_with(r.bindings, JqBinding { name: nm, value: v })
+            None
+        JqPArray(elements) =>
+            var err: ?jqerror.JqError = None
+            var i = 0
+            let xs = json.to_list(v) ?? []
+            for e in elements
+                if not broke(err)
+                    let item = element_at(xs, i)
+                    err = bind_pattern(var r, e, item, d, sc)
+                    i = i + 1
+            err
+        JqPObject(entries) => bind_entries(var r, entries, v, d, sc)
+
+fn element_at(xs: [JsonValueH], i: Int) -> JsonValueH []
+    // cov: skip — the one caller counts from zero, so i is never negative
+    if i < 0
+        return json.null()
+    if i >= list.len(xs)
+        return json.null()
+    xs[i]
+
+fn bind_entries(var r: Run, entries: [jqlang.JqPatternEntry], v: JsonValueH, d: Int,
+                sc: JqScope) -> ?jqerror.JqError []
+    var err: ?jqerror.JqError = None
+    for e in entries
+        if not broke(err)
+            let keys = eval(var r, e.key, v, d + 1, sc)
+            match keys.fault
+                Some(x) =>
+                    err = Some(x)
+                None    =>
+                    for k in keys.values
+                        if not broke(err)
+                            if not is_str(k)
+                                err = Some(jqerror.error(JqTypeMismatch,
+                                              json.string("object keys must be strings"), 0))
+                            else
+                                let member = member_or_null(v, text_of(k))
+                                err = bind_pattern(var r, e.pattern, member, d, sc)
+    err
+
+// The value of a member, or `null` — jq's missing-is-null rule, which
+// a pattern follows too.
+fn member_or_null(v: JsonValueH, name: Str) -> JsonValueH []
+    match json.get(v, name)
+        None    => json.null()
+        Some(x) => x
+
+// ── The evaluator ────────────────────────────────────────────────────
+
+// Run one filter against one input, charging the budget on the way in.
+//
+// The charge is HERE rather than at each recursive call so there is one
+// place a run can be stopped and one place that turns the flag back
+// into the error every caller is already holding.
+fn eval(var r: Run, f: jqlang.JqFilter, input: JsonValueH, d: Int, sc: JqScope) -> JqOutcome []
+    r.steps = r.steps + 1
+    if r.over
+        return stopped([], Some(budget_error(f)))
+    if r.steps > r.max_steps
+        r.over = true
+        return stopped([], Some(budget_error(f)))
+    if d > r.max_depth
+        r.over = true
+        return stopped([], Some(budget_error(f)))
+    let o = eval_node(var r, f, input, d, sc)
+    if r.over
+        return stopped(o.values, Some(budget_error(f)))
+    o
+
+// One filter, by shape.
+fn eval_node(var r: Run, f: jqlang.JqFilter, input: JsonValueH, d: Int, sc: JqScope) -> JqOutcome []
+    match f
+        JqFIdentity(_)                => produced_one(input)
+        JqFPath(_, q)                 => query_result(q, input, jqlang.position(f))
+        JqFLiteral(_, v)              => produced_one(literal_value(v))
+        JqFPipe(_, l, x)              => eval_pipe(var r, l, x, input, d, sc)
+        JqFComma(_, l, x)             => eval_comma(var r, l, x, input, d, sc)
+        JqFArray(_, b)                => eval_array(var r, b, input, d, sc)
+        JqFObject(_, fs)              => eval_object(var r, fs, input, d, sc)
+        JqFBinary(_, op, l, x)        => eval_binary(var r, op, l, x, input, d, sc)
+        JqFNegate(_, b)               => eval_negate(var r, b, input, d, sc)
+        JqFIf(_, c, y, n)             => eval_if(var r, c, y, n, input, d, sc)
+        JqFTry(_, b, h)               => eval_try(var r, b, h, input, d, sc)
+        JqFReduce(_, s, p, i, u)      => eval_reduce(var r, s, p, i, u, input, d, sc)
+        JqFForeach(_, s, p, i, u, x)  => eval_foreach(var r, s, p, i, u, x, input, d, sc)
+        JqFBind(_, s, p, b)           => eval_bind(var r, s, p, b, input, d, sc)
+        JqFVariable(_, nm)            => eval_variable(var r, nm, f, sc)
+        JqFCall(_, callee, args)      => eval_call(var r, callee, args, input, d, sc, jqlang.position(f))
+        JqFDefine(_, nm, ps, b, rest) => eval_define(var r, nm, ps, b, rest, input, d, sc)
+        JqFInterpolate(_, parts)      => eval_interpolate(var r, parts, input, d, sc)
+
+// A literal as a value.
+fn literal_value(v: jqlang.JqLiteral) -> JsonValueH []
+    match v
+        JqLNull      => json.null()
+        JqLBool(b)   => json.bool(b)
+        JqLNumber(x) => number_from(x)
+        JqLString(s) => json.string(s)
+
+// A path, with jq's rules for the places an RFC 9535 walk has none.
+fn query_result(q: jpquery.JpQuery, input: JsonValueH, at: Int) -> JqOutcome []
+    let walked = select_nodes(q, input, at)
+    stopped(values_of(walked.nodes), walked.fault)
+
+// `f | g` — every output of `f` fed to `g` in turn.
+//
+// The outputs `f` managed before it raised are still fed to `g`, which
+// is what jq's streaming pipe does and what
+// `.[] | (., error("stop"))` shows: the first element of `[1]` reaches
+// the echo before the error is raised, so the outcome carries one value
+// AND the error.
+fn eval_pipe(var r: Run, left: jqlang.JqFilter, right: jqlang.JqFilter, input: JsonValueH, d: Int,
+             sc: JqScope) -> JqOutcome []
+    let lo = eval(var r, left, input, d + 1, sc)
+    var out: [JsonValueH] = []
+    var err: ?jqerror.JqError = None
+    var go = true
+    for v in lo.values
+        if go
+            let ro = eval(var r, right, v, d + 1, sc)
+            if not emit_all(var r, var out, ro.values)
+                go = false
+            if broke(ro.fault)
+                err = ro.fault
+                go = false
+    if broke(err)
+        return stopped(out, err)
+    stopped(out, lo.fault)
+
+// `f, g` — the outputs of `f`, then the outputs of `g`.
+fn eval_comma(var r: Run, left: jqlang.JqFilter, right: jqlang.JqFilter, input: JsonValueH, d: Int,
+              sc: JqScope) -> JqOutcome []
+    let lo = eval(var r, left, input, d + 1, sc)
+    var out: [JsonValueH] = []
+    emit_all(var r, var out, lo.values)
+    if broke(lo.fault)
+        return stopped(out, lo.fault)
+    let ro = eval(var r, right, input, d + 1, sc)
+    emit_all(var r, var out, ro.values)
+    stopped(out, ro.fault)
+
+// `[f]` — the stream turned back into one value.
+fn eval_array(var r: Run, body: jqlang.JqFilter, input: JsonValueH, d: Int,
+              sc: JqScope) -> JqOutcome []
+    let o = eval(var r, body, input, d + 1, sc)
+    if broke(o.fault)
+        return stopped([], o.fault)
+    produced_one(json.array(o.values))
+
+// `{a: f, ...}` — one object per combination of the parts' outputs.
+//
+// A field's key is computed, so `{(.k): .v}` is the same node with a
+// path on the left, and a later field of the same name wins, which is
+// jq's rule and the reason `with_member` replaces rather than appends.
+fn eval_object(var r: Run, fields: [jqlang.JqField], input: JsonValueH, d: Int,
+               sc: JqScope) -> JqOutcome []
+    var partials: [JsonValueH] = []
+    list.push(partials, json.object([]))
+    var err: ?jqerror.JqError = None
+    var go = true
+    for fld in fields
+        if go
+            var next: [JsonValueH] = []
+            for base in partials
+                if go
+                    let ko = eval(var r, fld.key, input, d + 1, sc)
+                    if broke(ko.fault)
+                        err = ko.fault
+                        go = false
+                    else
+                        for k in ko.values
+                            if go
+                                if not is_str(k)
+                                    err = Some(jqerror.error(JqTypeMismatch,
+                                                  json.string("object keys must be strings"),
+                                                  jqlang.position(fld.key)))
+                                    go = false
+                                else
+                                    let vo = eval(var r, fld.value, input, d + 1, sc)
+                                    if broke(vo.fault)
+                                        err = vo.fault
+                                        go = false
+                                    else
+                                        for v in vo.values
+                                            list.push(next, with_member(base, text_of(k), v))
+            partials = next
+    if broke(err)
+        return stopped([], err)
+    var out: [JsonValueH] = []
+    emit_all(var r, var out, partials)
+    stopped(out, None)
+
+// One member set, on a copy.
+fn with_member(base: JsonValueH, k: Str, v: JsonValueH) -> JsonValueH []
+    let pairs = object_pairs(base)
+    var out: [(Str, JsonValueH)] = []
+    var seen = false
+    for p in pairs
+        if pair_key(p) == k
+            list.push(out, (k, v))
+            seen = true
+        else
+            list.push(out, p)
+    if not seen
+        list.push(out, (k, v))
+    json.object(out)
+
+// `-f` — applied to the OUTPUTS of `f`, so `-(.a, .b)` negates two.
+fn eval_negate(var r: Run, body: jqlang.JqFilter, input: JsonValueH, d: Int,
+               sc: JqScope) -> JqOutcome []
+    let o = eval(var r, body, input, d + 1, sc)
+    var out: [JsonValueH] = []
+    var err = o.fault
+    for v in o.values
+        match number_of(v)
+            None    =>
+                if not broke(err)
+                    err = Some(jqerror.error(JqTypeMismatch,
+                                 json.string(text_of(v) + " cannot be negated"),
+                                 jqlang.position(body)))
+            Some(f) => list.push(out, number_from(0.0 - f))
+    stopped(out, err)
+
+// `if c then a else b end` — once per output of the condition, which is
+// what makes `if (true, false) then 1 else 2 end` two values.
+fn eval_if(var r: Run, cond: jqlang.JqFilter, yes: jqlang.JqFilter, no: jqlang.JqFilter,
+           input: JsonValueH, d: Int, sc: JqScope) -> JqOutcome []
+    let co = eval(var r, cond, input, d + 1, sc)
+    var out: [JsonValueH] = []
+    var err: ?jqerror.JqError = None
+    var go = true
+    for c in co.values
+        if go
+            if truthy(c)
+                let yo = eval(var r, yes, input, d + 1, sc)
+                emit_all(var r, var out, yo.values)
+                if broke(yo.fault)
+                    err = yo.fault
+                    go = false
+            else
+                let xo = eval(var r, no, input, d + 1, sc)
+                emit_all(var r, var out, xo.values)
+                if broke(xo.fault)
+                    err = xo.fault
+                    go = false
+    if broke(err)
+        return stopped(out, err)
+    stopped(out, co.fault)
+
+// `try f catch g`, and `f?` with `empty` for the handler.
+//
+// The handler's INPUT is the error's value rather than the original
+// input, which is what makes `try error({code: 4}) catch .code` read a
+// member out of what was raised.  A budget is not catchable, so the run
+// stops rather than letting a program decide to ignore its ceiling.
+fn eval_try(var r: Run, body: jqlang.JqFilter, handler: jqlang.JqFilter, input: JsonValueH, d: Int,
+            sc: JqScope) -> JqOutcome []
+    let o = eval(var r, body, input, d + 1, sc)
+    match o.fault
+        None    => o
+        Some(e) =>
+            if not jqerror.is_catchable(e.kind)
+                return o
+            let h = eval(var r, handler, jqerror.error_value(e), d + 1, sc)
+            stopped(cat(o.values, h.values), h.fault)
+
+// `reduce s as $x (init; update)` — one output per init value, that
+// value's last state.
+//
+// The state is the LAST output of `update`, which is the reading that
+// makes `reduce` deterministic over a multi-output update.  An update
+// that produces nothing sets the state to null and the fold goes on
+// with the next item, and an init with several outputs folds once per
+// output — both readings measured against jq 1.7, as is the order the
+// faults arrive in: a fold's own fault ends the run, then the
+// source's, then the init's, each after the outputs already made.
+fn eval_reduce(var r: Run, source: jqlang.JqFilter, pattern: jqlang.JqPattern,
+               init: jqlang.JqFilter, update: jqlang.JqFilter, input: JsonValueH, d: Int,
+               sc: JqScope) -> JqOutcome []
+    let start = eval(var r, init, input, d + 1, sc)
+    let so = eval(var r, source, input, d + 1, sc)
+    var out: [JsonValueH] = []
+    var err: ?jqerror.JqError = None
+    for state in start.values
+        if not broke(err)
+            var acc = state
+            var live = true
+            for item in so.values
+                if live
+                    var saved = r.bindings
+                    let be = bind_pattern(var r, pattern, item, d + 1, sc)
+                    if broke(be)
+                        err = be
+                        live = false
+                    else
+                        let uo = eval(var r, update, acc, d + 1, sc)
+                        match list.last(uo.values)
+                            None     =>
+                                acc = null_value()
+                            Some(nx) =>
+                                acc = nx
+                        if broke(uo.fault)
+                            err = uo.fault
+                            live = false
+                    r.bindings = saved
+            if not broke(err)
+                if broke(so.fault)
+                    err = so.fault
+                else
+                    list.push(out, acc)
+    if not broke(err)
+        err = start.fault
+    if broke(err)
+        return stopped(out, err)
+    produced(out)
+
+// `foreach s as $x (init; update; extract)` — the state at every step.
+//
+// Same readings as `reduce` for the state: an update that produces
+// nothing makes the state null and emits nothing for that item (the
+// extract is not run), and an init with several outputs runs once per
+// output.  The faults arrive in the same order, with the outputs
+// already emitted kept.
+fn eval_foreach(var r: Run, source: jqlang.JqFilter, pattern: jqlang.JqPattern,
+                init: jqlang.JqFilter, update: jqlang.JqFilter, extract: jqlang.JqFilter,
+                input: JsonValueH, d: Int, sc: JqScope) -> JqOutcome []
+    let start = eval(var r, init, input, d + 1, sc)
+    let so = eval(var r, source, input, d + 1, sc)
+    var out: [JsonValueH] = []
+    var err: ?jqerror.JqError = None
+    for state in start.values
+        if not broke(err)
+            var acc = state
+            var live = true
+            for item in so.values
+                if live
+                    var saved = r.bindings
+                    let be = bind_pattern(var r, pattern, item, d + 1, sc)
+                    if broke(be)
+                        err = be
+                        live = false
+                    else
+                        let uo = eval(var r, update, acc, d + 1, sc)
+                        match list.last(uo.values)
+                            None     =>
+                                acc = null_value()
+                            Some(nx) =>
+                                acc = nx
+                                let eo = eval(var r, extract, acc, d + 1, sc)
+                                emit_all(var r, var out, eo.values)
+                                if broke(eo.fault)
+                                    err = eo.fault
+                                    live = false
+                        if broke(uo.fault)
+                            err = uo.fault
+                            live = false
+                    r.bindings = saved
+            if not broke(err)
+                if broke(so.fault)
+                    err = so.fault
+    if not broke(err)
+        err = start.fault
+    if broke(err)
+        return stopped(out, err)
+    produced(out)
+
+// `f as $x | g` — `g` once per output of `f`, over the ORIGINAL input.
+fn eval_bind(var r: Run, source: jqlang.JqFilter, pattern: jqlang.JqPattern, body: jqlang.JqFilter,
+             input: JsonValueH, d: Int, sc: JqScope) -> JqOutcome []
+    let so = eval(var r, source, input, d + 1, sc)
+    var out: [JsonValueH] = []
+    var err: ?jqerror.JqError = None
+    var go = true
+    for item in so.values
+        if go
+            var saved = r.bindings
+            let be = bind_pattern(var r, pattern, item, d + 1, sc)
+            if broke(be)
+                err = be
+                go = false
+            else
+                let bo = eval(var r, body, input, d + 1, sc)
+                emit_all(var r, var out, bo.values)
+                if broke(bo.fault)
+                    err = bo.fault
+                    go = false
+            r.bindings = saved
+    if broke(err)
+        return stopped(out, err)
+    stopped(out, so.fault)
+
+// `$name`.
+fn eval_variable(var r: Run, name: Str, f: jqlang.JqFilter, sc: JqScope) -> JqOutcome []
+    match find_binding(r.bindings, name)
+        Some(b) => produced_one(b.value)
+        None    => stopped([], Some(jqerror.error(JqBadArgument, json.string(name),
+                                        jqlang.position(f))))
+
+// A definition in scope over the rest of the program.
+fn eval_define(var r: Run, name: Str, parameters: [Str], body: jqlang.JqFilter,
+               rest: jqlang.JqFilter, input: JsonValueH, d: Int, sc: JqScope) -> JqOutcome []
+    var saved = r.defs
+    r.defs = defs_with(r.defs, JqDef { name: name, parameters: parameters, body: body,
+                                       scope: sc })
+    let o = eval(var r, rest, input, d + 1, sc)
+    r.defs = saved
+    o
+
+fn defs_with(xs: [JqDef], d: JqDef) -> [JqDef] []
+    var out: [JqDef] = []
+    for x in xs
+        list.push(out, x)
+    list.push(out, d)
+    out
+
+// `"a\(.b)c"`.
+//
+// Each interpolated filter may produce several outputs, and the string
+// is built once per combination, which is why this is one node rather
+// than a `+` chain of pieces the parser invented.
+fn eval_interpolate(var r: Run, parts: [jqlang.JqStrPart], input: JsonValueH, d: Int,
+                    sc: JqScope) -> JqOutcome []
+    var texts: [Str] = []
+    list.push(texts, "")
+    var err: ?jqerror.JqError = None
+    var go = true
+    for p in parts
+        if go
+            match p
+                JqSText(s)        =>
+                    var next: [Str] = []
+                    for t in texts
+                        list.push(next, t + s)
+                    texts = next
+                JqSInterpolate(b) =>
+                    let o = eval(var r, b, input, d + 1, sc)
+                    if broke(o.fault)
+                        err = o.fault
+                        go = false
+                    else
+                        var next: [Str] = []
+                        for t in texts
+                            for v in o.values
+                                list.push(next, t + to_text(v))
+                        texts = next
+    if broke(err)
+        return stopped([], err)
+    var out: [JsonValueH] = []
+    for t in texts
+        list.push(out, json.string(t))
+    stopped(out, None)
+
+// What a value looks like inside a string.
+//
+// jq's own rule, which is `tostring`'s: a string stands for itself and
+// everything else is its JSON.
+fn to_text(v: JsonValueH) -> Str []
+    if is_str(v)
+        return text_of(v)
+    json.stringify(v)
+
+// A list, without touching the ones it came from.
+fn cat(a: [JsonValueH], b: [JsonValueH]) -> [JsonValueH] []
+    var out: [JsonValueH] = []
+    for x in a
+        list.push(out, x)
+    for x in b
+        list.push(out, x)
+    out
+
+// ── Operators ────────────────────────────────────────────────────────
+
+// What applying an operator produced.  Two fields rather than a
+// `?JsonValueH` because a JSON `null` is a value and the absence of one
+// is not a value at all.
+struct JqAttempt
+    value: JsonValueH
+    error: ?jqerror.JqError
+
+fn ok(v: JsonValueH) -> JqAttempt []
+    JqAttempt { value: v, error: None }
+
+// The refusal every operator shares: two types it has no meaning for.
+fn bad(a: JsonValueH, b: JsonValueH, at: Int) -> JqAttempt []
+    JqAttempt { value: json.null(),
+                error: Some(jqerror.error(JqTypeMismatch,
+                              json.string(type_name(a) + " and " + type_name(b)
+                                          + " have no such operation"),
+                              at)) }
+
+// `f and g` — short-circuiting, over truthiness rather than booleans,
+// and once per pair of outputs.
+fn eval_and(var r: Run, left: jqlang.JqFilter, right: jqlang.JqFilter, input: JsonValueH, d: Int,
+            sc: JqScope) -> JqOutcome []
+    let lo = eval(var r, left, input, d + 1, sc)
+    if broke(lo.fault)
+        return stopped([], lo.fault)
+    var out: [JsonValueH] = []
+    var err: ?jqerror.JqError = None
+    var go = true
+    for a in lo.values
+        if go
+            if truthy(a)
+                let ro = eval(var r, right, input, d + 1, sc)
+                for b in ro.values
+                    if go
+                        if not emit(r, out, json.bool(truthy(b)))
+                            go = false
+                if broke(ro.fault)
+                    err = ro.fault
+                    go = false
+            elif not emit(r, out, json.bool(false))
+                go = false
+    if broke(err)
+        return stopped(out, err)
+    stopped(out, None)
+
+// `f or g`, the same way round.
+fn eval_or(var r: Run, left: jqlang.JqFilter, right: jqlang.JqFilter, input: JsonValueH, d: Int,
+           sc: JqScope) -> JqOutcome []
+    let lo = eval(var r, left, input, d + 1, sc)
+    if broke(lo.fault)
+        return stopped([], lo.fault)
+    var out: [JsonValueH] = []
+    var err: ?jqerror.JqError = None
+    var go = true
+    for a in lo.values
+        if go
+            if truthy(a)
+                if not emit(r, out, json.bool(true))
+                    go = false
+            else
+                let ro = eval(var r, right, input, d + 1, sc)
+                for b in ro.values
+                    if go
+                        if not emit(r, out, json.bool(truthy(b)))
+                            go = false
+                if broke(ro.fault)
+                    err = ro.fault
+                    go = false
+    if broke(err)
+        return stopped(out, err)
+    stopped(out, None)
+
+// `f // g` — the truthy outputs of `f`, or `g` when there are none.
+//
+// The reading taken here is jq's definition in words: "the values of
+// `f` that are not `false` or `null`, or, if there are none, the values
+// of `g`".  `f`'s ERROR is swallowed along with its falsy values, which
+// is what makes `.a.b // "none"` work on a document where `.a` is a
+// number — the left side raises, produces no truthy value, and the
+// right side answers.  When `f` did produce a truthy value, its error
+// still travels: `(1, error("x")) // 2` answers 1 and then raises.
+fn eval_alternative(var r: Run, left: jqlang.JqFilter, right: jqlang.JqFilter, input: JsonValueH,
+                    d: Int, sc: JqScope) -> JqOutcome []
+    let lo = eval(var r, left, input, d + 1, sc)
+    var good: [JsonValueH] = []
+    for v in lo.values
+        if truthy(v)
+            list.push(good, v)
+    if list.len(good) == 0
+        return eval(var r, right, input, d + 1, sc)
+    var out: [JsonValueH] = []
+    emit_all(var r, var out, good)
+    stopped(out, lo.fault)
+
+// `f op g` — the cartesian product of the two sides' outputs.
+fn eval_binary(var r: Run, op: jqlang.JqBinOp, left: jqlang.JqFilter, right: jqlang.JqFilter,
+               input: JsonValueH, d: Int, sc: JqScope) -> JqOutcome []
+    match op
+        JqOpAnd         => eval_and(var r, left, right, input, d, sc)
+        JqOpOr          => eval_or(var r, left, right, input, d, sc)
+        JqOpAlternative => eval_alternative(var r, left, right, input, d, sc)
+        _               => eval_op_product(var r, op, left, right, input, d, sc)
+
+fn eval_op_product(var r: Run, op: jqlang.JqBinOp, left: jqlang.JqFilter, right: jqlang.JqFilter,
+                   input: JsonValueH, d: Int, sc: JqScope) -> JqOutcome []
+    let at = jqlang.position(left)
+    let lo = eval(var r, left, input, d + 1, sc)
+    if broke(lo.fault)
+        return stopped([], lo.fault)
+    var out: [JsonValueH] = []
+    var err: ?jqerror.JqError = None
+    var go = true
+    for a in lo.values
+        if go
+            let ro = eval(var r, right, input, d + 1, sc)
+            if broke(ro.fault)
+                err = ro.fault
+                go = false
+            else
+                for b in ro.values
+                    if go
+                        let tried = apply_op(op, a, b, at)
+                        if broke(tried.error)
+                            err = tried.error
+                            go = false
+                        elif not emit(r, out, tried.value)
+                            go = false
+    if broke(err)
+        return stopped(out, err)
+    stopped(out, None)
+
+// One operator on one pair of values.
+fn apply_op(op: jqlang.JqBinOp, a: JsonValueH, b: JsonValueH, at: Int) -> JqAttempt []
+    match op
+        JqOpAdd          => add_attempt(a, b, at)
+        JqOpSubtract     => subtract_attempt(a, b, at)
+        JqOpMultiply     => multiply_attempt(a, b, at)
+        JqOpDivide       => divide_attempt(a, b, at)
+        JqOpModulo       => modulo_attempt(a, b, at)
+        JqOpEqual        => ok(json.bool(jpeval.value_equals(a, b)))
+        JqOpNotEqual     => ok(json.bool(not jpeval.value_equals(a, b)))
+        JqOpLess         => ok(json.bool(order(a, b) < 0))
+        JqOpLessEqual    => ok(json.bool(order(a, b) <= 0))
+        JqOpGreater      => ok(json.bool(order(a, b) > 0))
+        JqOpGreaterEqual => ok(json.bool(order(a, b) >= 0))
+        // cov: skip — the three operators left out above go to eval_and, eval_or and eval_alternative before apply_op is reached
+        _                => bad(a, b, at)
+
+// `+` — null is the identity of all four container cases, which is why
+// `{} + null` is `{}` and not a refusal.
+fn add_attempt(a: JsonValueH, b: JsonValueH, at: Int) -> JqAttempt []
+    if json.is_null(a)
+        return ok(b)
+    if json.is_null(b)
+        return ok(a)
+    if is_number(a) and is_number(b)
+        return ok(number_from((number_of(a) ?? 0.0) + (number_of(b) ?? 0.0)))
+    let ta = type_name(a)
+    let tb = type_name(b)
+    if ta == "string" and tb == "string"
+        return ok(json.string(text_of(a) + text_of(b)))
+    if ta == "array" and tb == "array"
+        return ok(json.array(cat(json.to_list(a) ?? [], json.to_list(b) ?? [])))
+    if ta == "object" and tb == "object"
+        return ok(merge_members(a, b, false))
+    bad(a, b, at)
+
+// `-` — numbers subtract and arrays drop the elements they share.
+fn subtract_attempt(a: JsonValueH, b: JsonValueH, at: Int) -> JqAttempt []
+    if is_number(a) and is_number(b)
+        return ok(number_from((number_of(a) ?? 0.0) - (number_of(b) ?? 0.0)))
+    if type_name(a) == "array" and type_name(b) == "array"
+        var out: [JsonValueH] = []
+        let drop = json.to_list(b) ?? []
+        for v in json.to_list(a) ?? []
+            if not contains_value(drop, v)
+                list.push(out, v)
+        return ok(json.array(out))
+    bad(a, b, at)
+
+// `*` — a string times a number repeats it, and two objects multiply
+// into a RECURSIVE merge, which is the one place jq's `*` and `+` part
+// company.
+fn multiply_attempt(a: JsonValueH, b: JsonValueH, at: Int) -> JqAttempt []
+    if is_number(a) and is_number(b)
+        return ok(number_from((number_of(a) ?? 0.0) * (number_of(b) ?? 0.0)))
+    let ta = type_name(a)
+    let tb = type_name(b)
+    if ta == "string" and tb == "number"
+        return repeat_attempt(a, b, at)
+    if ta == "number" and tb == "string"
+        return repeat_attempt(b, a, at)
+    if ta == "object" and tb == "object"
+        return ok(merge_members(a, b, true))
+    bad(a, b, at)
+
+fn repeat_attempt(s: JsonValueH, n: JsonValueH, at: Int) -> JqAttempt []
+    let count = whole_int(n)
+    match count
+        None    => bad(s, n, at)
+        Some(k) =>
+            if k <= 0
+                return ok(json.string(""))
+            ok(json.string(str.repeat(text_of(s), k)))
+
+// `/` — numbers divide, and a string divided by a string splits it,
+// which is jq's and surprises everyone once.
+fn divide_attempt(a: JsonValueH, b: JsonValueH, at: Int) -> JqAttempt []
+    if is_number(a) and is_number(b)
+        let d = number_of(b) ?? 0.0
+        if d == 0.0
+            return JqAttempt { value: json.null(),
+                               error: Some(jqerror.error(JqDivideByZero,
+                                             json.string("division by zero"), at)) }
+        return ok(number_from((number_of(a) ?? 0.0) / d))
+    if type_name(a) == "string" and type_name(b) == "string"
+        return ok(json.array(string_list(split_text(text_of(a), text_of(b)))))
+    bad(a, b, at)
+
+// `%` — the remainder, which novo's own operators do not carry for
+// floats, so it is computed as `a - b * trunc(a / b)`.
+fn modulo_attempt(a: JsonValueH, b: JsonValueH, at: Int) -> JqAttempt []
+    if not (is_number(a) and is_number(b))
+        return bad(a, b, at)
+    let x = number_of(a) ?? 0.0
+    let y = number_of(b) ?? 0.0
+    if y == 0.0
+        return JqAttempt { value: json.null(),
+                           error: Some(jqerror.error(JqDivideByZero,
+                                         json.string("division by zero"), at)) }
+    match math.checked_to_int(x / y)
+        None    => ok(number_from(x))
+        Some(q) => ok(number_from(x - y * q as Float))
+
+fn string_list(xs: [Str]) -> [JsonValueH] []
+    var out: [JsonValueH] = []
+    for s in xs
+        list.push(out, json.string(s))
+    out
+
+// Splitting on the empty string is splitting into codepoints, which is
+// jq's answer and the reason `str.split` alone is not enough.
+fn split_text(s: Str, sep: Str) -> [Str] []
+    if sep == ""
+        return str.chars(s)
+    str.split(s, sep)
+
+// The members of `b` written over `a` — shallow for `+`, and
+// member-by-member into two objects for `*`.
+fn merge_members(a: JsonValueH, b: JsonValueH, deep: Bool) -> JsonValueH []
+    var out = a
+    for p in object_pairs(b)
+        let k = pair_key(p)
+        let v = pair_value(p)
+        if deep
+            match json.get(a, k)
+                Some(av) =>
+                    if type_name(av) == "object" and type_name(v) == "object"
+                        out = with_member(out, k, merge_members(av, v, true))
+                    else
+                        out = with_member(out, k, v)
+                None     =>
+                    out = with_member(out, k, v)
+        else
+            out = with_member(out, k, v)
+    out
+
+// Whether a list holds a value, by jq's structural equality rather
+// than by the list element type's own.
+fn contains_value(xs: [JsonValueH], v: JsonValueH) -> Bool []
+    var found = false
+    for x in xs
+        if jpeval.value_equals(x, v)
+            found = true
+    found
+
+fn any_truthy(xs: [JsonValueH]) -> Bool []
+    var found = false
+    for x in xs
+        if truthy(x)
+            found = true
+    found
+
+// A whole number as an Int, where it has one.
+fn whole_int(v: JsonValueH) -> ?Int []
+    match number_of(v)
+        None    => None
+        Some(f) => math.checked_to_int(f)
+
+// ── Sorting ──────────────────────────────────────────────────────────
+
+// One element with the key its `_by` filter produced.
+struct JqKeyed
+    key: [JsonValueH]
+    value: JsonValueH
+
+// A list handed on without lending out the one it came from.  A list
+// is shared, and a plain return hands the caller permission to write
+// it, so a value read out of a field has to be copied before it leaves
+// as an answer.
+fn copy_values(xs: [JsonValueH]) -> [JsonValueH] []
+    var out: [JsonValueH] = []
+    for x in xs
+        list.push(out, x)
+    out
+
+fn copy_keyed(xs: [JqKeyed]) -> [JqKeyed] []
+    var out: [JqKeyed] = []
+    for x in xs
+        list.push(out, x)
+    out
+
+// A stable merge sort, written here rather than borrowed.
+//
+// `list.sort_by` sorts in place and says its ties are unspecified, and
+// `group_by` over records where only some carry the key needs the
+// document's order kept among equals — which is exactly stability.
+// The key of one element is the list of its filter's outputs, which is
+// how `sort_by(.a, .b)` sorts on two keys.
+fn sort_keyed(xs: [JqKeyed]) -> [JqKeyed] []
+    if list.len(xs) <= 1
+        return copy_keyed(xs)
+    let mid = list.len(xs) / 2
+    let a = sort_keyed(list.slice(xs, 0, mid))
+    let b = sort_keyed(list.slice(xs, mid, list.len(xs)))
+    merge_keyed(a, b)
+
+fn merge_keyed(a: [JqKeyed], b: [JqKeyed]) -> [JqKeyed] []
+    var out: [JqKeyed] = []
+    var i = 0
+    var j = 0
+    while i < list.len(a) or j < list.len(b)
+        if i >= list.len(a)
+            list.push(out, b[j])
+            j = j + 1
+        elif j >= list.len(b)
+            list.push(out, a[i])
+            i = i + 1
+        elif compare_lists(a[i].key, b[j].key) <= 0
+            list.push(out, a[i])
+            i = i + 1
+        else
+            list.push(out, b[j])
+            j = j + 1
+    out
+
+// Values in jq's total order.
+fn sorted_values(xs: [JsonValueH]) -> [JsonValueH] []
+    var keyed: [JqKeyed] = []
+    for v in xs
+        list.push(keyed, JqKeyed { key: [v], value: v })
+    var out: [JsonValueH] = []
+    for k in sort_keyed(keyed)
+        list.push(out, k.value)
+    out
+
+// ── The path walk, with jq's rules ───────────────────────────────────
+
+// A value and the path that reached it.
+struct JqAt
+    value: JsonValueH
+    path: [JsonValueH]
+
+// What a walk produced, and the error that stopped it.
+struct JqNodes
+    nodes: [JqAt]
+    fault: ?jqerror.JqError
+
+fn values_of(xs: [JqAt]) -> [JsonValueH] []
+    var out: [JsonValueH] = []
+    for x in xs
+        list.push(out, x.value)
+    out
+
+// Walk a parsed JSONPath query over a value with JQ's rules.
+//
+// RFC 9535 makes a name or index selector that matches nothing produce
+// an empty nodelist; jq makes it produce `null`, because `.a.b.c` on a
+// document missing `.a` has to be safe for the language to be usable
+// over real records.  The other half is the opposite: RFC 9535 says a
+// selector against the wrong kind of value produces nothing, and jq
+// raises.  Both differences are here, in one function, which is why
+// `select_path` is not `select_path_rfc`.
+fn select_nodes(q: jpquery.JpQuery, v: JsonValueH, at: Int) -> JqNodes []
+    var cur: [JqAt] = []
+    list.push(cur, JqAt { value: v, path: [] })
+    var fault: ?jqerror.JqError = None
+    var go = true
+    for seg in q.segments
+        if go
+            var next: [JqAt] = []
+            for n in cur
+                if go
+                    let r = apply_segment(seg, n, at)
+                    for m in r.nodes
+                        list.push(next, m)
+                    if broke(r.fault)
+                        fault = r.fault
+                        go = false
+            cur = next
+    JqNodes { nodes: cur, fault: fault }
+
+fn apply_segment(seg: jpquery.JpSegment, n: JqAt, at: Int) -> JqNodes []
+    match seg
+        JpChildSeg(sels)      => apply_selectors(sels, n, at)
+        JpDescendantSeg(sels) => descendants_apply(sels, n, at)
+
+// `..[sel]` — the node itself and everything under it, with the
+// selector applied at each, pre-order.
+fn descendants_apply(sels: [jpquery.JpSelector], n: JqAt, at: Int) -> JqNodes []
+    var out: [JqAt] = []
+    JqNodes { nodes: out, fault: descend_into(sels, n, at, var out) }
+
+// One node of `..[sel]`'s pre-order, and the first fault met below it.
+fn descend_into(sels: [jpquery.JpSelector], n: JqAt, at: Int,
+                var out: [JqAt]) -> ?jqerror.JqError []
+    let r = apply_selectors(sels, n, at)
+    if broke(r.fault)
+        return r.fault
+    for m in r.nodes
+        list.push(out, m)
+    let kids = children_at(n)
+    for kid in kids
+        let e = descend_into(sels, kid, at, var out)
+        if broke(e)
+            return e
+    None
+
+fn children_at(n: JqAt) -> [JqAt] []
+    var out: [JqAt] = []
+    let t = type_name(n.value)
+    if t == "array"
+        var i = 0
+        for v in json.to_list(n.value) ?? []
+            list.push(out, JqAt { value: v, path: cat_path(n.path, json.int(i)) })
+            i = i + 1
+    elif t == "object"
+        for p in object_pairs(n.value)
+            list.push(out, JqAt { value: pair_value(p),
+                                  path: cat_path(n.path, json.string(pair_key(p))) })
+    out
+
+fn cat_path(path: [JsonValueH], step: JsonValueH) -> [JsonValueH] []
+    var out: [JsonValueH] = []
+    for x in path
+        list.push(out, x)
+    list.push(out, step)
+    out
+
+fn apply_selectors(sels: [jpquery.JpSelector], n: JqAt, at: Int) -> JqNodes []
+    var out: [JqAt] = []
+    var fault: ?jqerror.JqError = None
+    for sel in sels
+        if not broke(fault)
+            let r = apply_selector(sel, n, at)
+            if broke(r.fault)
+                fault = r.fault
+            else
+                for m in r.nodes
+                    list.push(out, m)
+    JqNodes { nodes: out, fault: fault }
+
+fn apply_selector(sel: jpquery.JpSelector, n: JqAt, at: Int) -> JqNodes []
+    match sel
+        JpNameSel(name)   => name_at(n, name, at)
+        JpWildcardSel     => wildcard_at(n, at)
+        JpIndexSel(index) => index_at(n, index, at)
+        JpSliceSel(sl)    => slice_at(n, sl, at)
+        JpFilterSel(expr) => filter_at(n, expr)
+
+fn cannot_index(n: JqAt, what: Str, at: Int) -> JqNodes []
+    JqNodes { nodes: [], fault: Some(cannot_index_value(n.value, what, at)) }
+
+// The same refusal for a walk that holds a value and not a place,
+// which is what `getpath` applies its steps to.
+fn cannot_index_value(v: JsonValueH, what: Str, at: Int) -> jqerror.JqError []
+    jqerror.error(JqCannotIndex,
+                  json.string("cannot index " + type_name(v) + " with " + what), at)
+
+fn cannot_iterate(n: JqAt, at: Int) -> JqNodes []
+    JqNodes { nodes: [],
+              fault: Some(jqerror.error(JqCannotIterate,
+                            json.string("cannot iterate over " + render_value(n.value)),
+                            at)) }
+
+fn render_value(v: JsonValueH) -> Str []
+    json.stringify(v)
+
+// `.name` — a member, `null` where the member is missing, an error
+// where the value cannot have members at all.
+fn name_at(n: JqAt, name: Str, at: Int) -> JqNodes []
+    let t = type_name(n.value)
+    if t == "null"
+        return one_at(n.path, json.string(name), json.null())
+    if t != "object"
+        return cannot_index(n, render_value(json.string(name)), at)
+    one_at(n.path, json.string(name), member_or_null(n.value, name))
+
+fn one_at(path: [JsonValueH], step: JsonValueH, v: JsonValueH) -> JqNodes []
+    var nodes: [JqAt] = []
+    list.push(nodes, JqAt { value: v, path: cat_path(path, step) })
+    JqNodes { nodes: nodes, fault: None }
+
+// `[*]` or `.[]` — every element, and iterating a scalar or `null` is
+// an error here even though indexing one is not.
+fn wildcard_at(n: JqAt, at: Int) -> JqNodes []
+    let t = type_name(n.value)
+    if t == "array" or t == "object"
+        return JqNodes { nodes: children_at(n), fault: None }
+    cannot_iterate(n, at)
+
+// `[i]` — an element, `null` past the end, an error for an object.
+//
+// A negative index counts from the end, which is jq's rule
+// (`[1,2,3] | .[-1]` is `3`) and the same rule `pick_slice` already
+// applies to a slice's ends.  The step a path records is the index as
+// written, so `path(.[-1])` stays `[-1]`.
+fn index_at(n: JqAt, index: Int, at: Int) -> JqNodes []
+    let t = type_name(n.value)
+    if t == "null"
+        return one_at(n.path, json.int(index), json.null())
+    if t != "array"
+        return cannot_index(n, json.stringify(json.int(index)), at)
+    var k = index
+    if k < 0
+        k = (json.len(n.value) ?? 0) + k
+    if k < 0
+        return one_at(n.path, json.int(index), json.null())
+    match json.index(n.value, k)
+        None    => one_at(n.path, json.int(index), json.null())
+        Some(v) => one_at(n.path, json.int(index), v)
+
+// `[start:end:step]` — one value, which is jq's answer and not RFC
+// 9535's list of separately selected elements.
+//
+// A string slices into a substring, over code points rather than bytes
+// (`"héllo" | .[1:3]` is `"él"`), which is jq's unit for strings.  A
+// step over a string is the same rule the array branch uses; jq's
+// grammar has no step at all, so this is the reading a slice with one
+// has to have to be predictable.
+fn slice_at(n: JqAt, sl: jpquery.JpSlice, at: Int) -> JqNodes []
+    let t = type_name(n.value)
+    if t == "null"
+        return one_at(n.path, slice_step(sl), json.null())
+    if t == "string"
+        let cs = str.chars(json.to_str(n.value) ?? "")
+        return one_at(n.path, slice_step(sl), json.string(str.join(pick_slice(cs, sl), "")))
+    if t != "array"
+        return cannot_index(n, render_value(slice_step(sl)), at)
+    let xs = json.to_list(n.value) ?? []
+    let picked = pick_slice(xs, sl)
+    one_at(n.path, slice_step(sl), json.array(picked))
+
+// The step a slice records in a path, which is the object jq prints
+// inside `path(.[1:3])`: `start` and `end` always, `null` where the
+// program wrote nothing, and `step` only where the program wrote one —
+// jq's own grammar has no step, so the key is this package's addition
+// and appears only when it has something to say.
+fn slice_step(sl: jpquery.JpSlice) -> JsonValueH []
+    var kvs: [(Str, JsonValueH)] = []
+    list.push(kvs, ("start", int_or_null(sl.start)))
+    list.push(kvs, ("end", int_or_null(sl.end)))
+    match sl.step
+        None     => ()
+        Some(st) => list.push(kvs, ("step", json.int(st)))
+    json.object(kvs)
+
+fn int_or_null(v: ?Int) -> JsonValueH []
+    match v
+        None    => json.null()
+        Some(n) => json.int(n)
+
+// RFC 9535 § 2.3.4.2.2, which is also jq's rule — the same rule
+// `jsonpath-nv`'s own `slice_indices` applies, so a slice in a program
+// and a slice in a query read alike.  A missing end means the array's
+// length for a forward step and one place before the first element for
+// a backward one, which is what makes `.[::-1]` the array reversed
+// rather than empty.
+//
+// The element type is a parameter because an array picks values and a
+// string picks code points, and one picker is the point: the two ends
+// and the step mean the same thing either way.
+fn pick_slice<T>(xs: [T], sl: jpquery.JpSlice) -> [T] []
+    let n = list.len(xs)
+    let step = sl.step ?? 1
+    var out: [T] = []
+    if step == 0
+        return out
+    // workaround(a-list-map-closure-that-returns-an-element-of-a-captured-list-leaks-it):
+    // `list.range(0, count) |> list.map((k) => xs[lower + k * step])` leaks
+    // the picked elements, so the picks are pushed one by one.
+    if step > 0
+        let lower = held(counted(sl.start ?? 0, n), 0, n)
+        let upper = held(counted(sl.end ?? n, n), 0, n)
+        let count = (upper - lower + step - 1) / step
+        for k in 0..count
+            list.push(out, xs[lower + k * step])
+        return out
+    let upper = held(counted(sl.start ?? n - 1, n), 0 - 1, n - 1)
+    let lower = held(counted(sl.end ?? 0 - n - 1, n), 0 - 1, n - 1)
+    let back = 0 - step
+    let count = (upper - lower + back - 1) / back
+    for k in 0..count
+        list.push(out, xs[upper + k * step])
+    out
+
+// An index counted from the end when it is negative.
+fn counted(k: Int, n: Int) -> Int []
+    if k < 0
+        return n + k
+    k
+
+// A number held between two bounds.
+fn held(x: Int, lo: Int, hi: Int) -> Int []
+    if x < lo
+        return lo
+    if x > hi
+        return hi
+    x
+
+// `[?expr]` — the elements the expression is true of.
+//
+// This one is the delegate's: RFC 9535's filter selector is a
+// self-contained sub-language (it has its own comparison and function
+// syntax) and re-implementing it would be a second JSONPath, which is
+// the thing this package is a port of.  It is run over a one-segment
+// query so that its own rules, not the ones above, decide.
+fn filter_at(n: JqAt, expr: jpquery.JpExpr) -> JqNodes []
+    var sels: [jpquery.JpSelector] = []
+    list.push(sels, JpFilterSel(expr))
+    var q = one_selector_query(sels)
+    var nodes: [JqAt] = []
+    for v in jpeval.select_values(q, n.value)
+        list.push(nodes, JqAt { value: v, path: n.path })
+    JqNodes { nodes: nodes, fault: None }
+
+// A one-segment query holding just these selectors, which is how the
+// filter selector is handed to the delegate on its own.
+fn one_selector_query(sels: [jpquery.JpSelector]) -> jpquery.JpQuery []
+    var segs: [jpquery.JpSegment] = []
+    list.push(segs, JpChildSeg(sels))
+    JpQuery { absolute: true, segments: segs }
+
+// ── Calls ────────────────────────────────────────────────────────────
+
+fn eval_call(var r: Run, callee: jqlang.JqCallee, args: [jqlang.JqFilter], input: JsonValueH,
+             d: Int, sc: JqScope, at: Int) -> JqOutcome []
+    match callee
+        JqCBuiltin(b)  => eval_builtin(var r, b, args, input, d, sc, at)
+        JqCDefined(nm) => eval_defined(var r, nm, args, input, d, sc, at)
+
+// A call to one of the program's own `def`s.
+//
+// The arguments are pushed as zero-parameter filter entries rather than
+// evaluated, because jq's parameters are FILTERS: `def twice(f): f | f`
+// given `.a` runs `.a` twice, and a port that passed the value would run
+// it once.  Each entry records the index it was pushed at so the
+// argument's own body can skip itself — without that, an argument named
+// `x` handed to a parameter named `x` would resolve to itself and never
+// terminate.  Definitions are looked up from the top of the stack down
+// to the floor of the calling scope, so two `def`s at one level see each
+// other and a `def` inside a body does not escape it.
+fn eval_defined(var r: Run, name: Str, args: [jqlang.JqFilter], input: JsonValueH, d: Int,
+                sc: JqScope, at: Int) -> JqOutcome []
+    match find_def_index(r.defs, name, sc)
+        None        => stopped([], Some(jqerror.error(JqBadArgument,
+                           json.string("no definition of '" + name + "'"), at)))
+        Some(index) => call_def(var r, index, args, input, d, sc)
+
+fn call_def(var r: Run, index: Int, args: [jqlang.JqFilter], input: JsonValueH, d: Int,
+            sc: JqScope) -> JqOutcome []
+    let entry = r.defs[index]
+    var saved = r.defs
+    let base = list.len(r.defs)
+    var i = 0
+    for a in args
+        r.defs = defs_with(r.defs, JqDef { name: param_name(entry.parameters, i),
+                                           parameters: [], body: a,
+                                           scope: JqScope { floor: sc.floor, skip: base + i } })
+        i = i + 1
+    let o = eval(var r, entry.body, input, d + 1, entry.scope)
+    r.defs = saved
+    o
+
+fn param_name(ps: [Str], i: Int) -> Str []
+    // cov: skip — the one caller counts from zero, so i is never negative
+    if i < 0
+        return ""
+    if i >= list.len(ps)
+        return ""
+    ps[i]
+
+// A call to a builtin.
+//
+// Every argument becomes a filter entry whatever the builtin does with
+// it, so a builtin taking a filter and one taking a value are set up the
+// same way.  Which is which is `jqbuiltin.takes_filter_argument`'s
+// answer and not this function's business.
+fn eval_builtin(var r: Run, b: jqbuiltin.JqBuiltin, args: [jqlang.JqFilter], input: JsonValueH,
+                d: Int, sc: JqScope, at: Int) -> JqOutcome []
+    var saved = r.defs
+    let base = list.len(r.defs)
+    var i = 0
+    for a in args
+        r.defs = defs_with(r.defs, JqDef { name: " arg", parameters: [], body: a,
+                                           scope: JqScope { floor: sc.floor, skip: base + i } })
+        i = i + 1
+    let o = dispatch(var r, b, base, list.len(args), input, d, sc, at)
+    r.defs = saved
+    o
+
+// A value argument the caller wrote, and whether it produced one.
+struct JqArg
+    value: JsonValueH
+    error: ?jqerror.JqError
+    has: Bool
+
+fn arg_result(var r: Run, base: Int, i: Int, input: JsonValueH, d: Int) -> JqOutcome []
+    eval(var r, r.defs[base + i].body, input, d + 1, r.defs[base + i].scope)
+
+fn arg_of(var r: Run, base: Int, i: Int, input: JsonValueH, d: Int) -> JqArg []
+    let o = arg_result(var r, base, i, input, d)
+    match list.first(o.values)
+        None    => JqArg { value: json.null(), error: o.fault, has: false }
+        Some(v) => JqArg { value: v, error: o.fault, has: true }
+
+// Read every value argument, then hand the builtin its arguments.
+//
+// A value argument is read ONCE, and its first output is the value:
+// `has(.k)` asks about the member `.k` names, and a second output of `.k`
+// is not multiplied over the call.  That is the reading a caller of
+// `has`, `split` and `join` can predict; the builtins whose argument is a
+// filter read it with `arg_result` instead and are not touched by it.  A
+// value argument that produced nothing makes the whole call produce
+// nothing, which is jq's answer for `has(empty)`.
+fn dispatch(var r: Run, b: jqbuiltin.JqBuiltin, base: Int, argc: Int, input: JsonValueH, d: Int,
+            sc: JqScope, at: Int) -> JqOutcome []
+    var vals: [JsonValueH] = []
+    var i = 0
+    while i < argc
+        if jqbuiltin.takes_filter_argument(b, i)
+            list.push(vals, json.null())
+        else
+            let a = arg_of(var r, base, i, input, d)
+            if broke(a.error)
+                return stopped([], a.error)
+            if not a.has
+                return produced([])
+            list.push(vals, a.value)
+        i = i + 1
+    builtin_apply(var r, b, base, vals, input, d, sc, at)
+
+// The builtins themselves, one arm each.
+fn builtin_apply(var r: Run, b: jqbuiltin.JqBuiltin, base: Int, vals: [JsonValueH],
+                 input: JsonValueH, d: Int, sc: JqScope, at: Int) -> JqOutcome []
+    match b
+        JqbEmpty          => produced([])
+        JqbNot            => produced_one(json.bool(not truthy(input)))
+        JqbError0         => raised([], jqerror.error(JqUserRaised, input, at))
+        JqbError1         => raised([], jqerror.error(JqUserRaised, vals[0], at))
+        JqbType           => produced_one(json.string(type_name(input)))
+        JqbRecurse0       => recurse_all(var r, input, d)
+        JqbRecurse1       => recurse_filter(var r, base, input, d)
+        JqbRange1         => range_dispatch(var r, vals, at)
+        JqbRange2         => range_dispatch(var r, vals, at)
+        JqbRange3         => range_dispatch(var r, vals, at)
+        JqbFirst1         => first_outcome(var r, base, input, d)
+        JqbLast1          => last_outcome(var r, base, input, d)
+        JqbLimit2         => limit_outcome(var r, base, vals[0], input, d)
+        JqbUntil2         => until_outcome(var r, base, input, d)
+        JqbWhile2         => while_outcome(var r, base, input, d)
+        JqbLength         => length_outcome(input, at)
+        JqbUtf8ByteLength => byte_length_outcome(input, at)
+        JqbHas1           => has_outcome(input, vals[0], at)
+        JqbIn1            => has_outcome(vals[0], input, at)
+        JqbContains1      => contains_outcome(input, vals[0])
+        JqbInside1        => contains_outcome(vals[0], input)
+        JqbKeys           => keys_outcome(input, true, at)
+        JqbKeysUnsorted   => keys_outcome(input, false, at)
+        JqbValues         => values_outcome(input)
+        JqbToEntries      => to_entries_outcome(input, at)
+        JqbFromEntries    => from_entries_outcome(input, at)
+        JqbWithEntries1   => with_entries_outcome(var r, base, input, d, at)
+        JqbAdd            => add_outcome(input, at)
+        JqbAny0           => any_all_outcome(input, false, at)
+        JqbAll0           => any_all_outcome(input, true, at)
+        JqbAny1           => any_all_filter_outcome(var r, base, input, d, false, at)
+        JqbAll1           => any_all_filter_outcome(var r, base, input, d, true, at)
+        JqbFlatten0       => flatten_outcome(input, 0 - 1, at)
+        JqbFlatten1       => flatten_arg_outcome(input, vals[0], at)
+        JqbSelect1        => select_outcome(var r, base, input, d)
+        JqbMap1           => map_outcome(var r, base, input, d, at)
+        JqbMapValues1     => map_values_outcome(var r, base, input, d, at)
+        JqbPath1          => path_outcome(var r, base, input, d, at)
+        JqbPaths0         => paths_outcome(var r, input)
+        JqbPaths1         => paths_where_outcome(var r, base, input, d, at)
+        JqbGetpath1       => getpath_outcome(input, vals[0], at)
+        JqbSort           => sort_outcome(input, at)
+        JqbSortBy1        => sort_by_outcome(var r, base, input, d, at)
+        JqbGroupBy1       => group_by_outcome(var r, base, input, d, at)
+        JqbUnique         => unique_outcome(input, at)
+        JqbUniqueBy1      => unique_by_outcome(var r, base, input, d, at)
+        JqbReverse        => reverse_outcome(input, at)
+        JqbMin            => minmax_outcome(input, at, false)
+        JqbMax            => minmax_outcome(input, at, true)
+        JqbMinBy1         => minmax_by_outcome(var r, base, input, d, at, false)
+        JqbMaxBy1         => minmax_by_outcome(var r, base, input, d, at, true)
+        JqbToString       => produced_one(json.string(to_text(input)))
+        JqbToNumber       => to_number_outcome(input, at)
+        JqbToJson         => produced_one(json.string(json.stringify(input)))
+        JqbFromJson       => from_json_outcome(input, at)
+        JqbAsciiDowncase  => ascii_outcome(input, false, at)
+        JqbAsciiUpcase    => ascii_outcome(input, true, at)
+        JqbExplode        => explode_outcome(input, at)
+        JqbImplode        => implode_outcome(input, at)
+        JqbSplit1         => split_outcome(input, vals[0], at)
+        JqbJoin1          => join_outcome(input, vals[0], at)
+        JqbLtrimstr1      => trim_outcome(input, vals[0], at, true)
+        JqbRtrimstr1      => trim_outcome(input, vals[0], at, false)
+        JqbStartswith1    => starts_ends_outcome(input, vals[0], at, true)
+        JqbEndswith1      => starts_ends_outcome(input, vals[0], at, false)
+        JqbTest1          => test_outcome(input, vals[0], at)
+        JqbFloor          => round_outcome(input, at, 0)
+        JqbCeil           => round_outcome(input, at, 1)
+        JqbSqrt           => round_outcome(input, at, 2)
+
+// ── The builtins, one helper each ────────────────────────────────────
+
+fn is_iterable(v: JsonValueH) -> Bool []
+    let t = type_name(v)
+    t == "array" or t == "object"
+
+fn iterate_error(v: JsonValueH, at: Int) -> jqerror.JqError []
+    jqerror.error(JqCannotIterate,
+                  json.string("cannot iterate over " + render_value(v)), at)
+
+fn index_error(v: JsonValueH, k: JsonValueH, at: Int) -> jqerror.JqError []
+    jqerror.error(JqCannotIndex,
+                  json.string("cannot index " + type_name(v) + " with " + render_value(k)), at)
+
+fn bad_arg_error(what: Str, at: Int) -> jqerror.JqError []
+    jqerror.error(JqBadArgument, json.string(what), at)
+
+// `recurse` — the input and everything under it, depth first.
+fn recurse_all(var r: Run, input: JsonValueH, d: Int) -> JqOutcome []
+    var out: [JsonValueH] = []
+    recurse_into(var r, var out, input, d)
+    stopped(out, None)
+
+fn recurse_into(var r: Run, var out: [JsonValueH], v: JsonValueH, d: Int) []
+    if d > r.max_depth
+        r.over = true
+        return
+    if not emit(r, out, v)
+        return
+    for c in children(v)
+        recurse_into(var r, var out, c, d + 1)
+
+// `recurse(f)` — the input, then `f` of it, until `f` is empty.
+fn recurse_filter(var r: Run, base: Int, input: JsonValueH, d: Int) -> JqOutcome []
+    var out: [JsonValueH] = []
+    stopped(out, recurse_f_into(var r, base, var out, input, d))
+
+// One value of the descent: the value itself, then `f` of it and each
+// output's own descent, answering the first fault met on the way.
+fn recurse_f_into(var r: Run, base: Int, var out: [JsonValueH], v: JsonValueH,
+                  d: Int) -> ?jqerror.JqError []
+    // cov: skip — arg_result reads `f` at d + 1, so a frame deeper than the ceiling is
+    // never entered: the eval at that depth stops it with the fault first
+    if d > r.max_depth
+        r.over = true
+        return None
+    if not emit(r, out, v)
+        return None
+    // `recurse(f)` is `def r: ., (f | r); r`, so a fault out of `f`
+    // stops the descent and is the run's answer — after the values the
+    // descent already produced, which the outcome carries beside it.
+    // A fault inside an output's own descent comes first, the way the
+    // pull of `f`'s next output waits for it.
+    let o = arg_result(var r, base, 0, v, d)
+    for c in o.values
+        let e = recurse_f_into(var r, base, var out, c, d + 1)
+        if broke(e)
+            return e
+    o.fault
+
+// `range(n)`, `range(from; upto)` and `range(from; upto; by)`, read
+// from the arguments the call was given.
+//
+// Every bound must be a number.  A text or `null` bound is an error
+// rather than a silent zero, which is jq's own rule: `range("0"; 2)`
+// and `range(0; "2")` are refused there too, and a caller who wrote
+// one wants the fault, not an empty stream.  A fractional bound is
+// left as it is, and the step compares in the same floating point jq
+// does, so `range(0.5; 2)` is `0.5, 1.5`.
+fn range_dispatch(var r: Run, vals: [JsonValueH], at: Int) -> JqOutcome []
+    for v in vals
+        if not is_number(v)
+            return stopped([], Some(bad_arg_error("range needs numeric bounds", at)))
+    var from = 0.0
+    var upto = 0.0
+    var step = 1.0
+    if list.len(vals) == 1
+        upto = number_of(vals[0]) ?? 0.0
+    elif list.len(vals) == 2
+        from = number_of(vals[0]) ?? 0.0
+        upto = number_of(vals[1]) ?? 0.0
+    elif list.len(vals) == 3
+        from = number_of(vals[0]) ?? 0.0
+        upto = number_of(vals[1]) ?? 0.0
+        step = number_of(vals[2]) ?? 1.0
+    range_outcome(var r, from, upto, step)
+
+// `range(from; upto; by)` — one output per step.
+fn range_outcome(var r: Run, from: Float, upto: Float, step: Float) -> JqOutcome []
+    if step == 0.0
+        return produced([])
+    var out: [JsonValueH] = []
+    var x = from
+    var go = true
+    while go
+        if step > 0.0 and x >= upto
+            go = false
+        elif step < 0.0 and x <= upto
+            go = false
+        elif not emit(r, out, number_from(x))
+            go = false
+        else
+            x = x + step
+    stopped(out, None)
+
+// `first(f)` — the first output of `f`, and `f` stops there.
+//
+// The stop is the reading: a fault `f` would have raised after its
+// first output is never pulled, so `first(1, error("x"))` is `1` with
+// no fault, while a fault before any output — `first(empty,
+// error("x"))` — is the answer, because there is nothing to stop on.
+fn first_outcome(var r: Run, base: Int, input: JsonValueH, d: Int) -> JqOutcome []
+    let o = arg_result(var r, base, 0, input, d)
+    match list.first(o.values)
+        None    => stopped([], o.fault)
+        Some(v) => produced_one(v)
+
+// `last(f)` — the last output of `f`, and `null` when it has none.
+//
+// jq's own definition is `reduce f as $x (null; $x)`, and both halves
+// of it show here: the stream is walked to its end, so a fault anywhere
+// answers no value and surfaces, and an empty stream answers `null`
+// rather than nothing.
+fn last_outcome(var r: Run, base: Int, input: JsonValueH, d: Int) -> JqOutcome []
+    let o = arg_result(var r, base, 0, input, d)
+    if broke(o.fault)
+        return stopped([], o.fault)
+    match list.last(o.values)
+        None    => produced_one(json.null())
+        Some(v) => produced_one(v)
+
+// `limit(n; f)` — at most `n` outputs of `f`, none when `n` is zero,
+// and all of them when `n` is negative, which is jq's rule.
+//
+// The fault rides along the way the outputs do: a cap that `n` outputs
+// already filled is never pulled past, so those outputs answer with no
+// fault, while a negative `n` pulls the whole stream and a fault with
+// it.
+fn limit_outcome(var r: Run, base: Int, nval: JsonValueH, input: JsonValueH, d: Int) -> JqOutcome []
+    let n = whole_int(nval) ?? 0
+    let o = arg_result(var r, base, 1, input, d)
+    var out: [JsonValueH] = []
+    var i = 0
+    for v in o.values
+        if i < n or n < 0
+            list.push(out, v)
+            i = i + 1
+    if n == 0 or n > 0 and list.len(o.values) >= n
+        return stopped(out, None)
+    stopped(out, o.fault)
+
+// `until(cond; update)` — the first value the condition is true of.
+//
+// A fault on either side is the caller's answer, which is jq's: an
+// update that raises stops the loop with the error rather than
+// quietly answering nothing, and a condition that raises is the same.
+fn until_outcome(var r: Run, base: Int, input: JsonValueH, d: Int) -> JqOutcome []
+    var v = input
+    var go = true
+    var gave_up = false
+    var err: ?jqerror.JqError = None
+    while go
+        let co = arg_result(var r, base, 0, v, d)
+        if broke(co.fault) and list.len(co.values) == 0
+            err = co.fault
+            go = false
+        elif any_truthy(co.values)
+            go = false
+        else
+            let a = arg_of(var r, base, 1, v, d)
+            if broke(a.error)
+                err = a.error
+                go = false
+            elif not a.has
+                go = false
+                gave_up = true
+            else
+                v = a.value
+    if broke(err)
+        return stopped([], err)
+    if gave_up
+        return produced([])
+    produced_one(v)
+
+// `while(cond; update)` — the input, and each update while the condition
+// holds.
+//
+// The values reached before a fault are kept and the fault follows
+// them, which is what jq prints: `1 | while(. < 2; error("x"))`
+// answers `1` and then raises.
+fn while_outcome(var r: Run, base: Int, input: JsonValueH, d: Int) -> JqOutcome []
+    var out: [JsonValueH] = []
+    let err = while_into(var r, base, input, d, var out)
+    stopped(out, err)
+
+fn while_into(var r: Run, base: Int, v: JsonValueH, d: Int,
+              var out: [JsonValueH]) -> ?jqerror.JqError []
+    // cov: skip — arg_result reads the condition at d + 1, so a frame deeper than the
+    // ceiling is never entered: the eval at that depth stops it with the fault first
+    if d > r.max_depth
+        r.over = true
+        return None
+    let co = arg_result(var r, base, 0, v, d)
+    if broke(co.fault) and list.len(co.values) == 0
+        return co.fault
+    if not any_truthy(co.values)
+        return co.fault
+    if not emit(r, out, v)
+        return None
+    let uo = arg_result(var r, base, 1, v, d)
+    for nx in uo.values
+        let e = while_into(var r, base, nx, d + 1, var out)
+        if broke(e)
+            return e
+    if broke(uo.fault)
+        return uo.fault
+    co.fault
+
+// `length` — members, elements, codepoints, or a number's absolute
+// value.  `true | length` is jq's odd one out and is refused.
+fn length_outcome(input: JsonValueH, at: Int) -> JqOutcome []
+    let t = type_name(input)
+    if t == "null"
+        return produced_one(json.int(0))
+    if t == "number"
+        return produced_one(number_from(math.abs(number_of(input) ?? 0.0)))
+    if t == "boolean"
+        return stopped([], Some(bad_arg_error("boolean has no length", at)))
+    produced_one(json.int(json.len(input) ?? 0))
+
+// `utf8bytelength` — bytes, where `length` answers codepoints.
+fn byte_length_outcome(input: JsonValueH, at: Int) -> JqOutcome []
+    let t = type_name(input)
+    if t == "null"
+        return produced_one(json.int(0))
+    if t != "string"
+        return stopped([], Some(bad_arg_error("utf8bytelength requires a string", at)))
+    produced_one(json.int(str.len(text_of(input))))
+
+// `has(k)` and `in(o)`, which are one question with the arguments the
+// other way round.
+fn has_outcome(input: JsonValueH, k: JsonValueH, at: Int) -> JqOutcome []
+    let t = type_name(input)
+    if t == "object"
+        if type_name(k) != "string"
+            return stopped([], Some(index_error(input, k, at)))
+        match json.get(input, text_of(k))
+            None    =>
+                return produced_one(json.bool(false))
+            Some(_) =>
+                return produced_one(json.bool(true))
+    if t == "array"
+        match whole_int(k)
+            None    =>
+                return produced_one(json.bool(false))
+            Some(i) =>
+                let n = list.len(json.to_list(input) ?? [])
+                return produced_one(json.bool(i >= 0 and i < n))
+    stopped([], Some(index_error(input, k, at)))
+
+// `contains(v)` and `inside(v)`.
+//
+// jq's containment, which is recursive and not membership: an object
+// contains another when it has each of its members and contains each
+// value; an array contains another when each of that one's elements is
+// contained, by this same rule, in SOME element of the first, in any
+// order, so `[0,1,2,3] | contains([3,1])` holds; a string contains
+// another as a substring.
+fn contains_outcome(input: JsonValueH, b: JsonValueH) -> JqOutcome []
+    produced_one(json.bool(contains_deep(input, b)))
+
+fn contains_deep(a: JsonValueH, b: JsonValueH) -> Bool []
+    let ta = type_name(a)
+    let tb = type_name(b)
+    if tb == "object"
+        if ta != "object"
+            return false
+        var found = true
+        for p in object_pairs(b)
+            match json.get(a, pair_key(p))
+                None     =>
+                    found = false
+                Some(av) =>
+                    if not contains_deep(av, pair_value(p))
+                        found = false
+        return found
+    if tb == "array"
+        if ta != "array"
+            return false
+        let elems = json.to_list(a) ?? []
+        var found = true
+        for y in json.to_list(b) ?? []
+            if not any_contained(elems, y)
+                found = false
+        return found
+    if tb == "string"
+        if ta != "string"
+            return false
+        return str.contains(text_of(a), text_of(b))
+    jpeval.value_equals(a, b)
+
+// Whether some element of `xs` contains `y`.
+fn any_contained(xs: [JsonValueH], y: JsonValueH) -> Bool []
+    var found = false
+    for x in xs
+        if contains_deep(x, y)
+            found = true
+    found
+
+// `keys` and `keys_unsorted` — an object's member names, or an array's
+// indices.
+fn keys_outcome(input: JsonValueH, sorted: Bool, at: Int) -> JqOutcome []
+    let t = type_name(input)
+    if t == "object"
+        var names = json.keys(input)
+        if sorted
+            names = sorted_names(names)
+        return produced_one(json.array(string_list(names)))
+    if t == "array"
+        var out: [JsonValueH] = []
+        var i = 0
+        for _ in json.to_list(input) ?? []
+            list.push(out, json.int(i))
+            i = i + 1
+        return produced_one(json.array(out))
+    stopped([], Some(index_error(input, json.string("keys"), at)))
+
+fn sorted_names(xs: [Str]) -> [Str] []
+    var keyed: [JqKeyed] = []
+    for s in xs
+        list.push(keyed, JqKeyed { key: [json.string(s)], value: json.string(s) })
+    var out: [Str] = []
+    for k in sort_keyed(keyed)
+        list.push(out, text_of(k.value))
+    out
+
+// `values` — the input unless it is `null`.
+fn values_outcome(input: JsonValueH) -> JqOutcome []
+    if json.is_null(input)
+        return produced([])
+    produced_one(input)
+
+// `to_entries` and `from_entries`.
+fn to_entries_outcome(input: JsonValueH, at: Int) -> JqOutcome []
+    let t = type_name(input)
+    var out: [JsonValueH] = []
+    if t == "object"
+        for p in object_pairs(input)
+            list.push(out, entry_value(json.string(pair_key(p)), pair_value(p)))
+    elif t == "array"
+        var i = 0
+        for v in json.to_list(input) ?? []
+            list.push(out, entry_value(json.int(i), v))
+            i = i + 1
+    else
+        return stopped([], Some(index_error(input, json.string("to_entries"), at)))
+    produced_one(json.array(out))
+
+fn entry_value(k: JsonValueH, v: JsonValueH) -> JsonValueH []
+    json.object([("key", k), ("value", v)])
+
+// jq reads four spellings of each half of an entry, and a program
+// written for jq uses whichever it learned first.
+fn entry_key(e: JsonValueH) -> ?JsonValueH []
+    first_member(e, ["key", "Key", "name", "Name", "k", "K"])
+
+fn entry_item(e: JsonValueH) -> ?JsonValueH []
+    first_member(e, ["value", "Value", "v", "V"])
+
+fn first_member(e: JsonValueH, names: [Str]) -> ?JsonValueH []
+    var found: ?JsonValueH = None
+    for nm in names
+        if not has_some(found)
+            match json.get(e, nm)
+                Some(v) =>
+                    found = Some(v)
+                None    => ()
+    found
+
+fn has_some(v: ?JsonValueH) -> Bool []
+    match v
+        None    => false
+        Some(_) => true
+
+fn from_entries_outcome(input: JsonValueH, at: Int) -> JqOutcome []
+    if type_name(input) != "array"
+        return stopped([], Some(index_error(input, json.string("from_entries"), at)))
+    var kvs: [(Str, JsonValueH)] = []
+    var err: ?jqerror.JqError = None
+    for e in json.to_list(input) ?? []
+        if not broke(err)
+            match entry_key(e)
+                None    =>
+                    err = Some(bad_arg_error("an entry needs a key", at))
+                Some(k) =>
+                    if type_name(k) != "string"
+                        err = Some(bad_arg_error("an entry's key must be a string", at))
+                    else
+                        match entry_item(e)
+                            None    =>
+                                err = Some(bad_arg_error("an entry needs a value", at))
+                            Some(v) => list.push(kvs, (text_of(k), v))
+    if broke(err)
+        return stopped([], err)
+    produced_one(json.object(kvs))
+
+// `with_entries(f)` — `to_entries | map(f) | from_entries`.
+fn with_entries_outcome(var r: Run, base: Int, input: JsonValueH, d: Int, at: Int) -> JqOutcome []
+    let entries = to_entries_outcome(input, at)
+    if broke(entries.fault)
+        return entries
+    // `to_entries` answers ONE array, so the filter goes over that
+    // array's elements the way `map` runs its own: the stream `f` runs
+    // against is the entries, never the array holding them.
+    var mapped: [JsonValueH] = []
+    var err: ?jqerror.JqError = None
+    for arr in entries.values
+        for e in json.to_list(arr) ?? []
+            if not broke(err)
+                let o = arg_result(var r, base, 0, e, d)
+                for v in o.values
+                    list.push(mapped, v)
+                err = o.fault
+    if broke(err)
+        return stopped([], err)
+    from_entries_outcome(json.array(mapped), at)
+
+// `add` — the elements added left to right, with `+`'s own rules and
+// `null` for an empty array.
+fn add_outcome(input: JsonValueH, at: Int) -> JqOutcome []
+    if type_name(input) != "array"
+        return stopped([], Some(iterate_error(input, at)))
+    let xs = json.to_list(input) ?? []
+    if list.len(xs) == 0
+        return produced_one(json.null())
+    var acc = xs[0]
+    var err: ?jqerror.JqError = None
+    var i = 1
+    while i < list.len(xs) and not broke(err)
+        let tried = add_attempt(acc, xs[i], at)
+        if broke(tried.error)
+            err = tried.error
+        else
+            acc = tried.value
+        i = i + 1
+    if broke(err)
+        return stopped([], err)
+    produced_one(acc)
+
+// `any` and `all` over an array of booleans.
+fn any_all_outcome(input: JsonValueH, want_all: Bool, at: Int) -> JqOutcome []
+    if not is_iterable(input)
+        return stopped([], Some(iterate_error(input, at)))
+    produced_one(json.bool(fold_truth(children(input), want_all)))
+
+fn fold_truth(xs: [JsonValueH], want_all: Bool) -> Bool []
+    var answer = want_all
+    for x in xs
+        if want_all
+            if not truthy(x)
+                answer = false
+        else
+            if truthy(x)
+                answer = true
+    answer
+
+// `any(f)` and `all(f)` — the filter run once per element, which is
+// jq's own definition of them: `any(f)` is `any(.[]; f)`.
+//
+// Pulled the way jq pulls them: an output decides the answer as it
+// arrives, and the filter is read no further for that element, so
+// `any(true, error("x"))` is `true` — while a fault that arrives
+// BEFORE any output has decided surfaces, so `any(error)` and
+// `any(. > 5, error("x"))` fail rather than answering `false`.
+fn any_all_filter_outcome(var r: Run, base: Int, input: JsonValueH, d: Int, want_all: Bool,
+                          at: Int) -> JqOutcome []
+    if not is_iterable(input)
+        return stopped([], Some(iterate_error(input, at)))
+    var flag = want_all
+    var decided = false
+    var err: ?jqerror.JqError = None
+    for x in children(input)
+        if not decided and not broke(err)
+            let o = arg_result(var r, base, 0, x, d)
+            for v in o.values
+                if not decided
+                    if truthy(v)
+                        if not want_all
+                            flag = true
+                            decided = true
+                    elif want_all
+                        flag = false
+                        decided = true
+            if not decided
+                err = o.fault
+    if broke(err)
+        return stopped([], err)
+    produced_one(json.bool(flag))
+
+// `flatten` and `flatten(depth)`.
+//
+// A negative depth means all the way down, which is the only difference
+// between the two forms — and the sentinel the written form is not
+// allowed to spell: jq refuses a written negative depth.
+fn flatten_outcome(input: JsonValueH, depth: Int, at: Int) -> JqOutcome []
+    if type_name(input) != "array"
+        return stopped([], Some(iterate_error(input, at)))
+    produced_one(json.array(flatten_to(json.to_list(input) ?? [], depth)))
+
+// `flatten(depth)` with the depth written out.  jq refuses a value that
+// is not a number, refuses a negative one, counts a whole one in
+// levels, and treats a part of a level as all the way down — `[[[[1]]]]
+// | flatten(0.5)` is `[1]`, which is the loop `while depth != 0` that
+// jq's own flatten runs.
+fn flatten_arg_outcome(input: JsonValueH, depth: JsonValueH, at: Int) -> JqOutcome []
+    if type_name(depth) != "number"
+        return stopped([], Some(bad_arg_error("flatten needs a number of levels", at)))
+    let f = number_of(depth) ?? 0.0
+    if f < 0.0
+        return stopped([], Some(bad_arg_error("flatten depth must not be negative", at)))
+    if is_whole(f)
+        return flatten_outcome(input, math.checked_to_int(f) ?? 0, at)
+    flatten_outcome(input, 0 - 1, at)
+
+fn flatten_to(xs: [JsonValueH], depth: Int) -> [JsonValueH] []
+    var out: [JsonValueH] = []
+    for v in xs
+        if depth != 0 and type_name(v) == "array"
+            for w in flatten_to(json.to_list(v) ?? [], depth - 1)
+                list.push(out, w)
+        else
+            list.push(out, v)
+    out
+
+// `select(f)` — the input once per truthy output of `f`.
+fn select_outcome(var r: Run, base: Int, input: JsonValueH, d: Int) -> JqOutcome []
+    let o = arg_result(var r, base, 0, input, d)
+    if broke(o.fault)
+        return stopped([], o.fault)
+    var out: [JsonValueH] = []
+    for v in o.values
+        if truthy(v)
+            list.push(out, input)
+    stopped(out, None)
+
+// `map(f)` — `[.[] | f]`.
+fn map_outcome(var r: Run, base: Int, input: JsonValueH, d: Int, at: Int) -> JqOutcome []
+    if not is_iterable(input)
+        return stopped([], Some(iterate_error(input, at)))
+    var out: [JsonValueH] = []
+    var err: ?jqerror.JqError = None
+    for x in children(input)
+        if not broke(err)
+            let o = arg_result(var r, base, 0, x, d)
+            for v in o.values
+                list.push(out, v)
+            err = o.fault
+    if broke(err)
+        return stopped([], err)
+    produced_one(json.array(out))
+
+// `map_values(f)` — the same, keeping an object's keys, with an element
+// whose filter produces nothing dropped, which is what `.[] |= f` does.
+fn map_values_outcome(var r: Run, base: Int, input: JsonValueH, d: Int, at: Int) -> JqOutcome []
+    let t = type_name(input)
+    if t == "array"
+        var out: [JsonValueH] = []
+        var err: ?jqerror.JqError = None
+        for x in json.to_list(input) ?? []
+            if not broke(err)
+                let a = arg_of(var r, base, 0, x, d)
+                if a.has
+                    list.push(out, a.value)
+                else
+                    err = a.error
+        if broke(err)
+            return stopped([], err)
+        return produced_one(json.array(out))
+    if t == "object"
+        var kvs: [(Str, JsonValueH)] = []
+        var err: ?jqerror.JqError = None
+        for p in object_pairs(input)
+            if not broke(err)
+                let a = arg_of(var r, base, 0, pair_value(p), d)
+                if a.has
+                    list.push(kvs, (pair_key(p), a.value))
+                else
+                    err = a.error
+        if broke(err)
+            return stopped([], err)
+        return produced_one(json.object(kvs))
+    stopped([], Some(iterate_error(input, at)))
+
+// `sort`, and the three `_by` forms.
+fn sort_outcome(input: JsonValueH, at: Int) -> JqOutcome []
+    if not is_iterable(input)
+        return stopped([], Some(iterate_error(input, at)))
+    produced_one(json.array(sorted_values(children(input))))
+
+fn keyed_by(var r: Run, base: Int, input: JsonValueH, d: Int, at: Int,
+            var out: [JqKeyed]) -> ?jqerror.JqError []
+    var err: ?jqerror.JqError = None
+    if not is_iterable(input)
+        return Some(iterate_error(input, at))
+    for x in children(input)
+        if not broke(err)
+            let o = arg_result(var r, base, 0, x, d)
+            if broke(o.fault)
+                err = o.fault
+            else
+                list.push(out, JqKeyed { key: copy_values(o.values), value: x })
+    err
+
+fn sort_by_outcome(var r: Run, base: Int, input: JsonValueH, d: Int, at: Int) -> JqOutcome []
+    var keyed: [JqKeyed] = []
+    let err = keyed_by(var r, base, input, d, at, var keyed)
+    if broke(err)
+        return stopped([], err)
+    var out: [JsonValueH] = []
+    for k in sort_keyed(keyed)
+        list.push(out, k.value)
+    produced_one(json.array(out))
+
+// `group_by(f)` — sorted, then split where the key changes.
+fn group_by_outcome(var r: Run, base: Int, input: JsonValueH, d: Int, at: Int) -> JqOutcome []
+    var keyed: [JqKeyed] = []
+    let err = keyed_by(var r, base, input, d, at, var keyed)
+    if broke(err)
+        return stopped([], err)
+    var groups: [JsonValueH] = []
+    var cur: [JsonValueH] = []
+    var prev: [JsonValueH] = []
+    var started = false
+    for k in sort_keyed(keyed)
+        if not started
+            list.push(cur, k.value)
+            prev = copy_values(k.key)
+            started = true
+        elif compare_lists(prev, k.key) == 0
+            list.push(cur, k.value)
+        else
+            list.push(groups, json.array(cur))
+            cur = [k.value]
+            prev = copy_values(k.key)
+    if started
+        list.push(groups, json.array(cur))
+    produced_one(json.array(groups))
+
+// `unique` and `unique_by(f)` — the sorted elements with the first of
+// each equal run kept.
+fn unique_outcome(input: JsonValueH, at: Int) -> JqOutcome []
+    if not is_iterable(input)
+        return stopped([], Some(iterate_error(input, at)))
+    var out: [JsonValueH] = []
+    var prev = json.null()
+    var started = false
+    for v in sorted_values(children(input))
+        if not started or not jpeval.value_equals(prev, v)
+            list.push(out, v)
+            prev = v
+            started = true
+    produced_one(json.array(out))
+
+fn unique_by_outcome(var r: Run, base: Int, input: JsonValueH, d: Int, at: Int) -> JqOutcome []
+    var keyed: [JqKeyed] = []
+    let err = keyed_by(var r, base, input, d, at, var keyed)
+    if broke(err)
+        return stopped([], err)
+    var out: [JsonValueH] = []
+    var prev: [JsonValueH] = []
+    var started = false
+    for k in sort_keyed(keyed)
+        if not started or compare_lists(prev, k.key) != 0
+            list.push(out, k.value)
+            prev = copy_values(k.key)
+            started = true
+    produced_one(json.array(out))
+
+// `min` and `max`, by jq's total order, and `null` for an empty array.
+fn minmax_outcome(input: JsonValueH, at: Int, want_max: Bool) -> JqOutcome []
+    if not is_iterable(input)
+        return stopped([], Some(iterate_error(input, at)))
+    let xs = children(input)
+    if list.len(xs) == 0
+        return produced_one(json.null())
+    var best = xs[0]
+    for x in xs
+        if want_max
+            if order(x, best) > 0
+                best = x
+        elif order(x, best) < 0
+            best = x
+    produced_one(best)
+
+// `min_by(f)` and `max_by(f)`, on the list of the filter's outputs.  A
+// tie keeps the earlier element, in both directions.
+fn minmax_by_outcome(var r: Run, base: Int, input: JsonValueH, d: Int, at: Int,
+                     want_max: Bool) -> JqOutcome []
+    var keyed: [JqKeyed] = []
+    let err = keyed_by(var r, base, input, d, at, var keyed)
+    if broke(err)
+        return stopped([], err)
+    if list.len(keyed) == 0
+        return produced_one(json.null())
+    var best = keyed[0]
+    for k in keyed
+        if want_max
+            if compare_lists(k.key, best.key) > 0
+                best = k
+        elif compare_lists(k.key, best.key) < 0
+            best = k
+    produced_one(best.value)
+
+// `reverse` — an array's elements, or a string's codepoints.  Not
+// `str.reverse`, which reverses a string's BYTES and would split a
+// multibyte character.
+fn reverse_outcome(input: JsonValueH, at: Int) -> JqOutcome []
+    let t = type_name(input)
+    if t == "array"
+        var out: [JsonValueH] = []
+        let xs = json.to_list(input) ?? []
+        var i = list.len(xs)
+        while i > 0
+            i = i - 1
+            list.push(out, xs[i])
+        return produced_one(json.array(out))
+    if t == "string"
+        return produced_one(json.string(str.join(list.rev(str.chars(text_of(input))), "")))
+    stopped([], Some(index_error(input, json.string("reverse"), at)))
+
+// `tonumber` — a number as itself, a numeric string as the number.
+fn to_number_outcome(input: JsonValueH, at: Int) -> JqOutcome []
+    let t = type_name(input)
+    if t == "number"
+        return produced_one(input)
+    if t == "string"
+        match str.to_float(text_of(input))
+            Some(f) =>
+                return produced_one(number_from(f))
+            None    =>
+                return stopped([], Some(bad_arg_error("tonumber cannot read that string as a number", at)))
+    stopped([], Some(bad_arg_error("tonumber needs a number or a numeric string", at)))
+
+// `fromjson` — the document inside a string.
+fn from_json_outcome(input: JsonValueH, at: Int) -> JqOutcome []
+    if type_name(input) != "string"
+        return stopped([], Some(bad_arg_error("fromjson needs a string", at)))
+    match json.parse(text_of(input))
+        None    => stopped([], Some(bad_arg_error("fromjson could not parse the string", at)))
+        Some(v) => produced_one(v)
+
+// `ascii_downcase` and `ascii_upcase`, which fold the ASCII letters only
+// — a codepoint above 127 has its first byte above 127 and is left
+// exactly as it is.
+fn ascii_outcome(input: JsonValueH, up: Bool, at: Int) -> JqOutcome []
+    if type_name(input) != "string"
+        return stopped([], Some(bad_arg_error("ascii case folding needs a string", at)))
+    produced_one(json.string(ascii_fold(text_of(input), up)))
+
+fn ascii_fold(s: Str, up: Bool) -> Str []
+    var out = ""
+    for c in str.chars(s)
+        out = out + fold_char(c, up)
+    out
+
+fn fold_char(c: Str, up: Bool) -> Str []
+    let b = str.byte_at(c, 0) ?? -1
+    if up
+        if b >= 'a' and b <= 'z'
+            return str.from_char(b - 32)
+        return c
+    if b >= 'A' and b <= 'Z'
+        return str.from_char(b + 32)
+    c
+
+// `explode` and `implode`, which are codepoints and not bytes.
+fn explode_outcome(input: JsonValueH, at: Int) -> JqOutcome []
+    if type_name(input) != "string"
+        return stopped([], Some(bad_arg_error("explode needs a string", at)))
+    var out: [JsonValueH] = []
+    for c in str.chars(text_of(input))
+        list.push(out, json.int(codepoint_of(c)))
+    produced_one(json.array(out))
+
+// The one reader of a codepoint this build has: `str.chars` hands back
+// a one-codepoint string and `str.byte_at` reads its bytes, so the
+// decoding is here.  A string `str.chars` emitted one byte at a time,
+// which is what it does with invalid UTF-8, decodes as its first byte.
+fn codepoint_of(c: Str) -> Int []
+    let b0 = str.byte_at(c, 0) ?? 0
+    if b0 < 0x80
+        return b0
+    if b0 < 0xC0
+        return b0
+    let b1 = (str.byte_at(c, 1) ?? 0x80) - 0x80
+    if b0 < 0xE0
+        return (b0 - 0xC0) * 64 + b1
+    let b2 = (str.byte_at(c, 2) ?? 0x80) - 0x80
+    if b0 < 0xF0
+        return (b0 - 0xE0) * 4096 + b1 * 64 + b2
+    let b3 = (str.byte_at(c, 3) ?? 0x80) - 0x80
+    (b0 - 0xF0) * 262144 + b1 * 4096 + b2 * 64 + b3
+
+fn implode_outcome(input: JsonValueH, at: Int) -> JqOutcome []
+    if type_name(input) != "array"
+        return stopped([], Some(iterate_error(input, at)))
+    var out = ""
+    var err: ?jqerror.JqError = None
+    for v in json.to_list(input) ?? []
+        if not broke(err)
+            match whole_int(v)
+                None    =>
+                    err = Some(bad_arg_error("implode needs codepoints", at))
+                Some(n) =>
+                    out = out + str.from_char(n)
+    if broke(err)
+        return stopped([], err)
+    produced_one(json.string(out))
+
+fn split_outcome(input: JsonValueH, sep: JsonValueH, at: Int) -> JqOutcome []
+    if type_name(input) != "string" or type_name(sep) != "string"
+        return stopped([], Some(bad_arg_error("split needs two strings", at)))
+    produced_one(json.array(string_list(split_text(text_of(input), text_of(sep)))))
+
+// `join(sep)` — jq's rule for the elements: a string as itself, `null`
+// as the empty string, a number as its text, and anything else refused.
+fn join_outcome(input: JsonValueH, sep: JsonValueH, at: Int) -> JqOutcome []
+    if type_name(input) != "array" or type_name(sep) != "string"
+        return stopped([], Some(iterate_error(input, at)))
+    var parts: [Str] = []
+    var err: ?jqerror.JqError = None
+    for v in json.to_list(input) ?? []
+        if not broke(err)
+            let t = type_name(v)
+            if t == "string" or t == "number"
+                list.push(parts, to_text(v))
+            elif t == "null"
+                list.push(parts, "")
+            else
+                err = Some(bad_arg_error("join cannot read a value of type " + t, at))
+    if broke(err)
+        return stopped([], err)
+    produced_one(json.string(str.join(parts, text_of(sep))))
+
+// `ltrimstr(s)` and `rtrimstr(s)`.
+//
+// jq's own rule for the pair: a side that is not a string makes the
+// whole call the input unchanged, so `1 | ltrimstr("a")` is `1` and
+// `"x" | ltrimstr(1)` is `"x"` rather than either of them a fault.
+fn trim_outcome(input: JsonValueH, cut: JsonValueH, at: Int, left: Bool) -> JqOutcome []
+    if type_name(input) != "string" or type_name(cut) != "string"
+        return produced_one(input)
+    let s = text_of(input)
+    let c = text_of(cut)
+    if c == ""
+        return produced_one(input)
+    if left
+        if str.starts_with(s, c)
+            return produced_one(json.string(str.slice(s, str.len(c), str.len(s))))
+        return produced_one(input)
+    if str.ends_with(s, c)
+        return produced_one(json.string(str.slice(s, 0, str.len(s) - str.len(c))))
+    produced_one(input)
+
+fn starts_ends_outcome(input: JsonValueH, probe: JsonValueH, at: Int,
+                       want_start: Bool) -> JqOutcome []
+    if type_name(input) != "string" or type_name(probe) != "string"
+        return stopped([], Some(bad_arg_error("startswith and endswith need two strings", at)))
+    let s = text_of(input)
+    let p = text_of(probe)
+    if want_start
+        return produced_one(json.bool(str.starts_with(s, p)))
+    produced_one(json.bool(str.ends_with(s, p)))
+
+// `test(re)` — the one regex builtin, over I-Regexp.
+fn test_outcome(input: JsonValueH, pattern: JsonValueH, at: Int) -> JqOutcome []
+    if type_name(pattern) != "string"
+        return stopped([], Some(bad_arg_error("test needs a pattern string", at)))
+    match jpregex.compile(text_of(pattern))
+        Err(f) =>
+            stopped([], Some(bad_arg_error("the pattern is not an I-Regexp: "
+                                           + jperror.message(f),
+                                           at)))
+        Ok(re) =>
+            if type_name(input) != "string"
+                return stopped([], Some(bad_arg_error("test needs a string input", at)))
+            produced_one(json.bool(jpregex.search(re, text_of(input))))
+
+// `floor`, `ceil` and `sqrt`, which are one shape with three bodies.
+// `floor`, `ceil` and `sqrt`, which answer jq's answers: a sqrt of a
+// negative is `null` rather than a fault, the one place a numeric
+// builtin answers a value for an input it cannot compute.
+fn round_outcome(input: JsonValueH, at: Int, which: Int) -> JqOutcome []
+    let t = type_name(input)
+    if t != "number"
+        return stopped([], Some(bad_arg_error("that needs a number", at)))
+    let f = number_of(input) ?? 0.0
+    if which == 0
+        return produced_one(number_from(math.floor(f)))
+    if which == 1
+        return produced_one(number_from(math.ceil(f)))
+    if f < 0.0
+        return produced_one(json.null())
+    produced_one(number_from(math.sqrt(f)))
+
+// ── Paths ────────────────────────────────────────────────────────────
+
+// What a path expression selected: the places, or the error that
+// stopped it.
+struct JqWalk
+    nodes: [JqAt]
+    fault: ?jqerror.JqError
+
+fn no_path() -> [JsonValueH] []
+    var out: [JsonValueH] = []
+    out
+
+fn join_path(prefix: [JsonValueH], tail: [JsonValueH]) -> [JsonValueH] []
+    var out: [JsonValueH] = []
+    for x in prefix
+        list.push(out, x)
+    for x in tail
+        list.push(out, x)
+    out
+
+fn walk_ok(nodes: [JqAt]) -> JqWalk []
+    JqWalk { nodes: nodes, fault: None }
+
+fn walk_bad(e: jqerror.JqError) -> JqWalk []
+    JqWalk { nodes: [], fault: Some(e) }
+
+// The places the walk reached before `e` stopped it.  A fault is not a
+// reason to forget them: `path(recurse(.a))` on `{"a":1}` answers `[]`
+// and `["a"]` and then raises, the way jq's stream does, and the
+// module's `JqOutcome` contract — the values produced before the stop,
+// beside the error — is the same promise one level down.
+fn walk_stopped(nodes: [JqAt], e: ?jqerror.JqError) -> JqWalk []
+    JqWalk { nodes: nodes, fault: e }
+
+// The places a path expression selects.
+//
+// `path(f)` and `paths` are the same walk, and the walk is the one
+// `select_path` does: `.a.b` on a document with no `.a` selects one
+// place, the member that is not there, because `.a` on a missing member
+// is `null` and not nothing.  Where the two differ is the error rule —
+// `.a` on a number is a place here exactly as it is an error there, so
+// `path(.a)` on `3` fails the way `.a` on `3` fails rather than
+// quietly answering `["a"]`.  A caller can therefore predict that
+// `path(f)` fails exactly when `f` does, and that a walk that fails
+// still carries the places it reached first.
+//
+// The parser has already refused a `path(f)` whose `f` is not a path
+// expression (`jqlang.is_path_expression`), so the last arm is
+// unreachable from a parsed program and is here because a match has to
+// end somewhere.
+fn walk_path(var r: Run, f: jqlang.JqFilter, input: JsonValueH, prefix: [JsonValueH], d: Int,
+             sc: JqScope, at: Int) -> JqWalk []
+    if d > r.max_depth
+        r.over = true
+        return walk_bad(budget_error(f))
+    match f
+        JqFIdentity(_)                      => walk_ok([JqAt { value: input, path: prefix }])
+        JqFPath(_, q)                       =>
+            let nodes = select_nodes(q, input, at)
+            var out: [JqAt] = []
+            for n in nodes.nodes
+                list.push(out, JqAt { value: n.value, path: join_path(prefix, n.path) })
+            walk_stopped(out, nodes.fault)
+        JqFPipe(_, a, b)                    =>
+            let first = walk_path(var r, a, input, prefix, d + 1, sc, at)
+            if broke(first.fault)
+                return first
+            var out: [JqAt] = []
+            var err: ?jqerror.JqError = None
+            for m in first.nodes
+                if not broke(err)
+                    let second = walk_path(var r, b, m.value, m.path, d + 1, sc, at)
+                    for n in second.nodes
+                        list.push(out, n)
+                    err = second.fault
+            walk_stopped(out, err)
+        JqFComma(_, a, b)                   =>
+            let left = walk_path(var r, a, input, prefix, d + 1, sc, at)
+            if broke(left.fault)
+                return left
+            let right = walk_path(var r, b, input, prefix, d + 1, sc, at)
+            walk_stopped(join_nodes(left.nodes, right.nodes), right.fault)
+        JqFIf(_, c, t, e)                   =>
+            let co = eval(var r, c, input, d + 1, sc)
+            var out: [JqAt] = []
+            var err: ?jqerror.JqError = None
+            var go = true
+            for cv in co.values
+                if go
+                    var branch = e
+                    if truthy(cv)
+                        branch = t
+                    let w = walk_path(var r, branch, input, prefix, d + 1, sc, at)
+                    for n in w.nodes
+                        list.push(out, n)
+                    if broke(w.fault)
+                        err = w.fault
+                        go = false
+            JqWalk { nodes: out, fault: pick_error(err, co.fault) }
+        JqFTry(_, b, _)                     =>
+            // `try f` keeps the outputs `f` managed and drops the
+            // fault, which is the same rule `JqOutcome` states for a
+            // value stream — so a walk that reached places first hands
+            // them on rather than the error.
+            let inner = walk_path(var r, b, input, prefix, d + 1, sc, at)
+            walk_ok(inner.nodes)
+        JqFBinary(_, JqOpAlternative, a, b) =>
+            let left = walk_path(var r, a, input, prefix, d + 1, sc, at)
+            var good: [JqAt] = []
+            for n in left.nodes
+                if truthy(n.value)
+                    list.push(good, n)
+            if list.len(good) > 0
+                return walk_ok(good)
+            if broke(left.fault)
+                return walk_stopped([], left.fault)
+            walk_path(var r, b, input, prefix, d + 1, sc, at)
+        JqFCall(_, callee, args)            => walk_path_call(var r, callee, args, input, prefix, d, sc, at)
+        _                                   => walk_bad(bad_arg_error("not a path expression", jqlang.position(f)))
+
+fn join_nodes(a: [JqAt], b: [JqAt]) -> [JqAt] []
+    var out: [JqAt] = []
+    for x in a
+        list.push(out, x)
+    for x in b
+        list.push(out, x)
+    out
+
+// The calls a path expression may be built from, each wandering rather
+// than evaluating: `select` drops places, `first` keeps one, and
+// `getpath` reads a path array out of a value argument.
+fn walk_path_call(var r: Run, callee: jqlang.JqCallee, args: [jqlang.JqFilter], input: JsonValueH,
+                  prefix: [JsonValueH], d: Int, sc: JqScope, at: Int) -> JqWalk []
+    match callee
+        JqCDefined(_) => walk_bad(bad_arg_error("not a path expression", at))
+        JqCBuiltin(b) =>
+            var saved = r.defs
+            let base = list.len(r.defs)
+            var i = 0
+            for a in args
+                r.defs = defs_with(r.defs, JqDef { name: " arg", parameters: [], body: a,
+                                                   scope: JqScope { floor: sc.floor,
+                                                                    skip: base + i } })
+                i = i + 1
+            let w = walk_path_builtin(var r, b, base, input, prefix, d, at)
+            r.defs = saved
+            w
+
+fn walk_path_builtin(var r: Run, b: jqbuiltin.JqBuiltin, base: Int, input: JsonValueH,
+                     prefix: [JsonValueH], d: Int, at: Int) -> JqWalk []
+    match b
+        JqbEmpty    => walk_ok([])
+        JqbRecurse0 => walk_ok(places_under(input, prefix))
+        JqbRecurse1 => recurse_walk(var r, r.defs[base].body, input, prefix, d + 1,
+                                    r.defs[base].scope, at)
+        JqbPaths0   => walk_ok(descend_paths(input, prefix))
+        JqbPaths1   => paths_where_walk(var r, base, input, prefix, d, at)
+        JqbGetpath1 => getpath_walk(var r, base, input, prefix, d, at)
+        JqbSelect1  => select_walk(var r, base, input, prefix, d, at)
+        JqbFirst1   => keep_walk(var r, base, input, prefix, d, at, true)
+        JqbLast1    => keep_walk(var r, base, input, prefix, d, at, false)
+        JqbLimit2   =>
+            let cap = limit_count(var r, base, input, d)
+            first_n_walk(var r, base, cap, input, prefix, d, at)
+        _           => walk_bad(bad_arg_error("not a path expression", at))
+
+// The `n` of `limit(n; f)`, read as a value argument.
+fn limit_count(var r: Run, base: Int, input: JsonValueH, d: Int) -> Int []
+    let a = arg_of(var r, base, 0, input, d)
+    whole_int(a.value) ?? 0
+
+// A value and everything under it, the value first.
+fn places_under(v: JsonValueH, path: [JsonValueH]) -> [JqAt] []
+    var out: [JqAt] = []
+    places_into(v, path, var out)
+    out
+
+fn places_into(v: JsonValueH, path: [JsonValueH], var out: [JqAt]) []
+    list.push(out, JqAt { value: v, path: path })
+    for c in children_at(JqAt { value: v, path: path })
+        places_into(c.value, c.path, var out)
+
+// Every place below the input, the input itself left out — which is
+// exactly what `paths` is.
+fn descend_paths(v: JsonValueH, path: [JsonValueH]) -> [JqAt] []
+    var out: [JqAt] = []
+    for c in children_at(JqAt { value: v, path: path })
+        places_into(c.value, c.path, var out)
+    out
+
+fn recurse_walk(var r: Run, f: jqlang.JqFilter, input: JsonValueH, prefix: [JsonValueH], d: Int,
+                sc: JqScope, at: Int) -> JqWalk []
+    var out: [JqAt] = []
+    let err = recurse_walk_into(var r, f, input, prefix, d, sc, at, var out)
+    walk_stopped(out, err)
+
+fn recurse_walk_into(var r: Run, f: jqlang.JqFilter, v: JsonValueH, path: [JsonValueH], d: Int,
+                     sc: JqScope, at: Int, var out: [JqAt]) -> ?jqerror.JqError []
+    if d > r.max_depth
+        r.over = true
+        return Some(budget_error(f))
+    list.push(out, JqAt { value: v, path: path })
+    let step = walk_path(var r, f, v, path, d + 1, sc, at)
+    if broke(step.fault)
+        return step.fault
+    for n in step.nodes
+        let e = recurse_walk_into(var r, f, n.value, n.path, d + 1, sc, at, var out)
+        if broke(e)
+            return e
+    None
+
+// `paths(f)` — every path below the input whose value satisfies `f`.
+fn paths_where_walk(var r: Run, base: Int, input: JsonValueH, prefix: [JsonValueH], d: Int,
+                    at: Int) -> JqWalk []
+    var out: [JqAt] = []
+    var err: ?jqerror.JqError = None
+    for n in descend_paths(input, prefix)
+        if not broke(err)
+            let o = arg_result(var r, base, 0, n.value, d)
+            if broke(o.fault)
+                err = o.fault
+            else
+                for v in o.values
+                    if truthy(v)
+                        list.push(out, n)
+    if broke(err)
+        return walk_stopped(out, err)
+    walk_ok(out)
+
+// `select(f)` wandering: the places `f` selected whose value is truthy.
+fn select_walk(var r: Run, base: Int, input: JsonValueH, prefix: [JsonValueH], d: Int,
+               at: Int) -> JqWalk []
+    let w = walk_path(var r, r.defs[base].body, input, prefix, d + 1, r.defs[base].scope, at)
+    // `select(f)` passes its input through — once per true output of
+    // `f` — so the place is the input's own and `f`'s outputs are only
+    // consulted for truth: `path(select(.a))` is `[]`, not `["a"]`,
+    // and `path(select(true,true))` is `[]` twice.  A fault out of `f`
+    // comes after the outputs it already produced, so the places those
+    // produced are answered first and the fault follows them.
+    var out: [JqAt] = []
+    for n in w.nodes
+        if truthy(n.value)
+            list.push(out, JqAt { value: input, path: prefix })
+    walk_stopped(out, w.fault)
+
+// `first(f)` and `last(f)` wandering.
+//
+// `first(f)` stops at the first place, so a fault further along is
+// never pulled: `path(first(.[] | .a))` over `[{"a":1},5]` answers
+// `[[0,"a"]]` and raises nothing.  `last(f)` has to walk the whole
+// stream to know which place is last, so a fault anywhere drops every
+// place and surfaces, the way `last(1, error("x"))` answers no value
+// and the error.
+fn keep_walk(var r: Run, base: Int, input: JsonValueH, prefix: [JsonValueH], d: Int, at: Int,
+             want_first: Bool) -> JqWalk []
+    let w = walk_path(var r, r.defs[base].body, input, prefix, d + 1, r.defs[base].scope, at)
+    if not want_first and broke(w.fault)
+        return walk_stopped([], w.fault)
+    var found: ?JqAt = None
+    if want_first
+        found = list.first(w.nodes)
+    else
+        found = list.last(w.nodes)
+    match found
+        None    => walk_stopped([], w.fault)
+        Some(n) =>
+            var out: [JqAt] = []
+            list.push(out, n)
+            walk_ok(out)
+
+// `limit(n; f)` wandering.
+//
+// The cap is applied to the places the walk reached before it stopped,
+// and the fault is carried beside them: `path(limit(2; .[] | .a))` over
+// `[{"a":1},5]` answers `[[0,"a"]]` and then raises, which is what jq's
+// stream does.  A cap the places already fill is a different answer —
+// the pull that would raise never happens — so a fault goes when `n`
+// places were reached, and there is nothing for `n` of zero to pull.
+fn first_n_walk(var r: Run, base: Int, cap: Int, input: JsonValueH, prefix: [JsonValueH], d: Int,
+                at: Int) -> JqWalk []
+    let w = walk_path(var r, r.defs[base + 1].body, input, prefix, d + 1, r.defs[base + 1].scope,
+                      at)
+    var out: [JqAt] = []
+    var i = 0
+    for n in w.nodes
+        if i < cap or cap < 0
+            list.push(out, n)
+            i = i + 1
+    if cap == 0 or cap > 0 and list.len(w.nodes) >= cap
+        return walk_ok(out)
+    walk_stopped(out, w.fault)
+
+// `getpath(p)` wandering: one place, at the path `p` names.
+fn getpath_walk(var r: Run, base: Int, input: JsonValueH, prefix: [JsonValueH], d: Int,
+                at: Int) -> JqWalk []
+    let a = arg_of(var r, base, 0, input, d)
+    if broke(a.error)
+        return JqWalk { nodes: [], fault: a.error }
+    if not a.has
+        return walk_ok([])
+    match path_value_steps(a.value)
+        None        =>
+            walk_bad(bad_arg_error("getpath needs an array of names and indices", at))
+        Some(steps) =>
+            let w = walk_steps(input, steps, at)
+            if broke(w.fault)
+                return JqWalk { nodes: [], fault: w.fault }
+            var out: [JqAt] = []
+            for v in w.values
+                list.push(out, JqAt { value: v, path: join_path(prefix, steps) })
+            walk_ok(out)
+
+// A jq path array — names and indices — read into its steps, or `None`
+// when an element is neither.
+fn path_value_steps(p: JsonValueH) -> ?[JsonValueH] []
+    if type_name(p) != "array"
+        return None
+    var out: [JsonValueH] = []
+    for s in json.to_list(p) ?? []
+        let t = type_name(s)
+        if t == "string"
+            list.push(out, s)
+        elif t == "number"
+            match whole_int(s)
+                None    =>
+                    return None
+                Some(i) => list.push(out, json.int(i))
+        else
+            return None
+    Some(out)
+
+// The value at a path of names and indices, or the fault jq names when
+// a step is applied to a value that cannot take it.  `null` is a value
+// the walk passes through — `5 | getpath(["a"])` is an error, while
+// `null | getpath(["a"])` is `null` — and that difference is the whole
+// reason this answers an outcome rather than a value.
+fn walk_steps(root: JsonValueH, steps: [JsonValueH], at: Int) -> JqOutcome []
+    var cur = root
+    for s in steps
+        let t = type_name(s)
+        let ct = type_name(cur)
+        if ct == "null"
+            cur = json.null()
+        elif t == "string"
+            if ct == "object"
+                cur = member_or_null(cur, text_of(s))
+            else
+                return stopped([], Some(cannot_index_value(cur, json.stringify(s), at)))
+        elif t == "number"
+            if ct == "array"
+                cur = step_index(cur, whole_int(s) ?? 0)
+            else
+                return stopped([], Some(cannot_index_value(cur, json.stringify(s), at)))
+    produced_one(cur)
+
+fn step_index(cur: JsonValueH, i: Int) -> JsonValueH []
+    // cov: skip — the one caller is the array arm of walk_steps, so cur is always an array
+    if type_name(cur) != "array"
+        return json.null()
+    json.index(cur, i) ?? json.null()
+
+// `getpath(p)` outside a path expression, which is the same walk with
+// the answer read off the end.
+fn getpath_outcome(input: JsonValueH, p: JsonValueH, at: Int) -> JqOutcome []
+    match path_value_steps(p)
+        None        =>
+            stopped([], Some(bad_arg_error("getpath needs an array of names and indices", at)))
+        Some(steps) =>
+            walk_steps(input, steps, at)
+
+// `path(f)` — one output per place `f` selects.
+fn path_outcome(var r: Run, base: Int, input: JsonValueH, d: Int, at: Int) -> JqOutcome []
+    let w = walk_path(var r, r.defs[base].body, input, no_path(), d + 1, r.defs[base].scope, at)
+    var out: [JsonValueH] = []
+    var go = true
+    for n in w.nodes
+        if go
+            if not emit(r, out, json.array(n.path))
+                go = false
+    stopped(out, w.fault)
+
+// `paths` — every path below the input.
+fn paths_outcome(var r: Run, input: JsonValueH) -> JqOutcome []
+    var out: [JsonValueH] = []
+    var go = true
+    for n in descend_paths(input, no_path())
+        if go
+            if not emit(r, out, json.array(n.path))
+                go = false
+    stopped(out, None)
+
+// `paths(f)` — the paths whose value satisfies `f`.
+fn paths_where_outcome(var r: Run, base: Int, input: JsonValueH, d: Int, at: Int) -> JqOutcome []
+    let w = paths_where_walk(var r, base, input, no_path(), d, at)
+    var out: [JsonValueH] = []
+    var go = true
+    for n in w.nodes
+        if go
+            if not emit(r, out, json.array(n.path))
+                go = false
+    stopped(out, w.fault)
