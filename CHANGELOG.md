@@ -5,11 +5,13 @@ All notable changes to jsonquery-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## Unreleased
+## 0.1.0 — 2026-11-03
 
 ### Fixed
 
 - `jqlang.parse` refuses programs nested more than 128 deep with `JqUnexpectedByte`.
+
+This release requires novo 0.23.0 or later.
 
 ## 0.1.0 — 2026-10-11
 
