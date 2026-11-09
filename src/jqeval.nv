@@ -77,9 +77,11 @@ pub struct JqLimits
     // How many outputs the run may produce before it stops.
     max_outputs: Int
     // How many filter applications it may make.  The larger number,
-    // and the one that bounds the cost: `limit(1; recurse(.))` never
-    // finishes on its own, so its answer arrives only because a
-    // ceiling stopped the run.
+    // and the one that bounds the cost: `recurse(.)` never finishes on
+    // its own, so a program that reads all of it, such as
+    // `last(recurse(.))`, answers only because a ceiling stopped the
+    // run.  `limit(1; recurse(.))` stops the stream after one output
+    // and meets no ceiling.
     max_steps: Int
     // How deeply the evaluator may recurse, which bounds `recurse` and
     // a deeply nested program together.
@@ -802,30 +804,13 @@ fn budget_error(f: jqlang.JqFilter) -> jqerror.JqError []
                   jqlang.position(f))
 
 // Append one output, unless the output budget is spent.  Answers false
-// when the run has to stop, having set the flag `eval` reads.
+// when the run has to stop, having set the flag `each` reads.
 fn emit(var r: Run, var out: [JsonValueH], v: JsonValueH) -> Bool []
     if list.len(out) >= r.max_outputs
         r.over = true
         return false
     list.push(out, v)
     true
-
-// Append every value of a list, answering false when the budget stops
-// the run part way.
-fn emit_all(var r: Run, var out: [JsonValueH], xs: [JsonValueH]) -> Bool []
-    var ok = true
-    for v in xs
-        if ok
-            if not emit(r, out, v)
-                ok = false
-    ok
-
-// The error that stops a run: the inner one where there is one, else
-// the outer.
-fn pick_error(inner: ?jqerror.JqError, outer: ?jqerror.JqError) -> ?jqerror.JqError []
-    match inner
-        Some(_) => inner
-        None    => outer
 
 // Whether an optional error is one.
 fn broke(e: ?jqerror.JqError) -> Bool []
@@ -836,6 +821,121 @@ fn broke(e: ?jqerror.JqError) -> Bool []
 // An outcome carrying what it has and the error that stopped it.
 fn stopped(values: [JsonValueH], e: ?jqerror.JqError) -> JqOutcome []
     JqOutcome { values: values, fault: e }
+
+// ── The flow ─────────────────────────────────────────────────────────
+
+// What a producer answers a consumer with, and what a consumer answers
+// a producer with.  One type for both, because a pipe is a consumer
+// whose answer is the answer of the filter on its right.
+//
+// `JqMore`.  As an answer from a consumer: keep producing.  As an
+// answer from a producer: the stream ended by itself.
+//
+// `JqHalt`.  The consumer wants no more outputs, and a producer that
+// reads it stops at once and hands it on.  Nothing went wrong, so
+// reaching the demand of `limit` or `first` is this and never a budget:
+// it sets neither `Run.over` nor an error.
+//
+// `JqRaise`.  The run failed.  A producer that reads it stops and hands
+// it on, which is how an error raised on the right of a pipe ends the
+// filter on its left.
+enum JqFlow
+    JqMore
+    JqHalt
+    JqRaise(fault: jqerror.JqError)
+
+// The flow that carries an optional error: `JqMore` for none.
+fn flow_of(e: ?jqerror.JqError) -> JqFlow []
+    match e
+        None    => JqMore
+        Some(x) => JqRaise(x)
+
+// Whether a flow lets the producer go on.
+fn is_more(fl: JqFlow) -> Bool []
+    match fl
+        JqMore => true
+        _      => false
+
+// The error a flow carries, if it carries one.
+fn fault_of(fl: JqFlow) -> ?jqerror.JqError []
+    match fl
+        JqRaise(x) => Some(x)
+        _          => None
+
+// Two numbers a consumer needs to keep between calls.  A captured `Int`
+// or `Bool` is copied into the closure, so a count or a flag that the
+// consumer sets and the caller reads has to live in a struct.
+struct JqGate
+    var count: Int
+    var hit: Bool
+
+// The last output a consumer saw.
+struct JqHold
+    var value: JsonValueH
+
+// The last place a walk handed on.
+struct JqHoldAt
+    var has: Bool
+    var node: JqAt
+
+// The state of one fold: the value the update last answered.
+struct JqFold
+    var acc: JsonValueH
+
+// Hand every value of a list to a consumer, stopping at the first
+// answer that is not `JqMore`, then answer the optional error that
+// followed the values.
+fn deliver(values: [JsonValueH], e: ?jqerror.JqError, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    var result = JqMore
+    var go = true
+    for v in values
+        if go
+            let s = k(v)
+            if not is_more(s)
+                result = s
+                go = false
+    if go
+        return flow_of(e)
+    result
+
+// Charge one step for work that does not go through `each`, such as the
+// next number of a `range`.  Answers false when the step crossed the
+// ceiling, having set the flag `each` reads.
+fn tick(var r: Run) -> Bool []
+    r.steps = r.steps + 1
+    if r.steps > r.max_steps
+        r.over = true
+        return false
+    true
+
+// The flow of a run that crossed a budget in a loop `each` does not
+// enter.  `each` replaces the error with the one for the filter it was
+// asked to run, so only its kind matters here.
+fn over_flow(var r: Run, at: Int) -> JqFlow []
+    r.over = true
+    JqRaise(jqerror.error(JqOverBudget, json.string("the run crossed its budget"), at))
+
+// A consumer that puts the bindings and the definitions of the moment it
+// is made back before it calls `k`, and puts the ones it found back when
+// `k` answers.
+//
+// A producer that adds a binding or a definition for its body hands the
+// body this in place of the consumer it was given, because the body's
+// outputs reach the consumer while the body's names are still in the
+// run.  Without it `(1 as $x | $x) | $x` would read the inner `$x` on
+// the right of the pipe.
+fn restoring(var r: Run, k: fn(JsonValueH) -> JqFlow) -> fn(JsonValueH) -> JqFlow []
+    var bindings = r.bindings
+    var defs = r.defs
+    v =>
+        var inner_bindings = r.bindings
+        var inner_defs = r.defs
+        r.bindings = bindings
+        r.defs = defs
+        let s = k(v)
+        r.bindings = inner_bindings
+        r.defs = inner_defs
+        s
 
 // ── Bindings and definitions ─────────────────────────────────────────
 
@@ -940,47 +1040,76 @@ fn member_or_null(v: JsonValueH, name: Str) -> JsonValueH []
 
 // ── The evaluator ────────────────────────────────────────────────────
 
-// Run one filter against one input, charging the budget on the way in.
+// Run one filter against one input and keep every output.
+//
+// The collecting form of `each`, for the places that need the whole
+// stream before they can go on: an array constructor, the arguments of
+// the builtins that sort or group, the condition of an `if` on a path,
+// and the run itself.  Its consumer never stops the producer.  The one
+// exception is the output ceiling: a stream longer than `max_outputs` is
+// cut there, which is the budget and not a demand.
+fn eval(var r: Run, f: jqlang.JqFilter, input: JsonValueH, d: Int, sc: JqScope) -> JqOutcome []
+    var out: [JsonValueH] = []
+    let fl = each(var r, f, input, d, sc, v => keep(var r, var out, v))
+    stopped(out, fault_of(fl))
+
+// The consumer `eval` uses: keep the output, or stop the producer when
+// the output ceiling is spent.
+fn keep(var r: Run, var out: [JsonValueH], v: JsonValueH) -> JqFlow []
+    if emit(var r, var out, v)
+        return JqMore
+    JqHalt
+
+// Run one filter against one input, handing each output to a consumer
+// as the filter produces it, and charging the budget on the way in.
 //
 // The charge is HERE rather than at each recursive call so there is one
 // place a run can be stopped and one place that turns the flag back
 // into the error every caller is already holding.
-fn eval(var r: Run, f: jqlang.JqFilter, input: JsonValueH, d: Int, sc: JqScope) -> JqOutcome []
+//
+// The answer is how the stream ended.  `JqMore` means the filter ran to
+// its end, `JqHalt` that the consumer asked it to stop, and `JqRaise`
+// that the filter or the consumer failed.  A filter reads only as far
+// into its own sources as its consumer lets it, which is what lets
+// `limit` and `first` stop an argument that has no end.
+fn each(var r: Run, f: jqlang.JqFilter, input: JsonValueH, d: Int, sc: JqScope,
+        k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     r.steps = r.steps + 1
     if r.over
-        return stopped([], Some(budget_error(f)))
+        return JqRaise(budget_error(f))
     if r.steps > r.max_steps
         r.over = true
-        return stopped([], Some(budget_error(f)))
+        return JqRaise(budget_error(f))
     if d > r.max_depth
         r.over = true
-        return stopped([], Some(budget_error(f)))
-    let o = eval_node(var r, f, input, d, sc)
+        return JqRaise(budget_error(f))
+    let fl = each_node(var r, f, input, d, sc, k)
     if r.over
-        return stopped(o.values, Some(budget_error(f)))
-    o
+        return JqRaise(budget_error(f))
+    fl
 
 // One filter, by shape.
-fn eval_node(var r: Run, f: jqlang.JqFilter, input: JsonValueH, d: Int, sc: JqScope) -> JqOutcome []
+fn each_node(var r: Run, f: jqlang.JqFilter, input: JsonValueH, d: Int, sc: JqScope,
+             k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     match f
-        JqFIdentity(_)                => produced_one(input)
-        JqFPath(_, q)                 => query_result(q, input, jqlang.position(f))
-        JqFLiteral(_, v)              => produced_one(literal_value(v))
-        JqFPipe(_, l, x)              => eval_pipe(var r, l, x, input, d, sc)
-        JqFComma(_, l, x)             => eval_comma(var r, l, x, input, d, sc)
-        JqFArray(_, b)                => eval_array(var r, b, input, d, sc)
-        JqFObject(_, fs)              => eval_object(var r, fs, input, d, sc)
-        JqFBinary(_, op, l, x)        => eval_binary(var r, op, l, x, input, d, sc)
-        JqFNegate(_, b)               => eval_negate(var r, b, input, d, sc)
-        JqFIf(_, c, y, n)             => eval_if(var r, c, y, n, input, d, sc)
-        JqFTry(_, b, h)               => eval_try(var r, b, h, input, d, sc)
-        JqFReduce(_, s, p, i, u)      => eval_reduce(var r, s, p, i, u, input, d, sc)
-        JqFForeach(_, s, p, i, u, x)  => eval_foreach(var r, s, p, i, u, x, input, d, sc)
-        JqFBind(_, s, p, b)           => eval_bind(var r, s, p, b, input, d, sc)
-        JqFVariable(_, nm)            => eval_variable(var r, nm, f, sc)
-        JqFCall(_, callee, args)      => eval_call(var r, callee, args, input, d, sc, jqlang.position(f))
-        JqFDefine(_, nm, ps, b, rest) => eval_define(var r, nm, ps, b, rest, input, d, sc)
-        JqFInterpolate(_, parts)      => eval_interpolate(var r, parts, input, d, sc)
+        JqFIdentity(_)                => k(input)
+        JqFPath(_, q)                 => each_path(q, input, jqlang.position(f), k)
+        JqFLiteral(_, v)              => k(literal_value(v))
+        JqFPipe(_, l, x)              => each_pipe(var r, l, x, input, d, sc, k)
+        JqFComma(_, l, x)             => each_comma(var r, l, x, input, d, sc, k)
+        JqFArray(_, b)                => each_array(var r, b, input, d, sc, k)
+        JqFObject(_, fs)              => each_object(var r, fs, input, d, sc, k)
+        JqFBinary(_, op, l, x)        => each_binary(var r, op, l, x, input, d, sc, k)
+        JqFNegate(_, b)               => each_negate(var r, b, input, d, sc, k)
+        JqFIf(_, c, y, n)             => each_if(var r, c, y, n, input, d, sc, k)
+        JqFTry(_, b, h)               => each_try(var r, b, h, input, d, sc, k)
+        JqFReduce(_, s, p, i, u)      => each_reduce(var r, s, p, i, u, input, d, sc, k)
+        JqFForeach(_, s, p, i, u, x)  => each_foreach(var r, s, p, i, u, x, input, d, sc, k)
+        JqFBind(_, s, p, b)           => each_bind(var r, s, p, b, input, d, sc, k)
+        JqFVariable(_, nm)            => each_variable(var r, nm, f, sc, k)
+        JqFCall(_, callee, args)      => each_call(var r, callee, args, input, d, sc, jqlang.position(f), k)
+        JqFDefine(_, nm, ps, b, rest) => each_define(var r, nm, ps, b, rest, input, d, sc, k)
+        JqFInterpolate(_, parts)      => each_interpolate(var r, parts, input, d, sc, k)
 
 // A literal as a value.
 fn literal_value(v: jqlang.JqLiteral) -> JsonValueH []
@@ -991,62 +1120,58 @@ fn literal_value(v: jqlang.JqLiteral) -> JsonValueH []
         JqLString(s) => json.string(s)
 
 // A path, with jq's rules for the places an RFC 9535 walk has none.
-fn query_result(q: jpquery.JpQuery, input: JsonValueH, at: Int) -> JqOutcome []
+fn each_path(q: jpquery.JpQuery, input: JsonValueH, at: Int,
+             k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     let walked = select_nodes(q, input, at)
-    stopped(values_of(walked.nodes), walked.fault)
+    deliver(values_of(walked.nodes), walked.fault, k)
 
 // `f | g` — every output of `f` fed to `g` in turn.
+//
+// `f` is asked for its next output only when `g` has finished with the
+// last one, so a consumer that stops after the first output of the pipe
+// stops `f` after as many outputs as `g` needed to make it.  That is not
+// a number the pipe can know, because `g` may drop any of them
+// (`select`, `empty`).
 //
 // The outputs `f` managed before it raised are still fed to `g`, which
 // is what jq's streaming pipe does and what
 // `.[] | (., error("stop"))` shows: the first element of `[1]` reaches
 // the echo before the error is raised, so the outcome carries one value
-// AND the error.
-fn eval_pipe(var r: Run, left: jqlang.JqFilter, right: jqlang.JqFilter, input: JsonValueH, d: Int,
-             sc: JqScope) -> JqOutcome []
-    let lo = eval(var r, left, input, d + 1, sc)
-    var out: [JsonValueH] = []
-    var err: ?jqerror.JqError = None
-    var go = true
-    for v in lo.values
-        if go
-            let ro = eval(var r, right, v, d + 1, sc)
-            if not emit_all(var r, var out, ro.values)
-                go = false
-            if broke(ro.fault)
-                err = ro.fault
-                go = false
-    if broke(err)
-        return stopped(out, err)
-    stopped(out, lo.fault)
+// AND the error.  An error `g` raises ends the pipe at once and is the
+// answer, ahead of any error `f` would have raised later.
+fn each_pipe(var r: Run, left: jqlang.JqFilter, right: jqlang.JqFilter, input: JsonValueH, d: Int,
+             sc: JqScope, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    each(var r, left, input, d + 1, sc, v => each(var r, right, v, d + 1, sc, k))
 
 // `f, g` — the outputs of `f`, then the outputs of `g`.
-fn eval_comma(var r: Run, left: jqlang.JqFilter, right: jqlang.JqFilter, input: JsonValueH, d: Int,
-              sc: JqScope) -> JqOutcome []
-    let lo = eval(var r, left, input, d + 1, sc)
-    var out: [JsonValueH] = []
-    emit_all(var r, var out, lo.values)
-    if broke(lo.fault)
-        return stopped(out, lo.fault)
-    let ro = eval(var r, right, input, d + 1, sc)
-    emit_all(var r, var out, ro.values)
-    stopped(out, ro.fault)
+fn each_comma(var r: Run, left: jqlang.JqFilter, right: jqlang.JqFilter, input: JsonValueH, d: Int,
+              sc: JqScope, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    let fl = each(var r, left, input, d + 1, sc, k)
+    if is_more(fl)
+        return each(var r, right, input, d + 1, sc, k)
+    fl
 
 // `[f]` — the stream turned back into one value.
-fn eval_array(var r: Run, body: jqlang.JqFilter, input: JsonValueH, d: Int,
-              sc: JqScope) -> JqOutcome []
+//
+// A collecting node: `f` runs to its end whatever the consumer of the
+// array wants, since an array with some of its elements is not a smaller
+// answer, it is a different one.
+fn each_array(var r: Run, body: jqlang.JqFilter, input: JsonValueH, d: Int, sc: JqScope,
+              k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     let o = eval(var r, body, input, d + 1, sc)
     if broke(o.fault)
-        return stopped([], o.fault)
-    produced_one(json.array(o.values))
+        return flow_of(o.fault)
+    k(json.array(o.values))
 
 // `{a: f, ...}` — one object per combination of the parts' outputs.
 //
 // A field's key is computed, so `{(.k): .v}` is the same node with a
 // path on the left, and a later field of the same name wins, which is
 // jq's rule and the reason `with_member` replaces rather than appends.
-fn eval_object(var r: Run, fields: [jqlang.JqField], input: JsonValueH, d: Int,
-               sc: JqScope) -> JqOutcome []
+// A collecting node, like the array: every part runs to its end before
+// the first object is handed on.
+fn each_object(var r: Run, fields: [jqlang.JqField], input: JsonValueH, d: Int, sc: JqScope,
+               k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     var partials: [JsonValueH] = []
     list.push(partials, json.object([]))
     var err: ?jqerror.JqError = None
@@ -1061,9 +1186,9 @@ fn eval_object(var r: Run, fields: [jqlang.JqField], input: JsonValueH, d: Int,
                         err = ko.fault
                         go = false
                     else
-                        for k in ko.values
+                        for key in ko.values
                             if go
-                                if not is_str(k)
+                                if not is_str(key)
                                     err = Some(jqerror.error(JqTypeMismatch,
                                                   json.string("object keys must be strings"),
                                                   jqlang.position(fld.key)))
@@ -1075,13 +1200,11 @@ fn eval_object(var r: Run, fields: [jqlang.JqField], input: JsonValueH, d: Int,
                                         go = false
                                     else
                                         for v in vo.values
-                                            list.push(next, with_member(base, text_of(k), v))
+                                            list.push(next, with_member(base, text_of(key), v))
             partials = next
     if broke(err)
-        return stopped([], err)
-    var out: [JsonValueH] = []
-    emit_all(var r, var out, partials)
-    stopped(out, None)
+        return flow_of(err)
+    deliver(partials, None, k)
 
 // One member set, on a copy.
 fn with_member(base: JsonValueH, k: Str, v: JsonValueH) -> JsonValueH []
@@ -1099,46 +1222,29 @@ fn with_member(base: JsonValueH, k: Str, v: JsonValueH) -> JsonValueH []
     json.object(out)
 
 // `-f` — applied to the OUTPUTS of `f`, so `-(.a, .b)` negates two.
-fn eval_negate(var r: Run, body: jqlang.JqFilter, input: JsonValueH, d: Int,
-               sc: JqScope) -> JqOutcome []
-    let o = eval(var r, body, input, d + 1, sc)
-    var out: [JsonValueH] = []
-    var err = o.fault
-    for v in o.values
-        match number_of(v)
-            None    =>
-                if not broke(err)
-                    err = Some(jqerror.error(JqTypeMismatch,
-                                 json.string(text_of(v) + " cannot be negated"),
-                                 jqlang.position(body)))
-            Some(f) => list.push(out, number_from(0.0 - f))
-    stopped(out, err)
+fn each_negate(var r: Run, body: jqlang.JqFilter, input: JsonValueH, d: Int, sc: JqScope,
+               k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    each(var r, body, input, d + 1, sc, v => negated(v, jqlang.position(body), k))
+
+// One output of `-f`: the number negated, or the refusal.
+fn negated(v: JsonValueH, at: Int, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    match number_of(v)
+        None    => JqRaise(jqerror.error(JqTypeMismatch,
+                                json.string(text_of(v) + " cannot be negated"), at))
+        Some(f) => k(number_from(0.0 - f))
 
 // `if c then a else b end` — once per output of the condition, which is
 // what makes `if (true, false) then 1 else 2 end` two values.
-fn eval_if(var r: Run, cond: jqlang.JqFilter, yes: jqlang.JqFilter, no: jqlang.JqFilter,
-           input: JsonValueH, d: Int, sc: JqScope) -> JqOutcome []
-    let co = eval(var r, cond, input, d + 1, sc)
-    var out: [JsonValueH] = []
-    var err: ?jqerror.JqError = None
-    var go = true
-    for c in co.values
-        if go
-            if truthy(c)
-                let yo = eval(var r, yes, input, d + 1, sc)
-                emit_all(var r, var out, yo.values)
-                if broke(yo.fault)
-                    err = yo.fault
-                    go = false
-            else
-                let xo = eval(var r, no, input, d + 1, sc)
-                emit_all(var r, var out, xo.values)
-                if broke(xo.fault)
-                    err = xo.fault
-                    go = false
-    if broke(err)
-        return stopped(out, err)
-    stopped(out, co.fault)
+fn each_if(var r: Run, cond: jqlang.JqFilter, yes: jqlang.JqFilter, no: jqlang.JqFilter,
+           input: JsonValueH, d: Int, sc: JqScope, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    each(var r, cond, input, d + 1, sc, c => each_branch(var r, truthy(c), yes, no, input, d, sc, k))
+
+// The branch one output of the condition picks.
+fn each_branch(var r: Run, yes_branch: Bool, yes: jqlang.JqFilter, no: jqlang.JqFilter,
+               input: JsonValueH, d: Int, sc: JqScope, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    if yes_branch
+        return each(var r, yes, input, d + 1, sc, k)
+    each(var r, no, input, d + 1, sc, k)
 
 // `try f catch g`, and `f?` with `empty` for the handler.
 //
@@ -1146,30 +1252,46 @@ fn eval_if(var r: Run, cond: jqlang.JqFilter, yes: jqlang.JqFilter, no: jqlang.J
 // input, which is what makes `try error({code: 4}) catch .code` read a
 // member out of what was raised.  A budget is not catchable, so the run
 // stops rather than letting a program decide to ignore its ceiling.
-fn eval_try(var r: Run, body: jqlang.JqFilter, handler: jqlang.JqFilter, input: JsonValueH, d: Int,
-            sc: JqScope) -> JqOutcome []
-    let o = eval(var r, body, input, d + 1, sc)
-    match o.fault
-        None    => o
-        Some(e) =>
-            if not jqerror.is_catchable(e.kind)
-                return o
-            let h = eval(var r, handler, jqerror.error_value(e), d + 1, sc)
-            stopped(cat(o.values, h.values), h.fault)
+//
+// Only an error `f` raised is caught.  One the consumer raised on an
+// output of `f` passes through, as it does in jq: `try (1, 2) | error`
+// is the error, not the handler's answer.
+fn each_try(var r: Run, body: jqlang.JqFilter, handler: jqlang.JqFilter, input: JsonValueH, d: Int,
+            sc: JqScope, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    var gate = JqGate { count: 0, hit: false }
+    let fl = each(var r, body, input, d + 1, sc, v => passed_on(var gate, v, k))
+    match fl
+        JqRaise(e) =>
+            if gate.hit or not jqerror.is_catchable(e.kind)
+                return fl
+            each(var r, handler, jqerror.error_value(e), d + 1, sc, k)
+        _          => fl
+
+// Hand one output on, and note in the gate when the consumer answered
+// with anything but "go on", so the producer can tell its own failure
+// from the consumer's.
+fn passed_on<T>(var gate: JqGate, v: T, k: fn(T) -> JqFlow) -> JqFlow []
+    let s = k(v)
+    if not is_more(s)
+        gate.hit = true
+    s
 
 // `reduce s as $x (init; update)` — one output per init value, that
 // value's last state.
 //
 // The state is the LAST output of `update`, which is the reading that
 // makes `reduce` deterministic over a multi-output update.  An update
-// that produces nothing sets the state to null and the fold goes on
-// with the next item, and an init with several outputs folds once per
+// that produces nothing sets the state to null and the fold goes on with
+// the next item, and an init with several outputs folds once per
 // output — both readings measured against jq 1.7, as is the order the
-// faults arrive in: a fold's own fault ends the run, then the
-// source's, then the init's, each after the outputs already made.
-fn eval_reduce(var r: Run, source: jqlang.JqFilter, pattern: jqlang.JqPattern,
+// faults arrive in: a fold's own fault ends the run, then the source's,
+// then the init's, each after the outputs already made.
+//
+// A collecting node: the source runs to its end before the first state
+// is folded, so a source longer than `max_outputs` is the budget.
+fn each_reduce(var r: Run, source: jqlang.JqFilter, pattern: jqlang.JqPattern,
                init: jqlang.JqFilter, update: jqlang.JqFilter, input: JsonValueH, d: Int,
-               sc: JqScope) -> JqOutcome []
+               sc: JqScope, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     let start = eval(var r, init, input, d + 1, sc)
     let so = eval(var r, source, input, d + 1, sc)
     var out: [JsonValueH] = []
@@ -1203,9 +1325,7 @@ fn eval_reduce(var r: Run, source: jqlang.JqFilter, pattern: jqlang.JqPattern,
                     list.push(out, acc)
     if not broke(err)
         err = start.fault
-    if broke(err)
-        return stopped(out, err)
-    produced(out)
+    deliver(out, err, k)
 
 // `foreach s as $x (init; update; extract)` — the state at every step.
 //
@@ -1214,90 +1334,90 @@ fn eval_reduce(var r: Run, source: jqlang.JqFilter, pattern: jqlang.JqPattern,
 // extract is not run), and an init with several outputs runs once per
 // output.  The faults arrive in the same order, with the outputs
 // already emitted kept.
-fn eval_foreach(var r: Run, source: jqlang.JqFilter, pattern: jqlang.JqPattern,
+//
+// The source is read as the fold needs it and the extract's outputs go
+// to the consumer as they are made, so a consumer that stops after the
+// first state stops the source after its first item.
+fn each_foreach(var r: Run, source: jqlang.JqFilter, pattern: jqlang.JqPattern,
                 init: jqlang.JqFilter, update: jqlang.JqFilter, extract: jqlang.JqFilter,
-                input: JsonValueH, d: Int, sc: JqScope) -> JqOutcome []
+                input: JsonValueH, d: Int, sc: JqScope, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     let start = eval(var r, init, input, d + 1, sc)
-    let so = eval(var r, source, input, d + 1, sc)
-    var out: [JsonValueH] = []
-    var err: ?jqerror.JqError = None
-    for state in start.values
-        if not broke(err)
-            var acc = state
-            var live = true
-            for item in so.values
-                if live
-                    var saved = r.bindings
-                    let be = bind_pattern(var r, pattern, item, d + 1, sc)
-                    if broke(be)
-                        err = be
-                        live = false
-                    else
-                        let uo = eval(var r, update, acc, d + 1, sc)
-                        match list.last(uo.values)
-                            None     =>
-                                acc = null_value()
-                            Some(nx) =>
-                                acc = nx
-                                let eo = eval(var r, extract, acc, d + 1, sc)
-                                emit_all(var r, var out, eo.values)
-                                if broke(eo.fault)
-                                    err = eo.fault
-                                    live = false
-                        if broke(uo.fault)
-                            err = uo.fault
-                            live = false
-                    r.bindings = saved
-            if not broke(err)
-                if broke(so.fault)
-                    err = so.fault
-    if not broke(err)
-        err = start.fault
-    if broke(err)
-        return stopped(out, err)
-    produced(out)
-
-// `f as $x | g` — `g` once per output of `f`, over the ORIGINAL input.
-fn eval_bind(var r: Run, source: jqlang.JqFilter, pattern: jqlang.JqPattern, body: jqlang.JqFilter,
-             input: JsonValueH, d: Int, sc: JqScope) -> JqOutcome []
-    let so = eval(var r, source, input, d + 1, sc)
-    var out: [JsonValueH] = []
-    var err: ?jqerror.JqError = None
+    let back = restoring(var r, k)
+    var result = JqMore
     var go = true
-    for item in so.values
+    for state in start.values
         if go
-            var saved = r.bindings
-            let be = bind_pattern(var r, pattern, item, d + 1, sc)
-            if broke(be)
-                err = be
+            var fold = JqFold { acc: state }
+            let fl = each(var r, source, input, d + 1, sc,
+                          item => fold_step(var r, var fold, pattern, item, update, extract, d, sc, back))
+            if not is_more(fl)
+                result = fl
                 go = false
-            else
-                let bo = eval(var r, body, input, d + 1, sc)
-                emit_all(var r, var out, bo.values)
-                if broke(bo.fault)
-                    err = bo.fault
-                    go = false
-            r.bindings = saved
-    if broke(err)
-        return stopped(out, err)
-    stopped(out, so.fault)
+    if go
+        return flow_of(start.fault)
+    result
+
+// One item of a `foreach`: bind it, run the update, and hand the
+// extract's outputs on.
+//
+// An update that raised after it produced a value still has that value
+// extracted before the fault ends the fold, which is the order the
+// eager fold kept.
+fn fold_step(var r: Run, var fold: JqFold, pattern: jqlang.JqPattern, item: JsonValueH,
+             update: jqlang.JqFilter, extract: jqlang.JqFilter, d: Int, sc: JqScope,
+             k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    var saved = r.bindings
+    let be = bind_pattern(var r, pattern, item, d + 1, sc)
+    var result = flow_of(be)
+    if not broke(be)
+        let uo = eval(var r, update, fold.acc, d + 1, sc)
+        match list.last(uo.values)
+            None     =>
+                fold.acc = null_value()
+            Some(nx) =>
+                fold.acc = nx
+                result = each(var r, extract, nx, d + 1, sc, k)
+        if is_more(result)
+            result = flow_of(uo.fault)
+    r.bindings = saved
+    result
+
+// `f as $x | g`: `g` once per output of `f`, over the ORIGINAL input.
+fn each_bind(var r: Run, source: jqlang.JqFilter, pattern: jqlang.JqPattern, body: jqlang.JqFilter,
+             input: JsonValueH, d: Int, sc: JqScope, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    let back = restoring(var r, k)
+    each(var r, source, input, d + 1, sc,
+         item => bind_step(var r, pattern, item, body, input, d, sc, back))
+
+// One output of the source of an `as`: bind it, run the body.
+fn bind_step(var r: Run, pattern: jqlang.JqPattern, item: JsonValueH, body: jqlang.JqFilter,
+             input: JsonValueH, d: Int, sc: JqScope, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    var saved = r.bindings
+    let be = bind_pattern(var r, pattern, item, d + 1, sc)
+    var result = flow_of(be)
+    if not broke(be)
+        result = each(var r, body, input, d + 1, sc, k)
+    r.bindings = saved
+    result
 
 // `$name`.
-fn eval_variable(var r: Run, name: Str, f: jqlang.JqFilter, sc: JqScope) -> JqOutcome []
+fn each_variable(var r: Run, name: Str, f: jqlang.JqFilter, sc: JqScope,
+                 k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     match find_binding(r.bindings, name)
-        Some(b) => produced_one(b.value)
-        None    => stopped([], Some(jqerror.error(JqBadArgument, json.string(name),
-                                        jqlang.position(f))))
+        Some(b) => k(b.value)
+        None    => JqRaise(jqerror.error(JqBadArgument, json.string(name), jqlang.position(f)))
 
 // A definition in scope over the rest of the program.
-fn eval_define(var r: Run, name: Str, parameters: [Str], body: jqlang.JqFilter,
-               rest: jqlang.JqFilter, input: JsonValueH, d: Int, sc: JqScope) -> JqOutcome []
+fn each_define(var r: Run, name: Str, parameters: [Str], body: jqlang.JqFilter,
+               rest: jqlang.JqFilter, input: JsonValueH, d: Int, sc: JqScope,
+               k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    let back = restoring(var r, k)
     var saved = r.defs
     r.defs = defs_with(r.defs, JqDef { name: name, parameters: parameters, body: body,
                                        scope: sc })
-    let o = eval(var r, rest, input, d + 1, sc)
+    let fl = each(var r, rest, input, d + 1, sc, back)
     r.defs = saved
-    o
+    fl
 
 fn defs_with(xs: [JqDef], d: JqDef) -> [JqDef] []
     var out: [JqDef] = []
@@ -1310,9 +1430,10 @@ fn defs_with(xs: [JqDef], d: JqDef) -> [JqDef] []
 //
 // Each interpolated filter may produce several outputs, and the string
 // is built once per combination, which is why this is one node rather
-// than a `+` chain of pieces the parser invented.
-fn eval_interpolate(var r: Run, parts: [jqlang.JqStrPart], input: JsonValueH, d: Int,
-                    sc: JqScope) -> JqOutcome []
+// than a `+` chain of pieces the parser invented.  A collecting node:
+// every part runs to its end before the first string is handed on.
+fn each_interpolate(var r: Run, parts: [jqlang.JqStrPart], input: JsonValueH, d: Int, sc: JqScope,
+                    k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     var texts: [Str] = []
     list.push(texts, "")
     var err: ?jqerror.JqError = None
@@ -1337,11 +1458,11 @@ fn eval_interpolate(var r: Run, parts: [jqlang.JqStrPart], input: JsonValueH, d:
                                 list.push(next, t + to_text(v))
                         texts = next
     if broke(err)
-        return stopped([], err)
+        return flow_of(err)
     var out: [JsonValueH] = []
     for t in texts
         list.push(out, json.string(t))
-    stopped(out, None)
+    deliver(out, None, k)
 
 // What a value looks like inside a string.
 //
@@ -1383,57 +1504,30 @@ fn bad(a: JsonValueH, b: JsonValueH, at: Int) -> JqAttempt []
 
 // `f and g` — short-circuiting, over truthiness rather than booleans,
 // and once per pair of outputs.
-fn eval_and(var r: Run, left: jqlang.JqFilter, right: jqlang.JqFilter, input: JsonValueH, d: Int,
-            sc: JqScope) -> JqOutcome []
-    let lo = eval(var r, left, input, d + 1, sc)
-    if broke(lo.fault)
-        return stopped([], lo.fault)
-    var out: [JsonValueH] = []
-    var err: ?jqerror.JqError = None
-    var go = true
-    for a in lo.values
-        if go
-            if truthy(a)
-                let ro = eval(var r, right, input, d + 1, sc)
-                for b in ro.values
-                    if go
-                        if not emit(r, out, json.bool(truthy(b)))
-                            go = false
-                if broke(ro.fault)
-                    err = ro.fault
-                    go = false
-            elif not emit(r, out, json.bool(false))
-                go = false
-    if broke(err)
-        return stopped(out, err)
-    stopped(out, None)
+fn each_and(var r: Run, left: jqlang.JqFilter, right: jqlang.JqFilter, input: JsonValueH, d: Int,
+            sc: JqScope, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    each(var r, left, input, d + 1, sc, a => and_with(var r, a, right, input, d, sc, k))
+
+// One output of the left side of `and`: false when it is falsy, else the
+// truthiness of each output of the right side.
+fn and_with(var r: Run, a: JsonValueH, right: jqlang.JqFilter, input: JsonValueH, d: Int,
+            sc: JqScope, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    if truthy(a)
+        return each(var r, right, input, d + 1, sc, b => k(json.bool(truthy(b))))
+    k(json.bool(false))
 
 // `f or g`, the same way round.
-fn eval_or(var r: Run, left: jqlang.JqFilter, right: jqlang.JqFilter, input: JsonValueH, d: Int,
-           sc: JqScope) -> JqOutcome []
-    let lo = eval(var r, left, input, d + 1, sc)
-    if broke(lo.fault)
-        return stopped([], lo.fault)
-    var out: [JsonValueH] = []
-    var err: ?jqerror.JqError = None
-    var go = true
-    for a in lo.values
-        if go
-            if truthy(a)
-                if not emit(r, out, json.bool(true))
-                    go = false
-            else
-                let ro = eval(var r, right, input, d + 1, sc)
-                for b in ro.values
-                    if go
-                        if not emit(r, out, json.bool(truthy(b)))
-                            go = false
-                if broke(ro.fault)
-                    err = ro.fault
-                    go = false
-    if broke(err)
-        return stopped(out, err)
-    stopped(out, None)
+fn each_or(var r: Run, left: jqlang.JqFilter, right: jqlang.JqFilter, input: JsonValueH, d: Int,
+           sc: JqScope, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    each(var r, left, input, d + 1, sc, a => or_with(var r, a, right, input, d, sc, k))
+
+// One output of the left side of `or`: true when it is truthy, else the
+// truthiness of each output of the right side.
+fn or_with(var r: Run, a: JsonValueH, right: jqlang.JqFilter, input: JsonValueH, d: Int,
+           sc: JqScope, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    if truthy(a)
+        return k(json.bool(true))
+    each(var r, right, input, d + 1, sc, b => k(json.bool(truthy(b))))
 
 // `f // g` — the truthy outputs of `f`, or `g` when there are none.
 //
@@ -1444,55 +1538,51 @@ fn eval_or(var r: Run, left: jqlang.JqFilter, right: jqlang.JqFilter, input: Jso
 // number — the left side raises, produces no truthy value, and the
 // right side answers.  When `f` did produce a truthy value, its error
 // still travels: `(1, error("x")) // 2` answers 1 and then raises.
-fn eval_alternative(var r: Run, left: jqlang.JqFilter, right: jqlang.JqFilter, input: JsonValueH,
-                    d: Int, sc: JqScope) -> JqOutcome []
-    let lo = eval(var r, left, input, d + 1, sc)
-    var good: [JsonValueH] = []
-    for v in lo.values
-        if truthy(v)
-            list.push(good, v)
-    if list.len(good) == 0
-        return eval(var r, right, input, d + 1, sc)
-    var out: [JsonValueH] = []
-    emit_all(var r, var out, good)
-    stopped(out, lo.fault)
+//
+// The truthy outputs of `f` go to the consumer as they arrive.  An
+// error the consumer raised, or a stop it asked for, is not `f`'s and is
+// never swallowed.
+fn each_alternative(var r: Run, left: jqlang.JqFilter, right: jqlang.JqFilter, input: JsonValueH,
+                    d: Int, sc: JqScope, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    var gate = JqGate { count: 0, hit: false }
+    let fl = each(var r, left, input, d + 1, sc, v => kept_on(var gate, truthy(v), v, k))
+    if gate.count > 0
+        return fl
+    each(var r, right, input, d + 1, sc, k)
+
+// One output of the left side of `//`: on to the consumer if it is
+// to be kept (it is truthy), counted, and noted in the gate if the
+// consumer answered with anything but "go on".
+fn kept_on<T>(var gate: JqGate, keep: Bool, v: T, k: fn(T) -> JqFlow) -> JqFlow []
+    if not keep
+        return JqMore
+    gate.count = gate.count + 1
+    passed_on(var gate, v, k)
 
 // `f op g` — the cartesian product of the two sides' outputs.
-fn eval_binary(var r: Run, op: jqlang.JqBinOp, left: jqlang.JqFilter, right: jqlang.JqFilter,
-               input: JsonValueH, d: Int, sc: JqScope) -> JqOutcome []
+fn each_binary(var r: Run, op: jqlang.JqBinOp, left: jqlang.JqFilter, right: jqlang.JqFilter,
+               input: JsonValueH, d: Int, sc: JqScope, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     match op
-        JqOpAnd         => eval_and(var r, left, right, input, d, sc)
-        JqOpOr          => eval_or(var r, left, right, input, d, sc)
-        JqOpAlternative => eval_alternative(var r, left, right, input, d, sc)
-        _               => eval_op_product(var r, op, left, right, input, d, sc)
+        JqOpAnd         => each_and(var r, left, right, input, d, sc, k)
+        JqOpOr          => each_or(var r, left, right, input, d, sc, k)
+        JqOpAlternative => each_alternative(var r, left, right, input, d, sc, k)
+        _               => each_op_product(var r, op, left, right, input, d, sc, k)
 
-fn eval_op_product(var r: Run, op: jqlang.JqBinOp, left: jqlang.JqFilter, right: jqlang.JqFilter,
-                   input: JsonValueH, d: Int, sc: JqScope) -> JqOutcome []
+// The operators other than the three above: the right side once per
+// output of the left, an output at a time.
+fn each_op_product(var r: Run, op: jqlang.JqBinOp, left: jqlang.JqFilter, right: jqlang.JqFilter,
+                   input: JsonValueH, d: Int, sc: JqScope, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     let at = jqlang.position(left)
-    let lo = eval(var r, left, input, d + 1, sc)
-    if broke(lo.fault)
-        return stopped([], lo.fault)
-    var out: [JsonValueH] = []
-    var err: ?jqerror.JqError = None
-    var go = true
-    for a in lo.values
-        if go
-            let ro = eval(var r, right, input, d + 1, sc)
-            if broke(ro.fault)
-                err = ro.fault
-                go = false
-            else
-                for b in ro.values
-                    if go
-                        let tried = apply_op(op, a, b, at)
-                        if broke(tried.error)
-                            err = tried.error
-                            go = false
-                        elif not emit(r, out, tried.value)
-                            go = false
-    if broke(err)
-        return stopped(out, err)
-    stopped(out, None)
+    each(var r, left, input, d + 1, sc,
+         a => each(var r, right, input, d + 1, sc, b => applied(op, a, b, at, k)))
+
+// One pair of the product: the operator's answer, or the refusal.
+fn applied(op: jqlang.JqBinOp, a: JsonValueH, b: JsonValueH, at: Int,
+           k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    let tried = apply_op(op, a, b, at)
+    if broke(tried.error)
+        return flow_of(tried.error)
+    k(tried.value)
 
 // One operator on one pair of values.
 fn apply_op(op: jqlang.JqBinOp, a: JsonValueH, b: JsonValueH, at: Int) -> JqAttempt []
@@ -1508,7 +1598,7 @@ fn apply_op(op: jqlang.JqBinOp, a: JsonValueH, b: JsonValueH, at: Int) -> JqAtte
         JqOpLessEqual    => ok(json.bool(order(a, b) <= 0))
         JqOpGreater      => ok(json.bool(order(a, b) > 0))
         JqOpGreaterEqual => ok(json.bool(order(a, b) >= 0))
-        // cov: skip — the three operators left out above go to eval_and, eval_or and eval_alternative before apply_op is reached
+        // cov: skip — the three operators left out above go to each_and, each_or and each_alternative before apply_op is reached
         _                => bad(a, b, at)
 
 // `+` — null is the identity of all four container cases, which is why
@@ -2000,11 +2090,11 @@ fn one_selector_query(sels: [jpquery.JpSelector]) -> jpquery.JpQuery []
 
 // ── Calls ────────────────────────────────────────────────────────────
 
-fn eval_call(var r: Run, callee: jqlang.JqCallee, args: [jqlang.JqFilter], input: JsonValueH,
-             d: Int, sc: JqScope, at: Int) -> JqOutcome []
+fn each_call(var r: Run, callee: jqlang.JqCallee, args: [jqlang.JqFilter], input: JsonValueH,
+             d: Int, sc: JqScope, at: Int, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     match callee
-        JqCBuiltin(b)  => eval_builtin(var r, b, args, input, d, sc, at)
-        JqCDefined(nm) => eval_defined(var r, nm, args, input, d, sc, at)
+        JqCBuiltin(b)  => each_builtin(var r, b, args, input, d, sc, at, k)
+        JqCDefined(nm) => each_defined(var r, nm, args, input, d, sc, at, k)
 
 // A call to one of the program's own `def`s.
 //
@@ -2017,16 +2107,22 @@ fn eval_call(var r: Run, callee: jqlang.JqCallee, args: [jqlang.JqFilter], input
 // terminate.  Definitions are looked up from the top of the stack down
 // to the floor of the calling scope, so two `def`s at one level see each
 // other and a `def` inside a body does not escape it.
-fn eval_defined(var r: Run, name: Str, args: [jqlang.JqFilter], input: JsonValueH, d: Int,
-                sc: JqScope, at: Int) -> JqOutcome []
+fn each_defined(var r: Run, name: Str, args: [jqlang.JqFilter], input: JsonValueH, d: Int,
+                sc: JqScope, at: Int, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     match find_def_index(r.defs, name, sc)
-        None        => stopped([], Some(jqerror.error(JqBadArgument,
-                           json.string("no definition of '" + name + "'"), at)))
-        Some(index) => call_def(var r, index, args, input, d, sc)
+        None        => JqRaise(jqerror.error(JqBadArgument,
+                           json.string("no definition of '" + name + "'"), at))
+        Some(index) => call_def(var r, index, args, input, d, sc, k)
 
-fn call_def(var r: Run, index: Int, args: [jqlang.JqFilter], input: JsonValueH, d: Int,
-            sc: JqScope) -> JqOutcome []
+fn call_def(var r: Run, index: Int, args: [jqlang.JqFilter], input: JsonValueH, d: Int, sc: JqScope,
+            k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     let entry = r.defs[index]
+    // A call that pushes no argument leaves the definitions as they are,
+    // so the consumer needs no restoring and the parameters of a
+    // definition, which are such calls, cost no closure.
+    if list.len(args) == 0
+        return each(var r, entry.body, input, d + 1, entry.scope, k)
+    let back = restoring(var r, k)
     var saved = r.defs
     let base = list.len(r.defs)
     var i = 0
@@ -2035,9 +2131,9 @@ fn call_def(var r: Run, index: Int, args: [jqlang.JqFilter], input: JsonValueH, 
                                            parameters: [], body: a,
                                            scope: JqScope { floor: sc.floor, skip: base + i } })
         i = i + 1
-    let o = eval(var r, entry.body, input, d + 1, entry.scope)
+    let fl = each(var r, entry.body, input, d + 1, entry.scope, back)
     r.defs = saved
-    o
+    fl
 
 fn param_name(ps: [Str], i: Int) -> Str []
     // cov: skip — the one caller counts from zero, so i is never negative
@@ -2053,8 +2149,13 @@ fn param_name(ps: [Str], i: Int) -> Str []
 // it, so a builtin taking a filter and one taking a value are set up the
 // same way.  Which is which is `jqbuiltin.takes_filter_argument`'s
 // answer and not this function's business.
-fn eval_builtin(var r: Run, b: jqbuiltin.JqBuiltin, args: [jqlang.JqFilter], input: JsonValueH,
-                d: Int, sc: JqScope, at: Int) -> JqOutcome []
+fn each_builtin(var r: Run, b: jqbuiltin.JqBuiltin, args: [jqlang.JqFilter], input: JsonValueH,
+                d: Int, sc: JqScope, at: Int, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    // A call with no argument pushes nothing, so the consumer needs no
+    // restoring.
+    if list.len(args) == 0
+        return dispatch(var r, b, list.len(r.defs), 0, input, d, sc, at, k)
+    let back = restoring(var r, k)
     var saved = r.defs
     let base = list.len(r.defs)
     var i = 0
@@ -2062,9 +2163,9 @@ fn eval_builtin(var r: Run, b: jqbuiltin.JqBuiltin, args: [jqlang.JqFilter], inp
         r.defs = defs_with(r.defs, JqDef { name: " arg", parameters: [], body: a,
                                            scope: JqScope { floor: sc.floor, skip: base + i } })
         i = i + 1
-    let o = dispatch(var r, b, base, list.len(args), input, d, sc, at)
+    let fl = dispatch(var r, b, base, list.len(args), input, d, sc, at, back)
     r.defs = saved
-    o
+    fl
 
 // A value argument the caller wrote, and whether it produced one.
 struct JqArg
@@ -2072,8 +2173,14 @@ struct JqArg
     error: ?jqerror.JqError
     has: Bool
 
+// Every output of argument `i`, kept.
 fn arg_result(var r: Run, base: Int, i: Int, input: JsonValueH, d: Int) -> JqOutcome []
     eval(var r, r.defs[base + i].body, input, d + 1, r.defs[base + i].scope)
+
+// Each output of argument `i`, handed to a consumer as it is made.
+fn arg_each(var r: Run, base: Int, i: Int, input: JsonValueH, d: Int,
+            k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    each(var r, r.defs[base + i].body, input, d + 1, r.defs[base + i].scope, k)
 
 fn arg_of(var r: Run, base: Int, i: Int, input: JsonValueH, d: Int) -> JqArg []
     let o = arg_result(var r, base, i, input, d)
@@ -2087,11 +2194,11 @@ fn arg_of(var r: Run, base: Int, i: Int, input: JsonValueH, d: Int) -> JqArg []
 // `has(.k)` asks about the member `.k` names, and a second output of `.k`
 // is not multiplied over the call.  That is the reading a caller of
 // `has`, `split` and `join` can predict; the builtins whose argument is a
-// filter read it with `arg_result` instead and are not touched by it.  A
-// value argument that produced nothing makes the whole call produce
-// nothing, which is jq's answer for `has(empty)`.
+// filter read it with `arg_result` or `arg_each` instead and are not
+// touched by it.  A value argument that produced nothing makes the whole
+// call produce nothing, which is jq's answer for `has(empty)`.
 fn dispatch(var r: Run, b: jqbuiltin.JqBuiltin, base: Int, argc: Int, input: JsonValueH, d: Int,
-            sc: JqScope, at: Int) -> JqOutcome []
+            sc: JqScope, at: Int, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     var vals: [JsonValueH] = []
     var i = 0
     while i < argc
@@ -2100,32 +2207,47 @@ fn dispatch(var r: Run, b: jqbuiltin.JqBuiltin, base: Int, argc: Int, input: Jso
         else
             let a = arg_of(var r, base, i, input, d)
             if broke(a.error)
-                return stopped([], a.error)
+                return flow_of(a.error)
             if not a.has
-                return produced([])
+                return JqMore
             list.push(vals, a.value)
         i = i + 1
-    builtin_apply(var r, b, base, vals, input, d, sc, at)
+    builtin_each(var r, b, base, vals, input, d, sc, at, k)
+
+// The builtins that hand their outputs on one at a time, one arm each.
+//
+// These are the ones whose stream can be long or have no end, or that
+// take a stream as their argument and answer from part of it.  Every
+// other builtin answers one outcome, which the last arm hands on.
+fn builtin_each(var r: Run, b: jqbuiltin.JqBuiltin, base: Int, vals: [JsonValueH],
+                input: JsonValueH, d: Int, sc: JqScope, at: Int,
+                k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    match b
+        JqbEmpty    => JqMore
+        JqbRecurse0 => recurse_each(var r, input, d, at, k)
+        JqbRecurse1 => recurse_f_each(var r, base, input, d, at, k)
+        JqbRange1   => range_dispatch(var r, vals, at, k)
+        JqbRange2   => range_dispatch(var r, vals, at, k)
+        JqbRange3   => range_dispatch(var r, vals, at, k)
+        JqbFirst1   => take_each(var r, 1, base, 0, input, d, k)
+        JqbLast1    => last_each(var r, base, input, d, k)
+        JqbLimit2   => limit_each(var r, base, vals[0], input, d, k)
+        JqbWhile2   => while_each(var r, base, input, d, at, k)
+        JqbSelect1  => select_each(var r, base, input, d, k)
+        JqbPath1    => path_each(var r, base, input, d, at, k)
+        _           =>
+            let o = builtin_apply(var r, b, base, vals, input, d, sc, at)
+            deliver(o.values, o.fault, k)
 
 // The builtins themselves, one arm each.
 fn builtin_apply(var r: Run, b: jqbuiltin.JqBuiltin, base: Int, vals: [JsonValueH],
                  input: JsonValueH, d: Int, sc: JqScope, at: Int) -> JqOutcome []
     match b
-        JqbEmpty          => produced([])
         JqbNot            => produced_one(json.bool(not truthy(input)))
         JqbError0         => raised([], jqerror.error(JqUserRaised, input, at))
         JqbError1         => raised([], jqerror.error(JqUserRaised, vals[0], at))
         JqbType           => produced_one(json.string(type_name(input)))
-        JqbRecurse0       => recurse_all(var r, input, d)
-        JqbRecurse1       => recurse_filter(var r, base, input, d)
-        JqbRange1         => range_dispatch(var r, vals, at)
-        JqbRange2         => range_dispatch(var r, vals, at)
-        JqbRange3         => range_dispatch(var r, vals, at)
-        JqbFirst1         => first_outcome(var r, base, input, d)
-        JqbLast1          => last_outcome(var r, base, input, d)
-        JqbLimit2         => limit_outcome(var r, base, vals[0], input, d)
         JqbUntil2         => until_outcome(var r, base, input, d)
-        JqbWhile2         => while_outcome(var r, base, input, d)
         JqbLength         => length_outcome(input, at)
         JqbUtf8ByteLength => byte_length_outcome(input, at)
         JqbHas1           => has_outcome(input, vals[0], at)
@@ -2145,10 +2267,8 @@ fn builtin_apply(var r: Run, b: jqbuiltin.JqBuiltin, base: Int, vals: [JsonValue
         JqbAll1           => any_all_filter_outcome(var r, base, input, d, true, at)
         JqbFlatten0       => flatten_outcome(input, 0 - 1, at)
         JqbFlatten1       => flatten_arg_outcome(input, vals[0], at)
-        JqbSelect1        => select_outcome(var r, base, input, d)
         JqbMap1           => map_outcome(var r, base, input, d, at)
         JqbMapValues1     => map_values_outcome(var r, base, input, d, at)
-        JqbPath1          => path_outcome(var r, base, input, d, at)
         JqbPaths0         => paths_outcome(var r, input)
         JqbPaths1         => paths_where_outcome(var r, base, input, d, at)
         JqbGetpath1       => getpath_outcome(input, vals[0], at)
@@ -2180,6 +2300,8 @@ fn builtin_apply(var r: Run, b: jqbuiltin.JqBuiltin, base: Int, vals: [JsonValue
         JqbFloor          => round_outcome(input, at, 0)
         JqbCeil           => round_outcome(input, at, 1)
         JqbSqrt           => round_outcome(input, at, 2)
+        // cov: skip — the builtins that hand their outputs on one at a time are answered by builtin_each, which does not reach this match for them
+        _                 => produced([])
 
 // ── The builtins, one helper each ────────────────────────────────────
 
@@ -2199,47 +2321,40 @@ fn bad_arg_error(what: Str, at: Int) -> jqerror.JqError []
     jqerror.error(JqBadArgument, json.string(what), at)
 
 // `recurse` — the input and everything under it, depth first.
-fn recurse_all(var r: Run, input: JsonValueH, d: Int) -> JqOutcome []
-    var out: [JsonValueH] = []
-    recurse_into(var r, var out, input, d)
-    stopped(out, None)
-
-fn recurse_into(var r: Run, var out: [JsonValueH], v: JsonValueH, d: Int) []
+fn recurse_each(var r: Run, v: JsonValueH, d: Int, at: Int,
+                k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     if d > r.max_depth
-        r.over = true
-        return
-    if not emit(r, out, v)
-        return
+        return over_flow(var r, at)
+    let s = k(v)
+    if not is_more(s)
+        return s
+    var result = JqMore
+    var go = true
     for c in children(v)
-        recurse_into(var r, var out, c, d + 1)
+        if go
+            let fl = recurse_each(var r, c, d + 1, at, k)
+            if not is_more(fl)
+                result = fl
+                go = false
+    result
 
 // `recurse(f)` — the input, then `f` of it, until `f` is empty.
-fn recurse_filter(var r: Run, base: Int, input: JsonValueH, d: Int) -> JqOutcome []
-    var out: [JsonValueH] = []
-    stopped(out, recurse_f_into(var r, base, var out, input, d))
-
-// One value of the descent: the value itself, then `f` of it and each
-// output's own descent, answering the first fault met on the way.
-fn recurse_f_into(var r: Run, base: Int, var out: [JsonValueH], v: JsonValueH,
-                  d: Int) -> ?jqerror.JqError []
-    // cov: skip — arg_result reads `f` at d + 1, so a frame deeper than the ceiling is
-    // never entered: the eval at that depth stops it with the fault first
+//
+// `recurse(f)` is `def r: ., (f | r); r`, so each output of `f` is
+// descended into as it arrives, and a fault out of `f` stops the descent
+// and is the run's answer, after the values the descent already
+// produced.  A fault inside an output's own descent comes first, the way
+// the pull of `f`'s next output waits for it.
+fn recurse_f_each(var r: Run, base: Int, v: JsonValueH, d: Int, at: Int,
+                  k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    // cov: skip — arg_each reads `f` at d + 1, so a frame deeper than the ceiling is
+    // never entered: the each at that depth stops it with the fault first
     if d > r.max_depth
-        r.over = true
-        return None
-    if not emit(r, out, v)
-        return None
-    // `recurse(f)` is `def r: ., (f | r); r`, so a fault out of `f`
-    // stops the descent and is the run's answer — after the values the
-    // descent already produced, which the outcome carries beside it.
-    // A fault inside an output's own descent comes first, the way the
-    // pull of `f`'s next output waits for it.
-    let o = arg_result(var r, base, 0, v, d)
-    for c in o.values
-        let e = recurse_f_into(var r, base, var out, c, d + 1)
-        if broke(e)
-            return e
-    o.fault
+        return over_flow(var r, at)
+    let s = k(v)
+    if not is_more(s)
+        return s
+    arg_each(var r, base, 0, v, d, c => recurse_f_each(var r, base, c, d + 1, at, k))
 
 // `range(n)`, `range(from; upto)` and `range(from; upto; by)`, read
 // from the arguments the call was given.
@@ -2250,10 +2365,10 @@ fn recurse_f_into(var r: Run, base: Int, var out: [JsonValueH], v: JsonValueH,
 // one wants the fault, not an empty stream.  A fractional bound is
 // left as it is, and the step compares in the same floating point jq
 // does, so `range(0.5; 2)` is `0.5, 1.5`.
-fn range_dispatch(var r: Run, vals: [JsonValueH], at: Int) -> JqOutcome []
+fn range_dispatch(var r: Run, vals: [JsonValueH], at: Int, k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     for v in vals
         if not is_number(v)
-            return stopped([], Some(bad_arg_error("range needs numeric bounds", at)))
+            return JqRaise(bad_arg_error("range needs numeric bounds", at))
     var from = 0.0
     var upto = 0.0
     var step = 1.0
@@ -2266,71 +2381,104 @@ fn range_dispatch(var r: Run, vals: [JsonValueH], at: Int) -> JqOutcome []
         from = number_of(vals[0]) ?? 0.0
         upto = number_of(vals[1]) ?? 0.0
         step = number_of(vals[2]) ?? 1.0
-    range_outcome(var r, from, upto, step)
+    range_each(var r, from, upto, step, at, k)
 
-// `range(from; upto; by)` — one output per step.
-fn range_outcome(var r: Run, from: Float, upto: Float, step: Float) -> JqOutcome []
+// `range(from; upto; by)`: one output per step, each one charged a step
+// of the run, because a consumer that keeps nothing (`last`) would
+// otherwise let a range with no end run without a ceiling.
+fn range_each(var r: Run, from: Float, upto: Float, step: Float, at: Int,
+              k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     if step == 0.0
-        return produced([])
-    var out: [JsonValueH] = []
+        return JqMore
     var x = from
+    var result = JqMore
     var go = true
     while go
         if step > 0.0 and x >= upto
             go = false
         elif step < 0.0 and x <= upto
             go = false
-        elif not emit(r, out, number_from(x))
+        elif not tick(var r)
+            result = over_flow(var r, at)
             go = false
         else
-            x = x + step
-    stopped(out, None)
+            let s = k(number_from(x))
+            if is_more(s)
+                x = x + step
+            else
+                result = s
+                go = false
+    result
 
-// `first(f)` — the first output of `f`, and `f` stops there.
+// The first `n` outputs of argument `i`, and then the argument is
+// stopped.
 //
-// The stop is the reading: a fault `f` would have raised after its
-// first output is never pulled, so `first(1, error("x"))` is `1` with
-// no fault, while a fault before any output — `first(empty,
-// error("x"))` — is the answer, because there is nothing to stop on.
-fn first_outcome(var r: Run, base: Int, input: JsonValueH, d: Int) -> JqOutcome []
-    let o = arg_result(var r, base, 0, input, d)
-    match list.first(o.values)
-        None    => stopped([], o.fault)
-        Some(v) => produced_one(v)
+// What `first(f)` and `limit(n; f)` share.  The stop is the reading: a
+// fault the argument would have raised after its `n`th output is never
+// pulled, so `first(1, error("x"))` is `1` with no fault, while a fault
+// before the output that fills the count, as in `first(empty, error("x"))`,
+// is the answer, because there is nothing to stop on.
+//
+// The stop is a `JqHalt` the consumer made up, not a budget: it sets no
+// flag on the run and no error, so a `limit` that stops a stream with no
+// end leaves the run's ceilings for the rest of the program.  A stop
+// that came from further down the line is not this one's, and goes on
+// up.
+fn take_each(var r: Run, n: Int, base: Int, i: Int, input: JsonValueH, d: Int,
+             k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    var gate = JqGate { count: 0, hit: false }
+    let fl = arg_each(var r, base, i, input, d, v => counted_on(var gate, n, v, k))
+    match fl
+        JqHalt =>
+            if gate.hit
+                return JqMore
+            fl
+        _      => fl
+
+// One output of the argument of `first` or `limit`: on to the consumer,
+// counted, and a stop once the count is filled.  The gate's flag says
+// the stop is this call's own.
+fn counted_on<T>(var gate: JqGate, n: Int, v: T, k: fn(T) -> JqFlow) -> JqFlow []
+    gate.count = gate.count + 1
+    let s = k(v)
+    if is_more(s) and gate.count >= n
+        gate.hit = true
+        return JqHalt
+    s
 
 // `last(f)` — the last output of `f`, and `null` when it has none.
 //
 // jq's own definition is `reduce f as $x (null; $x)`, and both halves
 // of it show here: the stream is walked to its end, so a fault anywhere
 // answers no value and surfaces, and an empty stream answers `null`
-// rather than nothing.
-fn last_outcome(var r: Run, base: Int, input: JsonValueH, d: Int) -> JqOutcome []
-    let o = arg_result(var r, base, 0, input, d)
-    if broke(o.fault)
-        return stopped([], o.fault)
-    match list.last(o.values)
-        None    => produced_one(json.null())
-        Some(v) => produced_one(v)
+// rather than nothing.  The walk keeps one value, so a stream longer
+// than `max_outputs` is not the budget.
+fn last_each(var r: Run, base: Int, input: JsonValueH, d: Int,
+             k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    var held = JqHold { value: json.null() }
+    let fl = arg_each(var r, base, 0, input, d, v => hold(var held, v))
+    match fl
+        JqRaise(_) => fl
+        _          => k(held.value)
+
+// One output of the argument of `last`: remembered, and the stream goes on.
+fn hold(var held: JqHold, v: JsonValueH) -> JqFlow []
+    held.value = v
+    JqMore
 
 // `limit(n; f)` — at most `n` outputs of `f`, none when `n` is zero,
 // and all of them when `n` is negative, which is jq's rule.
 //
-// The fault rides along the way the outputs do: a cap that `n` outputs
-// already filled is never pulled past, so those outputs answer with no
-// fault, while a negative `n` pulls the whole stream and a fault with
-// it.
-fn limit_outcome(var r: Run, base: Int, nval: JsonValueH, input: JsonValueH, d: Int) -> JqOutcome []
+// A count of zero never runs `f`.  A negative count hands the whole
+// stream on and its fault with it, since nothing stops it.
+fn limit_each(var r: Run, base: Int, nval: JsonValueH, input: JsonValueH, d: Int,
+              k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     let n = whole_int(nval) ?? 0
-    let o = arg_result(var r, base, 1, input, d)
-    var out: [JsonValueH] = []
-    var i = 0
-    for v in o.values
-        if i < n or n < 0
-            list.push(out, v)
-            i = i + 1
-    if n == 0 or n > 0 and list.len(o.values) >= n
-        return stopped(out, None)
-    stopped(out, o.fault)
+    if n == 0
+        return JqMore
+    if n < 0
+        return arg_each(var r, base, 1, input, d, k)
+    take_each(var r, n, base, 1, input, d, k)
 
 // `until(cond; update)` — the first value the condition is true of.
 //
@@ -2370,34 +2518,42 @@ fn until_outcome(var r: Run, base: Int, input: JsonValueH, d: Int) -> JqOutcome 
 //
 // The values reached before a fault are kept and the fault follows
 // them, which is what jq prints: `1 | while(. < 2; error("x"))`
-// answers `1` and then raises.
-fn while_outcome(var r: Run, base: Int, input: JsonValueH, d: Int) -> JqOutcome []
-    var out: [JsonValueH] = []
-    let err = while_into(var r, base, input, d, var out)
-    stopped(out, err)
-
-fn while_into(var r: Run, base: Int, v: JsonValueH, d: Int,
-              var out: [JsonValueH]) -> ?jqerror.JqError []
+// answers `1` and then raises.  Each update output is descended into as
+// it arrives.
+fn while_each(var r: Run, base: Int, v: JsonValueH, d: Int, at: Int,
+              k: fn(JsonValueH) -> JqFlow) -> JqFlow []
     // cov: skip — arg_result reads the condition at d + 1, so a frame deeper than the
-    // ceiling is never entered: the eval at that depth stops it with the fault first
+    // ceiling is never entered: the each at that depth stops it with the fault first
     if d > r.max_depth
-        r.over = true
-        return None
+        return over_flow(var r, at)
     let co = arg_result(var r, base, 0, v, d)
     if broke(co.fault) and list.len(co.values) == 0
-        return co.fault
+        return flow_of(co.fault)
     if not any_truthy(co.values)
-        return co.fault
-    if not emit(r, out, v)
-        return None
-    let uo = arg_result(var r, base, 1, v, d)
-    for nx in uo.values
-        let e = while_into(var r, base, nx, d + 1, var out)
-        if broke(e)
-            return e
-    if broke(uo.fault)
-        return uo.fault
-    co.fault
+        return flow_of(co.fault)
+    let s = k(v)
+    if not is_more(s)
+        return s
+    let fl = arg_each(var r, base, 1, v, d, nx => while_each(var r, base, nx, d + 1, at, k))
+    if not is_more(fl)
+        return fl
+    flow_of(co.fault)
+
+// `select(f)`: the input once per truthy output of `f`.
+fn select_each(var r: Run, base: Int, input: JsonValueH, d: Int,
+               k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    let o = arg_result(var r, base, 0, input, d)
+    if broke(o.fault)
+        return flow_of(o.fault)
+    var result = JqMore
+    var go = true
+    for v in o.values
+        if go and truthy(v)
+            let s = k(input)
+            if not is_more(s)
+                result = s
+                go = false
+    result
 
 // `length` — members, elements, codepoints, or a number's absolute
 // value.  `true | length` is jq's odd one out and is refused.
@@ -2714,17 +2870,6 @@ fn flatten_to(xs: [JsonValueH], depth: Int) -> [JsonValueH] []
         else
             list.push(out, v)
     out
-
-// `select(f)` — the input once per truthy output of `f`.
-fn select_outcome(var r: Run, base: Int, input: JsonValueH, d: Int) -> JqOutcome []
-    let o = arg_result(var r, base, 0, input, d)
-    if broke(o.fault)
-        return stopped([], o.fault)
-    var out: [JsonValueH] = []
-    for v in o.values
-        if truthy(v)
-            list.push(out, input)
-    stopped(out, None)
 
 // `map(f)` — `[.[] | f]`.
 fn map_outcome(var r: Run, base: Int, input: JsonValueH, d: Int, at: Int) -> JqOutcome []
@@ -3120,7 +3265,8 @@ fn walk_bad(e: jqerror.JqError) -> JqWalk []
 fn walk_stopped(nodes: [JqAt], e: ?jqerror.JqError) -> JqWalk []
     JqWalk { nodes: nodes, fault: e }
 
-// The places a path expression selects.
+// The places a path expression selects, handed to a consumer as the
+// walk reaches them.
 //
 // `path(f)` and `paths` are the same walk, and the walk is the one
 // `select_path` does: `.a.b` on a document with no `.a` selects one
@@ -3130,97 +3276,102 @@ fn walk_stopped(nodes: [JqAt], e: ?jqerror.JqError) -> JqWalk []
 // `path(.a)` on `3` fails the way `.a` on `3` fails rather than
 // quietly answering `["a"]`.  A caller can therefore predict that
 // `path(f)` fails exactly when `f` does, and that a walk that fails
-// still carries the places it reached first.
+// still handed on the places it reached first.
+//
+// The walk is lazy the way `each` is: a consumer that answers `JqHalt`
+// stops it, so `path(limit(1; recurse(.)))` reads one place and not a
+// ceiling's worth.
 //
 // The parser has already refused a `path(f)` whose `f` is not a path
 // expression (`jqlang.is_path_expression`), so the last arm is
 // unreachable from a parsed program and is here because a match has to
 // end somewhere.
-fn walk_path(var r: Run, f: jqlang.JqFilter, input: JsonValueH, prefix: [JsonValueH], d: Int,
-             sc: JqScope, at: Int) -> JqWalk []
+fn walk_each(var r: Run, f: jqlang.JqFilter, input: JsonValueH, prefix: [JsonValueH], d: Int,
+             sc: JqScope, at: Int, k: fn(JqAt) -> JqFlow) -> JqFlow []
     if d > r.max_depth
         r.over = true
-        return walk_bad(budget_error(f))
+        return JqRaise(budget_error(f))
     match f
-        JqFIdentity(_)                      => walk_ok([JqAt { value: input, path: prefix }])
+        JqFIdentity(_)                      => k(JqAt { value: input, path: prefix })
         JqFPath(_, q)                       =>
             let nodes = select_nodes(q, input, at)
             var out: [JqAt] = []
             for n in nodes.nodes
                 list.push(out, JqAt { value: n.value, path: join_path(prefix, n.path) })
-            walk_stopped(out, nodes.fault)
+            deliver_at(out, nodes.fault, k)
         JqFPipe(_, a, b)                    =>
-            let first = walk_path(var r, a, input, prefix, d + 1, sc, at)
-            if broke(first.fault)
-                return first
-            var out: [JqAt] = []
-            var err: ?jqerror.JqError = None
-            for m in first.nodes
-                if not broke(err)
-                    let second = walk_path(var r, b, m.value, m.path, d + 1, sc, at)
-                    for n in second.nodes
-                        list.push(out, n)
-                    err = second.fault
-            walk_stopped(out, err)
+            walk_each(var r, a, input, prefix, d + 1, sc, at,
+                      m => walk_each(var r, b, m.value, m.path, d + 1, sc, at, k))
         JqFComma(_, a, b)                   =>
-            let left = walk_path(var r, a, input, prefix, d + 1, sc, at)
-            if broke(left.fault)
-                return left
-            let right = walk_path(var r, b, input, prefix, d + 1, sc, at)
-            walk_stopped(join_nodes(left.nodes, right.nodes), right.fault)
+            let fl = walk_each(var r, a, input, prefix, d + 1, sc, at, k)
+            if is_more(fl)
+                return walk_each(var r, b, input, prefix, d + 1, sc, at, k)
+            fl
         JqFIf(_, c, t, e)                   =>
             let co = eval(var r, c, input, d + 1, sc)
-            var out: [JqAt] = []
-            var err: ?jqerror.JqError = None
+            var result = JqMore
             var go = true
             for cv in co.values
                 if go
                     var branch = e
                     if truthy(cv)
                         branch = t
-                    let w = walk_path(var r, branch, input, prefix, d + 1, sc, at)
-                    for n in w.nodes
-                        list.push(out, n)
-                    if broke(w.fault)
-                        err = w.fault
+                    let fl = walk_each(var r, branch, input, prefix, d + 1, sc, at, k)
+                    if not is_more(fl)
+                        result = fl
                         go = false
-            JqWalk { nodes: out, fault: pick_error(err, co.fault) }
+            if go
+                return flow_of(co.fault)
+            result
         JqFTry(_, b, _)                     =>
             // `try f` keeps the outputs `f` managed and drops the
             // fault, which is the same rule `JqOutcome` states for a
             // value stream — so a walk that reached places first hands
-            // them on rather than the error.
-            let inner = walk_path(var r, b, input, prefix, d + 1, sc, at)
-            walk_ok(inner.nodes)
+            // them on rather than the error.  What the consumer
+            // answers is not `f`'s fault and goes on up.
+            var gate = JqGate { count: 0, hit: false }
+            let fl = walk_each(var r, b, input, prefix, d + 1, sc, at,
+                               n => passed_on(var gate, n, k))
+            if gate.hit
+                return fl
+            JqMore
         JqFBinary(_, JqOpAlternative, a, b) =>
-            let left = walk_path(var r, a, input, prefix, d + 1, sc, at)
-            var good: [JqAt] = []
-            for n in left.nodes
-                if truthy(n.value)
-                    list.push(good, n)
-            if list.len(good) > 0
-                return walk_ok(good)
-            if broke(left.fault)
-                return walk_stopped([], left.fault)
-            walk_path(var r, b, input, prefix, d + 1, sc, at)
-        JqFCall(_, callee, args)            => walk_path_call(var r, callee, args, input, prefix, d, sc, at)
-        _                                   => walk_bad(bad_arg_error("not a path expression", jqlang.position(f)))
+            var gate = JqGate { count: 0, hit: false }
+            let fl = walk_each(var r, a, input, prefix, d + 1, sc, at,
+                               n => kept_on(var gate, truthy(n.value), n, k))
+            if gate.hit
+                return fl
+            if gate.count > 0
+                return JqMore
+            if is_more(fl)
+                return walk_each(var r, b, input, prefix, d + 1, sc, at, k)
+            fl
+        JqFCall(_, callee, args)            => walk_each_call(var r, callee, args, input, prefix, d, sc, at, k)
+        _                                   => JqRaise(bad_arg_error("not a path expression", jqlang.position(f)))
 
-fn join_nodes(a: [JqAt], b: [JqAt]) -> [JqAt] []
-    var out: [JqAt] = []
-    for x in a
-        list.push(out, x)
-    for x in b
-        list.push(out, x)
-    out
+// Hand every place of a list to a consumer, stopping at the first answer
+// that is not `JqMore`, then answer the optional error that followed.
+fn deliver_at(nodes: [JqAt], e: ?jqerror.JqError, k: fn(JqAt) -> JqFlow) -> JqFlow []
+    var result = JqMore
+    var go = true
+    for n in nodes
+        if go
+            let s = k(n)
+            if not is_more(s)
+                result = s
+                go = false
+    if go
+        return flow_of(e)
+    result
 
 // The calls a path expression may be built from, each wandering rather
 // than evaluating: `select` drops places, `first` keeps one, and
 // `getpath` reads a path array out of a value argument.
-fn walk_path_call(var r: Run, callee: jqlang.JqCallee, args: [jqlang.JqFilter], input: JsonValueH,
-                  prefix: [JsonValueH], d: Int, sc: JqScope, at: Int) -> JqWalk []
+fn walk_each_call(var r: Run, callee: jqlang.JqCallee, args: [jqlang.JqFilter], input: JsonValueH,
+                  prefix: [JsonValueH], d: Int, sc: JqScope, at: Int,
+                  k: fn(JqAt) -> JqFlow) -> JqFlow []
     match callee
-        JqCDefined(_) => walk_bad(bad_arg_error("not a path expression", at))
+        JqCDefined(_) => JqRaise(bad_arg_error("not a path expression", at))
         JqCBuiltin(b) =>
             var saved = r.defs
             let base = list.len(r.defs)
@@ -3230,27 +3381,50 @@ fn walk_path_call(var r: Run, callee: jqlang.JqCallee, args: [jqlang.JqFilter], 
                                                    scope: JqScope { floor: sc.floor,
                                                                     skip: base + i } })
                 i = i + 1
-            let w = walk_path_builtin(var r, b, base, input, prefix, d, at)
+            let fl = walk_each_builtin(var r, b, base, input, prefix, d, at, k)
             r.defs = saved
-            w
+            fl
 
-fn walk_path_builtin(var r: Run, b: jqbuiltin.JqBuiltin, base: Int, input: JsonValueH,
-                     prefix: [JsonValueH], d: Int, at: Int) -> JqWalk []
+fn walk_each_builtin(var r: Run, b: jqbuiltin.JqBuiltin, base: Int, input: JsonValueH,
+                     prefix: [JsonValueH], d: Int, at: Int, k: fn(JqAt) -> JqFlow) -> JqFlow []
     match b
-        JqbEmpty    => walk_ok([])
-        JqbRecurse0 => walk_ok(places_under(input, prefix))
-        JqbRecurse1 => recurse_walk(var r, r.defs[base].body, input, prefix, d + 1,
-                                    r.defs[base].scope, at)
-        JqbPaths0   => walk_ok(descend_paths(input, prefix))
-        JqbPaths1   => paths_where_walk(var r, base, input, prefix, d, at)
-        JqbGetpath1 => getpath_walk(var r, base, input, prefix, d, at)
-        JqbSelect1  => select_walk(var r, base, input, prefix, d, at)
-        JqbFirst1   => keep_walk(var r, base, input, prefix, d, at, true)
-        JqbLast1    => keep_walk(var r, base, input, prefix, d, at, false)
+        JqbEmpty    => JqMore
+        JqbRecurse0 => deliver_at(places_under(input, prefix), None, k)
+        JqbRecurse1 => recurse_walk_each(var r, r.defs[base].body, input, prefix, d + 1,
+                                         r.defs[base].scope, at, k)
+        JqbPaths0   => deliver_at(descend_paths(input, prefix), None, k)
+        JqbPaths1   =>
+            let w = paths_where_walk(var r, base, input, prefix, d, at)
+            deliver_at(w.nodes, w.fault, k)
+        JqbGetpath1 =>
+            let w = getpath_walk(var r, base, input, prefix, d, at)
+            deliver_at(w.nodes, w.fault, k)
+        JqbSelect1  =>
+            // `select(f)` passes its input through, once per true output of
+            // `f`, so the place is the input's own and `f`'s outputs are only
+            // consulted for truth: `path(select(.a))` is `[]`, not `["a"]`,
+            // and `path(select(true,true))` is `[]` twice.  A fault out of `f`
+            // comes after the outputs it already produced, so the places those
+            // produced are answered first and the fault follows them.
+            walk_each(var r, r.defs[base].body, input, prefix, d + 1, r.defs[base].scope, at,
+                      n => place_if(truthy(n.value), input, prefix, k))
+        JqbFirst1   => walk_take(var r, 1, base, 0, input, prefix, d, at, k)
+        JqbLast1    => walk_last(var r, base, input, prefix, d, at, k)
         JqbLimit2   =>
             let cap = limit_count(var r, base, input, d)
-            first_n_walk(var r, base, cap, input, prefix, d, at)
-        _           => walk_bad(bad_arg_error("not a path expression", at))
+            if cap == 0
+                return JqMore
+            if cap < 0
+                return walk_each(var r, r.defs[base + 1].body, input, prefix, d + 1,
+                                 r.defs[base + 1].scope, at, k)
+            walk_take(var r, cap, base, 1, input, prefix, d, at, k)
+        _           => JqRaise(bad_arg_error("not a path expression", at))
+
+// The input's own place, when the output of the filter was true.
+fn place_if(keep: Bool, input: JsonValueH, prefix: [JsonValueH], k: fn(JqAt) -> JqFlow) -> JqFlow []
+    if keep
+        return k(JqAt { value: input, path: prefix })
+    JqMore
 
 // The `n` of `limit(n; f)`, read as a value argument.
 fn limit_count(var r: Run, base: Int, input: JsonValueH, d: Int) -> Int []
@@ -3276,26 +3450,18 @@ fn descend_paths(v: JsonValueH, path: [JsonValueH]) -> [JqAt] []
         places_into(c.value, c.path, var out)
     out
 
-fn recurse_walk(var r: Run, f: jqlang.JqFilter, input: JsonValueH, prefix: [JsonValueH], d: Int,
-                sc: JqScope, at: Int) -> JqWalk []
-    var out: [JqAt] = []
-    let err = recurse_walk_into(var r, f, input, prefix, d, sc, at, var out)
-    walk_stopped(out, err)
-
-fn recurse_walk_into(var r: Run, f: jqlang.JqFilter, v: JsonValueH, path: [JsonValueH], d: Int,
-                     sc: JqScope, at: Int, var out: [JqAt]) -> ?jqerror.JqError []
+// `recurse(f)` wandering: a place, then `f` of it and each place's own
+// descent, as each arrives.
+fn recurse_walk_each(var r: Run, f: jqlang.JqFilter, input: JsonValueH, prefix: [JsonValueH],
+                     d: Int, sc: JqScope, at: Int, k: fn(JqAt) -> JqFlow) -> JqFlow []
     if d > r.max_depth
         r.over = true
-        return Some(budget_error(f))
-    list.push(out, JqAt { value: v, path: path })
-    let step = walk_path(var r, f, v, path, d + 1, sc, at)
-    if broke(step.fault)
-        return step.fault
-    for n in step.nodes
-        let e = recurse_walk_into(var r, f, n.value, n.path, d + 1, sc, at, var out)
-        if broke(e)
-            return e
-    None
+        return JqRaise(budget_error(f))
+    let s = k(JqAt { value: input, path: prefix })
+    if not is_more(s)
+        return s
+    walk_each(var r, f, input, prefix, d + 1, sc, at,
+              n => recurse_walk_each(var r, f, n.value, n.path, d + 1, sc, at, k))
 
 // `paths(f)` — every path below the input whose value satisfies `f`.
 fn paths_where_walk(var r: Run, base: Int, input: JsonValueH, prefix: [JsonValueH], d: Int,
@@ -3315,68 +3481,50 @@ fn paths_where_walk(var r: Run, base: Int, input: JsonValueH, prefix: [JsonValue
         return walk_stopped(out, err)
     walk_ok(out)
 
-// `select(f)` wandering: the places `f` selected whose value is truthy.
-fn select_walk(var r: Run, base: Int, input: JsonValueH, prefix: [JsonValueH], d: Int,
-               at: Int) -> JqWalk []
-    let w = walk_path(var r, r.defs[base].body, input, prefix, d + 1, r.defs[base].scope, at)
-    // `select(f)` passes its input through — once per true output of
-    // `f` — so the place is the input's own and `f`'s outputs are only
-    // consulted for truth: `path(select(.a))` is `[]`, not `["a"]`,
-    // and `path(select(true,true))` is `[]` twice.  A fault out of `f`
-    // comes after the outputs it already produced, so the places those
-    // produced are answered first and the fault follows them.
-    var out: [JqAt] = []
-    for n in w.nodes
-        if truthy(n.value)
-            list.push(out, JqAt { value: input, path: prefix })
-    walk_stopped(out, w.fault)
-
-// `first(f)` and `last(f)` wandering.
+// `first(f)` and `limit(n; f)` wandering: the first `cap` places, and
+// then the walk is stopped.
 //
 // `first(f)` stops at the first place, so a fault further along is
 // never pulled: `path(first(.[] | .a))` over `[{"a":1},5]` answers
-// `[[0,"a"]]` and raises nothing.  `last(f)` has to walk the whole
-// stream to know which place is last, so a fault anywhere drops every
-// place and surfaces, the way `last(1, error("x"))` answers no value
-// and the error.
-fn keep_walk(var r: Run, base: Int, input: JsonValueH, prefix: [JsonValueH], d: Int, at: Int,
-             want_first: Bool) -> JqWalk []
-    let w = walk_path(var r, r.defs[base].body, input, prefix, d + 1, r.defs[base].scope, at)
-    if not want_first and broke(w.fault)
-        return walk_stopped([], w.fault)
-    var found: ?JqAt = None
-    if want_first
-        found = list.first(w.nodes)
-    else
-        found = list.last(w.nodes)
-    match found
-        None    => walk_stopped([], w.fault)
-        Some(n) =>
-            var out: [JqAt] = []
-            list.push(out, n)
-            walk_ok(out)
+// `[[0,"a"]]` and raises nothing.  A fault that arrives before the
+// count is filled is carried beside the places reached, as it is for
+// values: `path(limit(2; .[] | .a))` over `[{"a":1},5]` answers
+// `[[0,"a"]]` and then raises, which is what jq's stream does.
+fn walk_take(var r: Run, cap: Int, base: Int, i: Int, input: JsonValueH, prefix: [JsonValueH],
+             d: Int, at: Int, k: fn(JqAt) -> JqFlow) -> JqFlow []
+    var gate = JqGate { count: 0, hit: false }
+    let fl = walk_each(var r, r.defs[base + i].body, input, prefix, d + 1, r.defs[base + i].scope,
+                       at, n => counted_on(var gate, cap, n, k))
+    match fl
+        JqHalt =>
+            if gate.hit
+                return JqMore
+            fl
+        _      => fl
 
-// `limit(n; f)` wandering.
+// `last(f)` wandering.
 //
-// The cap is applied to the places the walk reached before it stopped,
-// and the fault is carried beside them: `path(limit(2; .[] | .a))` over
-// `[{"a":1},5]` answers `[[0,"a"]]` and then raises, which is what jq's
-// stream does.  A cap the places already fill is a different answer —
-// the pull that would raise never happens — so a fault goes when `n`
-// places were reached, and there is nothing for `n` of zero to pull.
-fn first_n_walk(var r: Run, base: Int, cap: Int, input: JsonValueH, prefix: [JsonValueH], d: Int,
-                at: Int) -> JqWalk []
-    let w = walk_path(var r, r.defs[base + 1].body, input, prefix, d + 1, r.defs[base + 1].scope,
-                      at)
-    var out: [JqAt] = []
-    var i = 0
-    for n in w.nodes
-        if i < cap or cap < 0
-            list.push(out, n)
-            i = i + 1
-    if cap == 0 or cap > 0 and list.len(w.nodes) >= cap
-        return walk_ok(out)
-    walk_stopped(out, w.fault)
+// `last(f)` has to walk the whole stream to know which place is last,
+// so a fault anywhere drops every place and surfaces, the way
+// `last(1, error("x"))` answers no value and the error.  A walk with no
+// places has no last one.
+fn walk_last(var r: Run, base: Int, input: JsonValueH, prefix: [JsonValueH], d: Int, at: Int,
+             k: fn(JqAt) -> JqFlow) -> JqFlow []
+    var held = JqHoldAt { has: false, node: JqAt { value: input, path: prefix } }
+    let fl = walk_each(var r, r.defs[base].body, input, prefix, d + 1, r.defs[base].scope, at,
+                       n => hold_at(var held, n))
+    match fl
+        JqRaise(_) => fl
+        _          =>
+            if held.has
+                return k(held.node)
+            JqMore
+
+// One place of the argument of `last`, remembered.
+fn hold_at(var held: JqHoldAt, n: JqAt) -> JqFlow []
+    held.has = true
+    held.node = n
+    JqMore
 
 // `getpath(p)` wandering: one place, at the path `p` names.
 fn getpath_walk(var r: Run, base: Int, input: JsonValueH, prefix: [JsonValueH], d: Int,
@@ -3456,16 +3604,11 @@ fn getpath_outcome(input: JsonValueH, p: JsonValueH, at: Int) -> JqOutcome []
         Some(steps) =>
             walk_steps(input, steps, at)
 
-// `path(f)` — one output per place `f` selects.
-fn path_outcome(var r: Run, base: Int, input: JsonValueH, d: Int, at: Int) -> JqOutcome []
-    let w = walk_path(var r, r.defs[base].body, input, no_path(), d + 1, r.defs[base].scope, at)
-    var out: [JsonValueH] = []
-    var go = true
-    for n in w.nodes
-        if go
-            if not emit(r, out, json.array(n.path))
-                go = false
-    stopped(out, w.fault)
+// `path(f)`: one output per place `f` selects, as the walk reaches it.
+fn path_each(var r: Run, base: Int, input: JsonValueH, d: Int, at: Int,
+             k: fn(JsonValueH) -> JqFlow) -> JqFlow []
+    walk_each(var r, r.defs[base].body, input, no_path(), d + 1, r.defs[base].scope, at,
+              n => k(json.array(n.path)))
 
 // `paths` — every path below the input.
 fn paths_outcome(var r: Run, input: JsonValueH) -> JqOutcome []
@@ -3473,7 +3616,7 @@ fn paths_outcome(var r: Run, input: JsonValueH) -> JqOutcome []
     var go = true
     for n in descend_paths(input, no_path())
         if go
-            if not emit(r, out, json.array(n.path))
+            if not emit(var r, var out, json.array(n.path))
                 go = false
     stopped(out, None)
 
@@ -3484,6 +3627,6 @@ fn paths_where_outcome(var r: Run, base: Int, input: JsonValueH, d: Int, at: Int
     var go = true
     for n in w.nodes
         if go
-            if not emit(r, out, json.array(n.path))
+            if not emit(var r, var out, json.array(n.path))
                 go = false
     stopped(out, w.fault)

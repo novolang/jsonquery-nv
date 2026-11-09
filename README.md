@@ -169,9 +169,11 @@ not a table, and `jqfmt.table_problem` says why.
 15. **A run is bounded.** `JqLimits` caps the outputs produced, the filter
     applications made, and the depth recursed. A refusal for exceeding a limit is not
     catchable by `try`. `jqeval.default_limits` is the set a caller gets when it
-    does not choose one. `limit` and `first` collect their filter argument, so one
-    that crosses a cap answers its value *and* reports `over-budget`, where jq
-    stops the argument and reports nothing; the CHANGELOG records it under Known.
+    does not choose one. `limit` and `first` are lazy, as they are in jq: they
+    stop their filter argument once they have the outputs they answer with, so
+    `limit(1; range(0; 1000000))` is `0` with no `over-budget`, and a stop is never
+    counted against a limit. A stream nothing stops is held to the limits: `[f]`
+    keeps at most `max_outputs` of `f`, and `last(f)` reads `f` to its end.
 16. **A CSV cell gets the narrowest type whose rendering is byte-identical to
     the cell's own text.** `120` is the number 120. `00417` is a string, because
     `417` does not render back as `00417`. `1.50` is a string for the same
@@ -230,6 +232,7 @@ novo test tests/jqfmt_tests.nv             # the CSV typing rule and the renderi
 novo test tests/jqquery_edge_tests.nv      # the readings chosen where the prose is silent
 novo test tests/jqcover_tests.nv           # every arm of every dispatch, reached with a carrying input
 novo test tests/jqarms_tests.nv            # the arms no program can reach, and the ceilings
+novo test tests/jqlazy_tests.nv            # limit and first stop their argument, and what a stop leaves alone
 ```
 
 The reference is jq 1.7. Its manual is the specification for the grammar, the

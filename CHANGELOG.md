@@ -5,6 +5,63 @@ All notable changes to jsonquery-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.1 (2026-11-09)
+
+`limit` and `first` stop their filter argument.  The evaluator in
+`jqeval` hands each output to a consumer that answers "go on" or
+"stop", so a filter is read only as far as the filter after it needs.
+The signatures did not change, and nothing a caller already ran
+answers differently except the two readings under Changed.
+
+### Fixed
+
+- **`limit(n; f)` and `first(f)` stop `f` after `n` outputs (one for
+  `first`), as they do in jq**, where 0.1.0 collected `f` to a ceiling
+  and sliced the list.  `limit(1; range(0; 1000000))` and
+  `first(range(0; 1000000))` answer `0` with no `over-budget`;
+  `limit(1; range(0; 1000000) | select(. > 10))` and
+  `first(range(0; 1000000) | select(. > 10))` answer `11` where 0.1.0
+  answered an error and no value; `limit(1; recurse(.))` answers its
+  first output inside the step ceiling.  A stop is not a budget: it
+  sets no flag on the run, so `range(0; N) | limit(1; recurse(.))`
+  does N stops and spends N times the work of one, not N times the
+  ceiling.  Filed as
+  `bugs/orbit/limit-and-first-collect-their-filter-argument.md`.
+- **`path(limit(n; f))` and `path(first(f))` stop their walk the same
+  way**, so `path(limit(1; recurse(.)))` answers `[]` and no error.
+
+### Changed
+
+- **Evaluation is lazy end to end.**  Every producer hands its outputs
+  on one at a time: the pipe, the comma, `if`, `try`, `//`, `and`, `or`,
+  the binary operators, negation, `as`, `foreach`, `def`, a call, and the
+  stream builtins `range`, `recurse`, `while`, `select`, `path`, `first`,
+  `last` and `limit`.  The array and object constructors, `reduce`, a
+  string with `\(...)` in it and the builtins that sort or group read
+  their parts to the end first, since a part of an answer is not a
+  smaller answer.  `jqbuiltin`'s rows for `limit` and `first` say they
+  are lazy.
+- **`last(f)` and `range` no longer count against the output ceiling.**
+  `last(range(0; 1000000))` answers `999999`; `range` is charged a step
+  per output instead, so a range with no end still meets the step
+  ceiling.  A stream longer than `max_outputs` is the budget only where
+  it is kept: in `[f]`, in the arguments of the builtins that sort or
+  group, and in the run's own outputs.
+- **A fault on the left of an operator, `and`, `or` or a negation now
+  arrives after the outputs before it**, as in jq.  `(1, error("x")) + 1`
+  answers `2` and then raises where 0.1.0 answered no value, and
+  `-(1, "a", 2)` answers `-1` and then the type error where 0.1.0
+  answered `-1, -2` and the error.
+
+### Added
+
+- `tests/jqlazy_tests.nv`, a suite for the stop: the repro lines of the
+  filing, a stop per element inside one budget, a stop from further
+  down the line going up through every stream between, and that `try`
+  and `//` do not take an error raised by their consumer for their own.
+
+This release requires novo 0.23.0 or later.
+
 ## 0.1.0 — 2026-11-03
 
 ### Fixed

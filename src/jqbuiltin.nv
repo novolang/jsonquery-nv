@@ -62,14 +62,19 @@ pub enum JqBuiltin
     // `range(from; upto; by)`.
     JqbRange3
     // `first(f)` — the first output of `f`, and `f` is not run again.
+    // It is lazy: `f` is stopped after its first output, so a filter
+    // with no end, or one longer than the run's ceilings, answers its
+    // first output with no error.
     JqbFirst1
     // `last(f)`.
     JqbLast1
-    // `limit(n; f)` — at most `n` outputs of `f`.  The laziness here
-    // is the reason `takes_filter_argument` is published: an
-    // implementation that collected `f` first would run an infinite
-    // `recurse(.)` forever.  This one collects, which the CHANGELOG
-    // records under Known.
+    // `limit(n; f)`: at most `n` outputs of `f`.  It is lazy: `f` is
+    // stopped after `n` outputs, so `limit(1; recurse(.))` answers its
+    // first output and does not run to a ceiling.  That is the reason
+    // `takes_filter_argument` is published: an implementation that
+    // collected `f` first would run an infinite `recurse(.)` forever.
+    // The stop is not a budget, so it sets no error and leaves the
+    // run's ceilings for the rest of the program.
     JqbLimit2
     // `until(cond; update)`.
     JqbUntil2
@@ -415,9 +420,9 @@ pub fn summary(b: JqBuiltin) -> Str []
         JqbRange1         => "range(n): 0 to n-1, one output each"
         JqbRange2         => "range(from; upto): from to upto-1, one output each"
         JqbRange3         => "range(from; upto; by): from to upto-1 stepping by by"
-        JqbFirst1         => "first(f): the first output of f, and f stops there"
+        JqbFirst1         => "first(f): the first output of f, and f stops there (lazy)"
         JqbLast1          => "last(f): the last output of f"
-        JqbLimit2         => "limit(n; f): at most n outputs of f"
+        JqbLimit2         => "limit(n; f): at most n outputs of f, and f stops there (lazy)"
         JqbUntil2         => "until(cond; update): update until cond is true"
         JqbWhile2         => "while(cond; update): the input while cond is true"
         JqbType           => "type: the input's JSON type name"

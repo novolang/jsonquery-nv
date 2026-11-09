@@ -1,0 +1,242 @@
+// jqlazy_tests.nv: what a consumer that stops does to the filter it
+// stops.
+//
+// WHAT THIS SUITE IS FOR.  `limit(n; f)` and `first(f)` read as much of
+// `f` as they answer with and no more, and jq's own answers for them are
+// the reference: an argument with no end, or one far longer than a
+// ceiling, is a value and no error, because the argument was stopped
+// before it met the ceiling.  Every row here was measured against jq 1.7
+// and against the package, and names the property it pins.  A stop is
+// never a budget: a row that stops a stream must leave the run's
+// ceilings for the rest of the program.
+
+use std.test
+use std.json
+use std.list
+use std.str
+use jqerror
+use jqeval
+use jqeval.{ JqLimits }
+use jqlang
+
+// A JSON value from its text, with the null value for text that is not
+// JSON, since every input below is a literal, so the fallback is unreachable.
+fn value_of(text: Str) -> JsonValueH
+    json.parse(text) ?? jqeval.null_value()
+
+// What a program produces under the ceilings given, as one line:
+// `[out,out]`, with `!kind` appended when the run failed.
+fn answer(src: Str, input: Str, outs: Int, steps: Int) -> Str []
+    match jqlang.parse(src)
+        Err(f) => "parse:" + jqerror.fault_kind_name(f.kind)
+        Ok(p)  =>
+            let lim = JqLimits { max_outputs: outs, max_steps: steps, max_depth: 256 }
+            let o = jqeval.run_with(p, value_of(input), jqeval.env_with(lim))
+            var parts: [Str] = []
+            for v in o.values
+                list.push(parts, json.stringify(v))
+            let body = "[" + str.join(parts, ",") + "]"
+            match o.fault
+                None    => body
+                Some(e) => body + "!" + jqerror.error_kind_name(e.kind)
+
+// One row: a program, its input, and the line it answers under the
+// default ceilings.
+struct LazyCase
+    src: Str
+    input: Str
+    want: Str
+
+// The rows of the filing, and the same property in the shapes a pipe,
+// a fold and a stream builtin give it.
+fn stop_cases() -> [LazyCase] []
+    [
+        // The argument has no end, or is far past a ceiling, and the answer is
+        // the first output with no error.
+        LazyCase { src: "limit(1; range(0; 1000000))", input: "null", want: "[0]" },
+        LazyCase { src: "first(range(0; 1000000))", input: "null", want: "[0]" },
+        LazyCase { src: "limit(1; recurse(.))", input: "1", want: "[1]" },
+        LazyCase { src: "first(recurse(.))", input: "1", want: "[1]" },
+        // A filtering stage after the source: the pipe reads its left side
+        // until the right side has made enough, which no count can say.
+        LazyCase { src: "limit(1; range(0; 1000000) | select(. > 10))", input: "null",
+                   want: "[11]" },
+        LazyCase { src: "first(range(0; 1000000) | select(. > 10))", input: "null",
+                   want: "[11]" },
+        LazyCase { src: "first(range(0; 1000000) | select(. > 10) | . * 2) | . + 1",
+                   input: "null", want: "[23]" },
+        LazyCase { src: "[limit(3; range(0; 1000000) | . * 2)]", input: "null",
+                   want: "[[0,2,4]]" },
+        LazyCase { src: "[limit(3; range(0; 10) | if . % 2 == 0 then . else empty end)]",
+                   input: "null", want: "[[0,2,4]]" },
+        // A collecting node inside the argument still collects.
+        LazyCase { src: "limit(1; [1, 2, 3])", input: "null", want: "[[1,2,3]]" },
+        LazyCase { src: "limit(1; range(0; 5))", input: "null", want: "[0]" },
+        // The other stream builtins hand their outputs on one at a time.
+        LazyCase { src: "[limit(3; 1 | while(true; . + 1))]", input: "null",
+                   want: "[[1,2,3]]" },
+        LazyCase { src: "[limit(3; 1 | recurse(. + 1))]", input: "null", want: "[[1,2,3]]" },
+        LazyCase { src: "[limit(2; foreach range(0; 1000000) as \$x (0; . + \$x))]",
+                   input: "null", want: "[[0,1]]" },
+        LazyCase { src: "last(range(0; 100000))", input: "null", want: "[99999]" },
+        LazyCase { src: "last(range(0; 5) | select(. < 3))", input: "null", want: "[2]" },
+        LazyCase { src: "[limit(2; select(true, true, true))]", input: "1", want: "[[1,1]]" },
+        LazyCase { src: "first(select(false, true))", input: "1", want: "[1]" },
+        // Every node that passes a stream on lets it be stopped.
+        LazyCase { src: "[limit(1; (1, 2) + (10, 20))]", input: "null", want: "[[11]]" },
+        LazyCase { src: "[limit(1; -(range(1; 5)))]", input: "null", want: "[[-1]]" },
+        LazyCase { src: "[limit(2; (true, false) and (true, false))]", input: "null",
+                   want: "[[true,false]]" },
+        LazyCase { src: "[limit(1; (false, true) or (true, false))]", input: "null",
+                   want: "[[true]]" },
+        LazyCase { src: "[limit(1; {a: (1, 2)})]", input: "null", want: "[[{\"a\":1}]]" },
+        LazyCase { src: "[limit(1; \"a\\(1, 2)\")]", input: "null", want: "[[\"a1\"]]" },
+        LazyCase { src: "[limit(2; .[] as \$x | \$x + 1)]", input: "[1, 2, 3]", want: "[[2,3]]" },
+        LazyCase { src: "[limit(2; .[] as [\$a] | \$a)]", input: "[[1], [2], [3]]",
+                   want: "[[1,2]]" },
+        LazyCase { src: "[limit(2; def f: .[]; f)]", input: "[1, 2, 3]", want: "[[1,2]]" },
+        LazyCase { src: "[limit(2; def f(g): g; f(.[]))]", input: "[1, 2, 3]",
+                   want: "[[1,2]]" },
+        LazyCase { src: "[limit(1; (null, 1, 2) // 9)]", input: "null", want: "[[1]]" },
+        LazyCase { src: "first(range(0; 1000000) // 5)", input: "null", want: "[0]" },
+        LazyCase { src: "[limit(2; (.a, .b) // 5)]", input: "{\"a\":1,\"b\":2}",
+                   want: "[[1,2]]" },
+        LazyCase { src: "[(.a, .b) // 5]", input: "{\"a\":null,\"b\":false}", want: "[[5]]" },
+        LazyCase { src: "[limit(1; foreach (1, 2, 3) as \$x (0; . + \$x; ., error(\"x\")))]",
+                   input: "null", want: "[[1]]" },
+        // A fault the argument would raise after the count is filled is never
+        // pulled.
+        LazyCase { src: "first(1, error(\"x\"))", input: "null", want: "[1]" },
+        LazyCase { src: "limit(2; 1, 2, error(\"x\"))", input: "null", want: "[1,2]" },
+        LazyCase { src: "limit(3; 1, 2, error(\"x\"))", input: "null", want: "[1,2]!user-raised" },
+        LazyCase { src: "[limit(1; try (1, error(\"e\")) catch \"c\")]", input: "null",
+                   want: "[[1]]" }]
+
+@test
+fn test_a_stop_leaves_the_argument_unread_and_the_run_inside_its_budget() [io]
+    for c in stop_cases()
+        test.case("${c.src}")
+        test.assert_eq_str(answer(c.src, c.input, 100000, 10000000), c.want)
+
+// A stop is not a budget, so a program that stops many streams pays for
+// the outputs it read and nothing else.  Each row runs under a step
+// ceiling a stream with no end would cross at once.
+@test
+fn test_many_stops_in_one_run_share_one_budget() [io]
+    test.case("a stop per element of a range")
+    test.assert_eq_str(answer("[range(0; 2000) | limit(1; recurse(.))] | length", "null",
+                              100000, 100000),
+                              "[2000]")
+    test.case("the same through first")
+    test.assert_eq_str(answer("[range(0; 2000) | first(recurse(.))] | length", "null",
+                              100000, 100000),
+                              "[2000]")
+    test.case("a stop in a stream longer than the output ceiling")
+    test.assert_eq_str(answer("[range(0; 2000) | limit(1; range(0; 1000000))] | length", "null",
+                              100000, 100000),
+                              "[2000]")
+    test.case("a stop per element of an input")
+    test.assert_eq_str(answer("[.[] | limit(1; recurse(.))]", "[1, 2, 3]",
+                              100000, 1000),
+                              "[[1,2,3]]")
+
+// A stop that comes from further down the line goes up through every
+// stream between, and each `limit` tells its own stop from another's.
+@test
+fn test_a_stop_from_below_goes_up_and_a_stop_of_its_own_ends_there() [io]
+    test.case("the outer count is the smaller")
+    test.assert_eq_str(answer("[limit(2; limit(5; range(0; 100)))]", "null", 100000, 10000000),
+                       "[[0,1]]")
+    test.case("the inner count is the smaller")
+    test.assert_eq_str(answer("[limit(5; limit(2; range(0; 100)))]", "null", 100000, 10000000),
+                       "[[0,1]]")
+    test.case("the inner stream ends and the outer goes on with the rest")
+    test.assert_eq_str(answer("[limit(3; limit(2; range(0; 100)), 7, 8)]", "null",
+                              100000, 10000000),
+                              "[[0,1,7]]")
+    test.case("a count of zero reads nothing and a negative count stops nothing")
+    test.assert_eq_str(answer("[limit(0; error), limit(-1; 1, 2, 3)]", "null",
+                              100000, 10000000),
+                              "[[1,2,3]]")
+
+// A consumer that raises ends the producers above it, and `try` and `//`
+// do not take that error for their own.
+@test
+fn test_an_error_from_below_is_not_caught_by_the_stream_above() [io]
+    test.case("try catches what its body raised and not what came after")
+    test.assert_eq_str(answer("(try (1, 2) catch \"c\") | error(\"x\")", "null",
+                              100000, 10000000),
+                              "[]!user-raised")
+    test.case("// does not swallow an error raised on its output")
+    test.assert_eq_str(answer("((1, 2) // 3) | error(\"x\")", "null", 100000, 10000000),
+                       "[]!user-raised")
+    test.case("a budget crossed under try is not caught either")
+    test.assert_eq_str(answer("try range(0; 10) catch \"c\"", "null", 3, 10000000),
+                       "[0,1,2]!over-budget")
+    test.case("an error of the left side after its outputs reaches the right first")
+    test.assert_eq_str(answer("(1, error(\"x\")) + 1", "null", 100000, 10000000),
+                       "[2]!user-raised")
+    test.case("a refusal on the first output of a negation ends the stream there")
+    test.assert_eq_str(answer("-(1, \"a\", 2)", "null", 100000, 10000000),
+                       "[-1]!type-mismatch")
+
+// The names a producer adds are its own: the consumer on the other side
+// of it sees the names it saw before the producer ran.
+@test
+fn test_the_names_a_producer_adds_do_not_reach_its_consumer() [io]
+    test.case("a binding")
+    test.assert_eq_str(answer("1 as \$x | ((2 as \$x | \$x) | \$x)", "null", 100000, 10000000),
+                       "[1]")
+    test.case("a definition")
+    test.assert_eq_str(answer("def f: 1; (def f: 2; f) | f", "null", 100000, 10000000), "[1]")
+    test.case("a fold's binding")
+    test.assert_eq_str(answer("1 as \$y | [foreach (2, 3) as \$x (0; . + \$x; \$y)]", "null",
+                              100000, 10000000),
+                              "[[1,1]]")
+    test.case("a fold's binding under a stop")
+    test.assert_eq_str(answer("1 as \$y | [limit(1; foreach (2, 3) as \$x (0; . + \$x; \$y))]",
+                              "null", 100000, 10000000),
+                              "[[1]]")
+
+// What the ceilings still do: a stream nobody stops, and a loop that
+// keeps nothing, are held to the step ceiling.
+@test
+fn test_a_stream_nobody_stops_still_meets_its_ceiling() [io]
+    test.case("a range that keeps nothing is charged a step per output")
+    test.assert_eq_str(answer("last(range(0; 1000))", "null", 100000, 100), "[]!over-budget")
+    test.case("a collected stream is held to the output ceiling")
+    test.assert_eq_str(answer("[range(0; 1000000)] | length", "null", 100, 10000000),
+                       "[]!over-budget")
+    test.case("a ceiling crossed on the left of // is not swallowed by the right")
+    test.assert_eq_str(answer("(range(0; 1000) | select(. < 0)) // 5", "null", 100000, 50),
+                       "[]!over-budget")
+    test.case("a stream with no end under last meets the step ceiling")
+    test.assert_eq_str(answer("last(1 | while(true; . + 1))", "null", 100000, 1000),
+                       "[]!over-budget")
+
+// A path expression is walked the same way: the walk is stopped by the
+// consumer, and what the consumer answers is not the walk's own failure.
+@test
+fn test_a_path_expression_is_stopped_the_way_a_value_stream_is() [io]
+    test.case("a recursion with no end")
+    test.assert_eq_str(answer("path(limit(1; recurse(.)))", "1", 100000, 10000000), "[[]]")
+    test.case("first of a recursion with no end")
+    test.assert_eq_str(answer("path(first(recurse(.)))", "1", 100000, 10000000), "[[]]")
+    test.case("a recursion that has a descent of its own")
+    test.assert_eq_str(answer("[path(limit(2; recurse(.[]?)))]", "[[1], [2]]", 100000, 10000000),
+                       "[[[],[0]]]")
+    test.case("a stop from below goes up through a limit")
+    test.assert_eq_str(answer("[path(limit(2; limit(5; .[])))]", "[1, 2, 3]", 100000, 10000000),
+                       "[[[0],[1]]]")
+    test.case("a stop goes up through try")
+    test.assert_eq_str(answer("[path(limit(1; try .[]))]", "[1, 2, 3]", 100000, 10000000),
+                       "[[[0]]]")
+    test.case("a stop goes up through //")
+    test.assert_eq_str(answer("[path(limit(1; .[] // .))]", "[1, 2, 3]", 100000, 10000000),
+                       "[[[0]]]")
+    test.case("the first place of a filtered walk")
+    test.assert_eq_str(answer("[path(first(.[] | select(.)))]", "[null, 2, 3]",
+                              100000, 10000000),
+                              "[[[1]]]")
+    test.case("a stop through a path that is a stream")
+    test.assert_eq_str(answer("first(path(..))", "{\"a\": [1]}", 100000, 10000000), "[[]]")
