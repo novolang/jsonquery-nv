@@ -1084,7 +1084,7 @@ fn find_def(s: Scan, nm: Str, argc: Int) -> Bool
 
 // ── The grammar ──────────────────────────────────────────────────────
 
-// An expression, which is a comma-separated list of pipes, and the
+// An expression, which is a pipe of comma-separated lists, and the
 // place a chain of `def`s attaches: `def f: …; rest` is one node whose
 // `rest` is the whole expression after it.
 fn parse_exp(var s: Scan) -> JqFilter
@@ -1098,27 +1098,23 @@ fn parse_exp(var s: Scan) -> JqFilter
 fn parse_exp_inside(var s: Scan) -> JqFilter
     if peek_word(s) == "def"
         return parse_define_at(var s, s.i)
-    parse_comma(var s)
+    parse_pipe(var s)
 
-fn parse_comma(var s: Scan) -> JqFilter
-    var left = parse_pipe(var s)
-    var looping = true
-    while looping
-        skip_space(var s)
-        if here(s) == 44
-            let at = s.i
-            s.i = s.i + 1
-            if not can_start(s)
-                fault_at(var s, JqDanglingOperator, at, at + 1, "")
-                looping = false
-            else
-                left = JqFComma(position(left), left, parse_pipe(var s))
-        else
-            looping = false
-    left
-
+// The pipe is the loosest operator, the comma binds tighter than it
+// and `//` tighter than the comma, as in jq's grammar: `1, 2 | . + 1`
+// is `(1, 2) | . + 1`.
 fn parse_pipe(var s: Scan) -> JqFilter
-    var left = parse_alt(var s)
+    parse_pipe_of(var s, true)
+
+// The value of an object field: a pipe of `//`-level operands with no
+// comma, because the comma there separates the next field.
+fn parse_field_value(var s: Scan) -> JqFilter
+    parse_pipe_of(var s, false)
+
+// A chain of pipes whose operands are comma-level when `commas` holds
+// and `//`-level otherwise.
+fn parse_pipe_of(var s: Scan, commas: Bool) -> JqFilter
+    var left = parse_pipe_operand(var s, commas)
     var looping = true
     while looping
         skip_space(var s)
@@ -1129,7 +1125,29 @@ fn parse_pipe(var s: Scan) -> JqFilter
                 fault_at(var s, JqDanglingOperator, at, at + 1, "")
                 looping = false
             else
-                left = pipe_or_fuse(left, parse_alt(var s))
+                left = pipe_or_fuse(left, parse_pipe_operand(var s, commas))
+        else
+            looping = false
+    left
+
+fn parse_pipe_operand(var s: Scan, commas: Bool) -> JqFilter
+    if commas
+        return parse_comma(var s)
+    parse_alt(var s)
+
+fn parse_comma(var s: Scan) -> JqFilter
+    var left = parse_alt(var s)
+    var looping = true
+    while looping
+        skip_space(var s)
+        if here(s) == 44
+            let at = s.i
+            s.i = s.i + 1
+            if not can_start(s)
+                fault_at(var s, JqDanglingOperator, at, at + 1, "")
+                looping = false
+            else
+                left = JqFComma(position(left), left, parse_alt(var s))
         else
             looping = false
     left
@@ -1493,7 +1511,7 @@ fn parse_object_field(var s: Scan) -> ?JqField
             fault_at(var s, JqBadObjectKey, at, s.i, "")
             return None
         s.i = s.i + 1
-        return Some(JqField { key: k, value: parse_pipe(var s) })
+        return Some(JqField { key: k, value: parse_field_value(var s) })
     if c == '('
         s.i = s.i + 1
         let k = parse_exp(var s)
@@ -1507,13 +1525,13 @@ fn parse_object_field(var s: Scan) -> ?JqField
             fault_at(var s, JqBadObjectKey, at, s.i, "")
             return None
         s.i = s.i + 1
-        return Some(JqField { key: k, value: parse_pipe(var s) })
+        return Some(JqField { key: k, value: parse_field_value(var s) })
     if is_word_first(c)
         let nm = take_word(var s)
         skip_space(var s)
         if here(s) == 58
             s.i = s.i + 1
-            return Some(JqField { key: JqFLiteral(at, JqLString(nm)), value: parse_pipe(var s) })
+            return Some(JqField { key: JqFLiteral(at, JqLString(nm)), value: parse_field_value(var s) })
         if here(s) == 44 or here(s) == 125
             return Some(JqField { key: JqFLiteral(at, JqLString(nm)), value: name_path(at, nm) })
         fault_at(var s, JqBadObjectKey, at, s.i, "")
@@ -1781,35 +1799,35 @@ fn parse_define_at(var s: Scan, at: Int) -> JqFilter
 // ── Rendering ────────────────────────────────────────────────────────
 
 // The rendering precedence of a filter: the operator levels of the
-// grammar above, and 1 for the keyword forms, which are lowest.
+// grammar above, and 0 for the keyword forms, which are lowest.
 fn prec(f: JqFilter) -> Int
     match f
-        JqFComma(_, _, _)            => 1
-        JqFPipe(_, _, _)             => 2
+        JqFPipe(_, _, _)             => 1
+        JqFComma(_, _, _)            => 2
         JqFBinary(_, op, _, _)       => op_level(op)
-        JqFNegate(_, _)              => 8
-        JqFIf(_, _, _, _)            => 1
-        JqFTry(_, _, _)              => 1
-        JqFReduce(_, _, _, _, _)     => 1
-        JqFForeach(_, _, _, _, _, _) => 1
-        JqFBind(_, _, _, _)          => 1
-        JqFDefine(_, _, _, _, _)     => 1
-        _                            => 9
+        JqFNegate(_, _)              => 9
+        JqFIf(_, _, _, _)            => 0
+        JqFTry(_, _, _)              => 0
+        JqFReduce(_, _, _, _, _)     => 0
+        JqFForeach(_, _, _, _, _, _) => 0
+        JqFBind(_, _, _, _)          => 0
+        JqFDefine(_, _, _, _, _)     => 0
+        _                            => 10
 
 fn op_level(op: JqBinOp) -> Int
     match op
-        JqOpAlternative  => 3
-        JqOpOr           => 4
-        JqOpAnd          => 4
-        JqOpEqual        => 5
-        JqOpNotEqual     => 5
-        JqOpLess         => 5
-        JqOpLessEqual    => 5
-        JqOpGreater      => 5
-        JqOpGreaterEqual => 5
-        JqOpAdd          => 6
-        JqOpSubtract     => 6
-        _                => 7
+        JqOpAlternative  => 4
+        JqOpOr           => 5
+        JqOpAnd          => 5
+        JqOpEqual        => 6
+        JqOpNotEqual     => 6
+        JqOpLess         => 6
+        JqOpLessEqual    => 6
+        JqOpGreater      => 6
+        JqOpGreaterEqual => 6
+        JqOpAdd          => 7
+        JqOpSubtract     => 7
+        _                => 8
 
 fn render_prec(f: JqFilter, min: Int) -> Str
     let body = render_of(f)
@@ -1828,15 +1846,15 @@ fn render_of(f: JqFilter) -> Str
     match f
         JqFIdentity(_)                => "."
         JqFPath(_, q)                 => render_query(q)
-        JqFPipe(_, a, b)              => render_prec(a, 2) + " | " + render_prec(b, 3)
-        JqFComma(_, a, b)             => render_prec(a, 1) + ", " + render_prec(b, 2)
+        JqFPipe(_, a, b)              => render_prec(a, 1) + " | " + render_prec(b, 2)
+        JqFComma(_, a, b)             => render_prec(a, 2) + ", " + render_prec(b, 3)
         JqFLiteral(_, v)              => render_literal(v)
         JqFArray(_, b)                => render_array(b)
         JqFObject(_, fs)              => "{" + fields_text(fs) + "}"
         JqFBinary(_, op, a, b)        =>
             let lv = op_level(op)
             render_prec(a, lv) + " " + op_text(op) + " " + render_prec(b, lv + 1)
-        JqFNegate(_, b)               => "-" + render_prec(b, 8)
+        JqFNegate(_, b)               => "-" + render_prec(b, 9)
         JqFIf(_, c, t, e)             =>
             var out = "if " + render_prec(c, 0) + " then " + render_prec(t, 0)
             out = out + " else " + render_prec(e, 0) + " end"
@@ -1847,16 +1865,16 @@ fn render_of(f: JqFilter) -> Str
             else
                 "try " + render_prec(b, 0) + " catch " + render_prec(h, 0)
         JqFReduce(_, s, p, i, u)      =>
-            var out = "reduce " + render_prec(s, 9) + " as " + render_pattern(p)
+            var out = "reduce " + render_prec(s, 10) + " as " + render_pattern(p)
             out = out + " (" + render_prec(i, 0) + "; " + render_prec(u, 0) + ")"
             out
         JqFForeach(_, s, p, i, u, x)  =>
-            var out = "foreach " + render_prec(s, 9) + " as " + render_pattern(p)
+            var out = "foreach " + render_prec(s, 10) + " as " + render_pattern(p)
             out = out + " (" + render_prec(i, 0) + "; " + render_prec(u, 0)
             out = out + "; " + render_prec(x, 0) + ")"
             out
         JqFBind(_, s, p, b)           =>
-            render_prec(s, 9) + " as " + render_pattern(p) + " | " + render_prec(b, 0)
+            render_prec(s, 10) + " as " + render_pattern(p) + " | " + render_prec(b, 0)
         JqFVariable(_, nm)            => "\$" + nm
         JqFCall(_, callee, args)      => call_text(callee, args)
         JqFDefine(_, nm, ps, b, rest) =>
@@ -1890,8 +1908,15 @@ fn params_text(ps: [Str]) -> Str
 fn fields_text(fs: [JqField]) -> Str
     var parts: [Str] = []
     for f in fs
-        list.push(parts, render_key(f.key) + ": " + render_prec(f.value, 2))
+        list.push(parts, render_key(f.key) + ": " + render_field_value(f.value))
     list.join(parts, ", ")
+
+// A field value is a pipe of `//`-level operands, so a comma in it, or
+// a pipe on the right of a pipe, is bracketed.
+fn render_field_value(f: JqFilter) -> Str
+    match f
+        JqFPipe(_, a, b) => render_field_value(a) + " | " + render_prec(b, 4)
+        _                => render_prec(f, 4)
 
 fn render_key(k: JqFilter) -> Str
     match k
@@ -2285,7 +2310,10 @@ fn builtin_is_path(b: jqbuiltin.JqBuiltin, args: [JqFilter]) -> Bool
         JqbPaths0   => true
         JqbPaths1   => true
         JqbGetpath1 => true
-        JqbSelect1  => path_argument(args, 0)
+        // The argument of `select` is a condition read for its truth and
+        // the place is the input, so any condition is allowed.  Only a
+        // call with no argument, a tree no program spells, is refused.
+        JqbSelect1  => list.len(args) > 0
         JqbFirst1   => path_argument(args, 0)
         JqbLast1    => path_argument(args, 0)
         JqbLimit2   => path_argument(args, 1)

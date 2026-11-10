@@ -1,0 +1,209 @@
+// jqreadings_tests.nv: three readings of jq's grammar and scope that
+// 0.1.1 had wrong, each pinned with its neighbours.
+//
+// WHAT THIS SUITE IS FOR.  Three filed defects had one thing in common:
+// the program parsed, ran and answered, and the answer was not jq's.
+//
+// - The pipe is jq's loosest operator and the comma binds tighter, so
+//   `1, 2, 3 | . + 1` is `(1, 2, 3) | . + 1`.  0.1.1 grouped the pipe
+//   first.
+// - The argument of `select` is a condition and the place is its input,
+//   so `path(select(. > 1))` is a path expression.  0.1.1 held the
+//   condition to the rule for `first` and `limit`, whose arguments
+//   supply the places.
+// - A filter argument and a `def` read the `$name`s of the place they
+//   were written.  0.1.1 ran them under the names of the body that
+//   called them.
+//
+// Every row was measured against jq 1.7 and the package answers the same
+// line.  A row is a program, its input, and the outputs as one line,
+// `[out,out]`, with `!kind` appended when the run failed.
+
+use std.test
+use std.json
+use std.list
+use std.str
+use jqerror
+use jqeval
+use jqlang
+
+// A JSON value from its text, with the null value for text that is not
+// JSON, since every input below is a literal, so the fallback is unreachable.
+fn value_of(text: Str) -> JsonValueH
+    json.parse(text) ?? jqeval.null_value()
+
+fn answer(src: Str, input: Str) -> Str []
+    match jqlang.parse(src)
+        Err(f) => "parse:" + jqerror.fault_kind_name(f.kind)
+        Ok(p)  =>
+            let o = jqeval.run(p, value_of(input))
+            var parts: [Str] = []
+            for v in o.values
+                list.push(parts, json.stringify(v))
+            let body = "[" + str.join(parts, ",") + "]"
+            match o.fault
+                None    => body
+                Some(e) => body + "!" + jqerror.error_kind_name(e.kind)
+
+struct ReadingCase
+    src: Str
+    input: Str
+    want: Str
+
+// The pipe is the loosest operator and the comma binds tighter than it, so a comma list is the whole input of the pipe after it.
+fn grammar_cases() -> [ReadingCase] []
+    [
+        ReadingCase { src: "[1, 2, 3 | . + 1]", input: "null",
+                      want: "[[2,3,4]]" },
+        ReadingCase { src: "[(1, 2, 3) | . + 1]", input: "null",
+                      want: "[[2,3,4]]" },
+        ReadingCase { src: "[1, 2 | 3, 4]", input: "null",
+                      want: "[[3,4,3,4]]" },
+        ReadingCase { src: "[1 | 2, 3]", input: "null",
+                      want: "[[2,3]]" },
+        ReadingCase { src: "[.[] | . * 2, . * 3]", input: "[1, 2]",
+                      want: "[[2,3,4,6]]" },
+        ReadingCase { src: "[limit(3; 1, 2, 3 | . + 1)]", input: "null",
+                      want: "[[2,3,4]]" },
+        ReadingCase { src: "[1, 2 | . + 1 | . * 10]", input: "null",
+                      want: "[[20,30]]" },
+        ReadingCase { src: "[1, 2 // 3 | . + 1]", input: "null",
+                      want: "[[2,3]]" },
+        ReadingCase { src: "[1 as \$x | \$x, 2]", input: "null",
+                      want: "[[1,2]]" },
+        ReadingCase { src: "[(1, 2) as \$x | \$x * 10, 5]", input: "null",
+                      want: "[[10,5,20,5]]" },
+        ReadingCase { src: "def f: 1, 2; [f | . + 10]", input: "null",
+                      want: "[[11,12]]" },
+        ReadingCase { src: "[if true then 1, 2 | . + 1 else 0 end]", input: "null",
+                      want: "[[2,3]]" },
+        ReadingCase { src: "[try (1, 2 | error) catch . + 1]", input: "null",
+                      want: "[[2]]" },
+        ReadingCase { src: "{a: .x | length, b: 2}", input: "{\"x\": [1, 2]}",
+                      want: "[{\"a\":2,\"b\":2}]" },
+        ReadingCase { src: "{a: 1, b: 2}", input: "null",
+                      want: "[{\"a\":1,\"b\":2}]" },
+        ReadingCase { src: "[.[] | select(. > 1), 0 | . + 1]", input: "[1, 2, 3]",
+                      want: "[[1,3,1,4,1]]" }]
+
+@test
+fn test_a_pipe_is_looser_than_a_comma() [io]
+    for c in grammar_cases()
+        test.case("${c.src} over ${c.input}")
+        test.assert_eq_str(answer(c.src, c.input), c.want)
+
+// The argument of `select` supplies a truth value and the place is its input, so any condition is allowed inside a path expression.
+fn path_cases() -> [ReadingCase] []
+    [
+        ReadingCase { src: "[path(select(. > 1))]", input: "5",
+                      want: "[[[]]]" },
+        ReadingCase { src: "[path(select(. > 9))]", input: "5",
+                      want: "[[]]" },
+        ReadingCase { src: "[path(.[] | select(. > 2))]", input: "[1, 5, 3]",
+                      want: "[[[1],[2]]]" },
+        ReadingCase { src: "[path(.[] | select(type == \"number\"))]", input: "{\"a\": 1, \"b\": \"x\"}",
+                      want: "[[[\"a\"]]]" },
+        ReadingCase { src: "[path(.. | select(type == \"number\"))]", input: "{\"a\": [1, {\"b\": 2}]}",
+                      want: "[[[\"a\",0],[\"a\",1,\"b\"]]]" },
+        ReadingCase { src: "[path(select(length > 1) | .[0])]", input: "[1, 2]",
+                      want: "[[[0]]]" },
+        ReadingCase { src: "[path(select(length > 1) | .[0])]", input: "[1]",
+                      want: "[[]]" },
+        ReadingCase { src: "[path(select(. > 1) | select(. < 9))]", input: "5",
+                      want: "[[[]]]" },
+        ReadingCase { src: "[path(first(select(. > 1)))]", input: "5",
+                      want: "[[[]]]" },
+        ReadingCase { src: "[path(select(true, true))]", input: "1",
+                      want: "[[[],[]]]" },
+        ReadingCase { src: "[path(select(empty))]", input: "1",
+                      want: "[[]]" },
+        ReadingCase { src: "[path(select(.a))]", input: "{\"a\": true}",
+                      want: "[[[]]]" },
+        ReadingCase { src: "[path(.[] | select(has(\"k\")))]", input: "[{\"k\": 1}, {\"j\": 2}]",
+                      want: "[[[0]]]" },
+        ReadingCase { src: "[path(.. | select(type == \"array\") | .[0])]", input: "{\"a\": [1, 2], \"b\": 3}",
+                      want: "[[[\"a\",0]]]" },
+        ReadingCase { src: "[paths(type == \"number\")]", input: "[1, [2]]",
+                      want: "[[[0],[1,0]]]" }]
+
+@test
+fn test_a_select_condition_is_a_value_and_its_input_is_the_place() [io]
+    for c in path_cases()
+        test.case("${c.src} over ${c.input}")
+        test.assert_eq_str(answer(c.src, c.input), c.want)
+
+// A filter argument and a definition read the `$name`s of the place they were written, and not the ones of the body that runs them.
+fn scope_cases() -> [ReadingCase] []
+    [
+        ReadingCase { src: "def f(g): 1 as \$x | g; 2 as \$x | f(\$x)", input: "null",
+                      want: "[2]" },
+        ReadingCase { src: "def f(g): 1 as \$x | g; 2 as \$x | f(\$x + 10)", input: "null",
+                      want: "[12]" },
+        ReadingCase { src: "def f(g): 1 as \$x | [g, \$x]; 2 as \$x | f(\$x)", input: "null",
+                      want: "[[2,1]]" },
+        ReadingCase { src: "def f(\$a): 1 as \$x | \$a + \$x; 2 as \$x | f(\$x)", input: "null",
+                      want: "[3]" },
+        ReadingCase { src: "def f(g): 1 as \$x | g; 2 as \$y | 3 as \$x | [f(\$x + \$y), \$x]", input: "null",
+                      want: "[[5,3]]" },
+        ReadingCase { src: "1 as \$x | def f: \$x; 2 as \$x | f", input: "null",
+                      want: "[1]" },
+        ReadingCase { src: "def f(g): def h: g; 1 as \$x | h; 2 as \$x | f(\$x)", input: "null",
+                      want: "[2]" },
+        ReadingCase { src: "def f(g): 1 as \$x | g; def h(k): 3 as \$x | f(k); 2 as \$x | h(\$x)", input: "null",
+                      want: "[2]" },
+        ReadingCase { src: "def f(g): 1 as \$x | g | g; 2 as \$x | 0 | f(. + \$x)", input: "null",
+                      want: "[4]" },
+        ReadingCase { src: "def f(g): 1 as \$x | limit(2; g); 2 as \$x | [f(\$x, \$x)]", input: "null",
+                      want: "[[2,2]]" },
+        ReadingCase { src: "def f(g): 1 as \$x | [.[] | g]; 2 as \$x | f(. * \$x)", input: "[1, 2]",
+                      want: "[[2,4]]" },
+        ReadingCase { src: "def f(g): 1 as \$x | map(g); 2 as \$x | f(. * \$x)", input: "[1, 2]",
+                      want: "[[2,4]]" },
+        ReadingCase { src: "def f(g): 1 as \$x | g as \$y | \$y + \$x; 2 as \$x | f(\$x)", input: "null",
+                      want: "[3]" },
+        ReadingCase { src: "def fac: if . <= 1 then 1 else . as \$n | (. - 1 | fac) * \$n end; 5 | fac", input: "null",
+                      want: "[120]" },
+        ReadingCase { src: "def f: . as \$x | if \$x > 0 then \$x, (. - 1 | f) else empty end; [3 | f]", input: "null",
+                      want: "[[3,2,1]]" },
+        ReadingCase { src: "2 as \$x | [1, 2] | map(. * \$x)", input: "null",
+                      want: "[[2,4]]" },
+        ReadingCase { src: "def f(g): 1 as \$x | g; [f(5), 1]", input: "null",
+                      want: "[[5,1]]" },
+        ReadingCase { src: "def f(g; h): 1 as \$x | g + h; 2 as \$x | 3 as \$y | f(\$x; \$y)", input: "null",
+                      want: "[5]" },
+        ReadingCase { src: "def f(g): reduce (1, 2) as \$x (0; . + g); 10 as \$x | f(\$x)", input: "null",
+                      want: "[20]" }]
+
+@test
+fn test_a_name_in_a_filter_argument_is_the_callers() [io]
+    for c in scope_cases()
+        test.case("${c.src} over ${c.input}")
+        test.assert_eq_str(answer(c.src, c.input), c.want)
+
+// A rendering brackets by the same order the parser reads: the pipe is
+// loosest, the comma binds tighter, and the value of an object field is
+// a pipe of operands that hold no comma.
+fn render_cases() -> [ReadingCase] []
+    [
+        ReadingCase { src: "(1, 2) | . + 1", input: "", want: "1, 2 | . + 1" },
+        ReadingCase { src: "1 | (2, 3)", input: "", want: "1 | 2, 3" },
+        ReadingCase { src: "(1 | 2), 3", input: "", want: "(1 | 2), 3" },
+        ReadingCase { src: "1, (2 | 3)", input: "", want: "1, (2 | 3)" },
+        ReadingCase { src: "(try 1), 2", input: "", want: "(try 1), 2" },
+        ReadingCase { src: "{a: .x | length, b: 2}", input: "", want: "{a: .x | length, b: 2}" },
+        ReadingCase { src: "{a: (1, 2)}", input: "", want: "{a: (1, 2)}" },
+        ReadingCase { src: "{a: 1 | 2 | 3}", input: "", want: "{a: 1 | 2 | 3}" },
+        ReadingCase { src: "{a: 1 | (2 | 3)}", input: "", want: "{a: 1 | (2 | 3)}" },
+        ReadingCase { src: "{a: (1, 2) | 3}", input: "", want: "{a: (1, 2) | 3}" }]
+
+@test
+fn test_a_rendering_brackets_by_the_order_the_parser_reads() [io]
+    for c in render_cases()
+        test.case("${c.src}")
+        match jqlang.parse(c.src)
+            Err(_) => test.assert(false)
+            Ok(p)  =>
+                test.assert_eq_str(jqlang.render(p), c.want)
+                match jqlang.parse(jqlang.render(p))
+                    Err(_) => test.assert(false)
+                    Ok(q)  => test.assert_eq_str(jqlang.render(q), c.want)

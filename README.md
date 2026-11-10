@@ -233,6 +233,7 @@ novo test tests/jqquery_edge_tests.nv      # the readings chosen where the prose
 novo test tests/jqcover_tests.nv           # every arm of every dispatch, reached with a carrying input
 novo test tests/jqarms_tests.nv            # the arms no program can reach, and the ceilings
 novo test tests/jqlazy_tests.nv            # limit and first stop their argument, and what a stop leaves alone
+novo test tests/jqreadings_tests.nv        # comma and pipe, select in a path, the names a filter argument reads
 ```
 
 The reference is jq 1.7. Its manual is the specification for the grammar, the

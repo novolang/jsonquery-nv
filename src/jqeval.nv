@@ -744,17 +744,25 @@ fn produced_one(v: JsonValueH) -> JqOutcome []
 // and the index the body's scope starts at.
 //
 // The scope is what makes jq's parameters possible here without
-// closures.  jq's function parameters are FILTERS rather than values —
+// closures over definitions; the bindings make them closures over
+// names.  jq's function parameters are FILTERS rather than values —
 // `def twice(f): f | f` given `.a` evaluates `.a` twice — so a call
 // pushes each argument as a zero-parameter entry whose body is the
 // argument filter, and the index says how far down the stack that
 // filter may look.  Without it, an argument named `x` handed to a
 // parameter named `x` would resolve to itself and never terminate.
+//
+// `bindings` are the `$name`s in force where the definition was written,
+// or where the call that pushed the argument was written.  A body runs
+// under them and not under the ones of whoever calls it, because jq's
+// names are lexical: in `def f(g): 1 as $x | g; 2 as $x | f($x)` the
+// argument reads the `$x` of 2 although `f` has bound another.
 struct JqDef
     name: Str
     parameters: [Str]
     body: jqlang.JqFilter
     scope: JqScope
+    var bindings: [JqBinding]
 
 // Where a name is looked up from: the lowest definition index that is
 // visible, and the one entry that is not.
@@ -1414,7 +1422,7 @@ fn each_define(var r: Run, name: Str, parameters: [Str], body: jqlang.JqFilter,
     let back = restoring(var r, k)
     var saved = r.defs
     r.defs = defs_with(r.defs, JqDef { name: name, parameters: parameters, body: body,
-                                       scope: sc })
+                                       scope: sc, bindings: r.bindings })
     let fl = each(var r, rest, input, d + 1, sc, back)
     r.defs = saved
     fl
@@ -2116,12 +2124,22 @@ fn each_defined(var r: Run, name: Str, args: [jqlang.JqFilter], input: JsonValue
 
 fn call_def(var r: Run, index: Int, args: [jqlang.JqFilter], input: JsonValueH, d: Int, sc: JqScope,
             k: fn(JsonValueH) -> JqFlow) -> JqFlow []
-    let entry = r.defs[index]
-    // A call that pushes no argument leaves the definitions as they are,
+    var entry = r.defs[index]
+    // The names in force at the call, which the arguments pushed below
+    // close over and which the consumer gets back.
+    var caller = r.bindings
+    // A call that pushes no argument leaves the definitions as they are.
+    // With no name bound on either side the body needs nothing swapped,
     // so the consumer needs no restoring and the parameters of a
     // definition, which are such calls, cost no closure.
     if list.len(args) == 0
-        return each(var r, entry.body, input, d + 1, entry.scope, k)
+        if list.len(caller) == 0 and list.len(entry.bindings) == 0
+            return each(var r, entry.body, input, d + 1, entry.scope, k)
+        let held = restoring(var r, k)
+        r.bindings = entry.bindings
+        let fl = each(var r, entry.body, input, d + 1, entry.scope, held)
+        r.bindings = caller
+        return fl
     let back = restoring(var r, k)
     var saved = r.defs
     let base = list.len(r.defs)
@@ -2129,9 +2147,12 @@ fn call_def(var r: Run, index: Int, args: [jqlang.JqFilter], input: JsonValueH, 
     for a in args
         r.defs = defs_with(r.defs, JqDef { name: param_name(entry.parameters, i),
                                            parameters: [], body: a,
-                                           scope: JqScope { floor: sc.floor, skip: base + i } })
+                                           scope: JqScope { floor: sc.floor, skip: base + i },
+                                           bindings: caller })
         i = i + 1
+    r.bindings = entry.bindings
     let fl = each(var r, entry.body, input, d + 1, entry.scope, back)
+    r.bindings = caller
     r.defs = saved
     fl
 
@@ -2161,7 +2182,8 @@ fn each_builtin(var r: Run, b: jqbuiltin.JqBuiltin, args: [jqlang.JqFilter], inp
     var i = 0
     for a in args
         r.defs = defs_with(r.defs, JqDef { name: " arg", parameters: [], body: a,
-                                           scope: JqScope { floor: sc.floor, skip: base + i } })
+                                           scope: JqScope { floor: sc.floor, skip: base + i },
+                                           bindings: r.bindings })
         i = i + 1
     let fl = dispatch(var r, b, base, list.len(args), input, d, sc, at, back)
     r.defs = saved
@@ -3379,7 +3401,8 @@ fn walk_each_call(var r: Run, callee: jqlang.JqCallee, args: [jqlang.JqFilter], 
             for a in args
                 r.defs = defs_with(r.defs, JqDef { name: " arg", parameters: [], body: a,
                                                    scope: JqScope { floor: sc.floor,
-                                                                    skip: base + i } })
+                                                                    skip: base + i },
+                                                   bindings: r.bindings })
                 i = i + 1
             let fl = walk_each_builtin(var r, b, base, input, prefix, d, at, k)
             r.defs = saved
@@ -3401,13 +3424,14 @@ fn walk_each_builtin(var r: Run, b: jqbuiltin.JqBuiltin, base: Int, input: JsonV
             deliver_at(w.nodes, w.fault, k)
         JqbSelect1  =>
             // `select(f)` passes its input through, once per true output of
-            // `f`, so the place is the input's own and `f`'s outputs are only
-            // consulted for truth: `path(select(.a))` is `[]`, not `["a"]`,
-            // and `path(select(true,true))` is `[]` twice.  A fault out of `f`
+            // `f`, so the place is the input's own and `f` is a condition,
+            // read as a value and consulted only for truth: `path(select(.a))`
+            // is `[]`, not `["a"]`, `path(select(. > 1))` is `[]` on a 5, and
+            // `path(select(true,true))` is `[]` twice.  A fault out of `f`
             // comes after the outputs it already produced, so the places those
             // produced are answered first and the fault follows them.
-            walk_each(var r, r.defs[base].body, input, prefix, d + 1, r.defs[base].scope, at,
-                      n => place_if(truthy(n.value), input, prefix, k))
+            each(var r, r.defs[base].body, input, d + 1, r.defs[base].scope,
+                 v => place_if(truthy(v), input, prefix, k))
         JqbFirst1   => walk_take(var r, 1, base, 0, input, prefix, d, at, k)
         JqbLast1    => walk_last(var r, base, input, prefix, d, at, k)
         JqbLimit2   =>

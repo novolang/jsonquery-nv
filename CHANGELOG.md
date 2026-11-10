@@ -5,6 +5,60 @@ All notable changes to jsonquery-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.2 (2026-11-10)
+
+Three readings of jq's grammar and scope are corrected.  Each one made
+a program parse, run and answer something other than jq answers, or
+refused a program jq accepts.  Each is pinned by a row measured against
+jq 1.7 in `tests/jqreadings_tests.nv`.
+
+### Fixed
+
+- **The comma binds tighter than the pipe**, as in jq's grammar, where
+  0.1.1 grouped the pipe first.  `[1, 2, 3 | . + 1]` answers `[2,3,4]`
+  where 0.1.1 answered `[1,2,4]`, because the program is
+  `(1, 2, 3) | . + 1`.  Any program that writes `a, b | c` without
+  brackets answers differently; so does an argument of a call that holds
+  a comma and a pipe, such as `limit(3; 1, 2, 3 | . + 1)`.  The value of
+  an object field still stops at a comma, since the comma there starts
+  the next field.  `jqlang.render` brackets by the new order, so a
+  comma inside a pipe's operand and a keyword form inside a comma's
+  operand are bracketed.  Filed as
+  `bugs/orbit/a-comma-binds-looser-than-a-pipe-in-a-jq-program.md`.
+- **`path(select(f))` accepts any condition `f`**, where 0.1.1 refused
+  `path(select(. > 1))` and every other condition that is not itself a
+  path as `bad-path`.  The argument of `select` supplies a truth value
+  and the place is its input, so the walk reads the condition as a
+  value and yields the input once per true output.  `first`, `last` and
+  `limit` still require a path argument, because theirs supplies the
+  places.  Filed as
+  `bugs/orbit/select-of-a-condition-is-refused-as-not-a-path-expression.md`.
+- **A filter argument and a `def` read the `$name`s of the place they
+  were written**, as in jq, where 0.1.1 ran them under the names of the
+  body that called them.  `def f(g): 1 as $x | g; 2 as $x | f($x)`
+  answers `2` where 0.1.1 answered `1`.  A definition records the
+  bindings in force where it was written, or where the call that pushed
+  the argument stood, and a call runs the body under them and puts the
+  caller's back when the body's outputs have been handed on.  Filed as
+  `bugs/orbit/a-name-read-in-a-filter-argument-sees-the-callees-binding.md`.
+
+### Added
+
+- `tests/jqreadings_tests.nv`, a suite for the three readings above,
+  each with the neighbours that kept the old reading right: object
+  fields, `as` bodies, `if`, `try`, nested definitions, a recursive
+  definition that binds a name, and the stream builtins that take a
+  filter argument.
+
+### Changed
+
+- `tests/jqcover_tests.nv` pinned two answers of the old grouping:
+  `1, 2 | . + 1` answered `[1,3]` and `path(.a, .b | .c)` answered the
+  places of `.a` and of `.b.c`.  They now answer `[2,3]` and, over
+  `{"a":1,"b":{"c":2}}`, the error `cannot-index` that jq raises.
+
+This release requires novo 0.23.0 or later.
+
 ## 0.1.1 (2026-11-09)
 
 `limit` and `first` stop their filter argument.  The evaluator in
